@@ -1,3 +1,6 @@
+-- Example configuration for Harper-nvim-julia
+-- Place this in your Neovim config (e.g., ~/.config/nvim/lua/plugins/julia.lua for lazy.nvim)
+
 return {
 	"kitajusSus/jemach",
 
@@ -13,6 +16,7 @@ return {
 	-- Configuration
 	config = function()
 		require("jemach").setup({
+			-- ===== Project Settings =====
 			-- Automatically activate Julia project (finds Project.toml)
 			activate_project_on_start = true,
 

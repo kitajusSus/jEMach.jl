@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# jl-assist — Launch Julia workspace assistant in a new tmux pane
+#
+# Usage:
+#   jl-assist [OPTIONS]
+#
+# Options:
+#   -p PANE_ID   Target Julia REPL pane (default: auto-detect or left-of)
+#   -w WIDTH     Width of the TUI pane in columns (default: 60)
+#   -f           Force a new pane even if one already exists
+#   -h           Show this help
+#
+# The script:
+#   1. Detects (or creates) the Julia REPL pane in the current tmux window.
+#   2. Splits a new pane to the right.
+#   3. Launches the jl_tui.lua TUI there, pointing it at the Julia pane.
+#
+# Recommended workflow:
+#   tmux new-window
+#   julia --project=.                 ← in left pane
+#   include("scripts/jl_watcher.jl")  ← inside Julia REPL
+#   jl-assist                         ← in any other pane / shell
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TUI_SCRIPT="${SCRIPT_DIR}/jl_tui.lua"
+
+# --------------------------------------------------------------------------
+# Defaults
+# --------------------------------------------------------------------------
+JULIA_PANE=""
+PANE_WIDTH=60
+FORCE_NEW=0
+
+# --------------------------------------------------------------------------
+# Usage
+# --------------------------------------------------------------------------
+usage() {
+  sed -n '/^# jl-assist/,/^# Recommended/{ s/^# \?//; p }' "$0"
+  exit 0
+}
+
+# --------------------------------------------------------------------------
+# Parse arguments
+# --------------------------------------------------------------------------
+while getopts "p:w:fh" opt; do
+  case "$opt" in
+    p) JULIA_PANE="$OPTARG" ;;
+    w) PANE_WIDTH="$OPTARG" ;;
+    f) FORCE_NEW=1 ;;
+    h) usage ;;
+    *) echo "Unknown option: $opt"; usage ;;
+  esac
+done
+
+# --------------------------------------------------------------------------
+# Sanity checks
+# --------------------------------------------------------------------------
+if [[ -z "${TMUX:-}" ]]; then
+  echo "Error: jl-assist must be run inside a tmux session." >&2
+  exit 1
+fi
+
+if ! command -v luajit &>/dev/null; then
+  echo "Error: luajit not found." >&2
+  echo "  Arch Linux : sudo pacman -S luajit" >&2
+  echo "  Ubuntu/Deb : sudo apt install luajit" >&2
+  echo "  Fedora     : sudo dnf install luajit" >&2
+  exit 1
+fi
+
+if [[ ! -f "$TUI_SCRIPT" ]]; then
+  echo "Error: TUI script not found at $TUI_SCRIPT" >&2
+  exit 1
+fi
+
+# --------------------------------------------------------------------------
+# Detect Julia pane (if not explicitly provided)
+# --------------------------------------------------------------------------
+if [[ -z "$JULIA_PANE" ]]; then
+  # Find a pane running Julia in the current window
+  JULIA_PANE="$(tmux list-panes -F "#{pane_id} #{pane_current_command}" \
+    | awk '/julia/{print $1; exit}')"
+
+  if [[ -z "$JULIA_PANE" ]]; then
+    echo "No Julia pane detected in current window." >&2
+    echo "Starting julia --project=. in the current pane first, then re-run jl-assist." >&2
+    echo "" >&2
+    echo "If Julia is running in a different window/session, pass the pane ID manually:" >&2
+    echo "  jl-assist -p %1" >&2
+    exit 1
+  fi
+fi
+
+echo "Julia pane: ${JULIA_PANE}"
+
+# --------------------------------------------------------------------------
+# Check for existing TUI pane
+# --------------------------------------------------------------------------
+TUI_PANE=""
+if [[ "$FORCE_NEW" -eq 0 ]]; then
+  TUI_PANE="$(tmux list-panes -F "#{pane_id} #{pane_current_command}" \
+    | awk '/luajit/{print $1; exit}')"
+fi
+
+if [[ -n "$TUI_PANE" ]]; then
+  echo "TUI pane already running (${TUI_PANE}). Use -f to force a new one."
+  tmux select-pane -t "$TUI_PANE"
+  exit 0
+fi
+
+# --------------------------------------------------------------------------
+# Split a new pane to the right and launch the TUI
+# --------------------------------------------------------------------------
+echo "Launching Julia Workspace TUI (pane width: ${PANE_WIDTH})…"
+
+tmux split-window -h -l "${PANE_WIDTH}" \
+  "luajit '${TUI_SCRIPT}' '${JULIA_PANE}'; echo 'TUI exited — press any key'; read -n1"
+
+echo "Done. TUI pane started alongside Julia REPL pane ${JULIA_PANE}."

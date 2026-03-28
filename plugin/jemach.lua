@@ -66,10 +66,10 @@ end, {
 vim.api.nvim_create_user_command("JuliaSetBackend", function(opts)
 	require("jemach").set_backend(opts.args)
 end, {
-	desc = "Set REPL backend (toggleterm|vim-slime|native|zellij|auto)",
+	desc = "Set REPL backend (toggleterm|vim-slime|auto)",
 	nargs = 1,
 	complete = function()
-		return { "toggleterm", "vim-slime", "native", "zellij", "auto" }
+		return { "toggleterm", "vim-slime", "auto" }
 	end,
 })
 
@@ -144,6 +144,22 @@ vim.api.nvim_create_user_command("JuliaTmuxFindPanes", function()
 	end
 end, {
 	desc = "Find Julia REPL panes in tmux",
+})
+
+vim.api.nvim_create_user_command("JuliaNativeInfo", function()
+	local native = require("jemach.native")
+	local info = native.get_info()
+
+	local msg = string.format(
+		"Native Module Info:\n  Backend: %s\n  FFI Available: %s\n  Native Available: %s",
+		info.backend,
+		tostring(info.ffi_available),
+		tostring(info.has_native)
+	)
+
+	vim.notify(msg, vim.log.levels.INFO)
+end, {
+	desc = "Show native module information",
 })
 
 -- LSP integration commands

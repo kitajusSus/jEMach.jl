@@ -6,15 +6,13 @@ M.config = {
 	detect_imports = true,
 	show_import_status = true,
 	languageserver_path = nil,
-	julia_project = nil, -- nil means auto-detect using on_new_config logic
-	default_environment = "v#.#", -- Fallback environment: path or "v#.#" for default
+	julia_project = "@.",
 	startup_file = false,
 	history_file = false,
 }
 
 local lsp_client_id = nil
 local detected_imports = {}
-
 local function has_lspconfig()
 	local ok, _ = pcall(require, "lspconfig")
 	return ok
@@ -37,27 +35,6 @@ local function detect_languageserver()
 
 	return false
 end
-
-local function get_project_flag(root_dir)
-	-- If user specifically forced a project in config, use it
-	if M.config.julia_project then
-		return M.config.julia_project
-	end
-
-	-- Check if we found a real project root
-	if root_dir and (vim.fn.filereadable(root_dir .. "/Project.toml") == 1 or vim.fn.filereadable(root_dir .. "/JuliaProject.toml") == 1) then
-		return "@."
-	end
-
-	-- Fallback to default environment
-	local env = M.config.default_environment
-	if not env or env == "v#.#" then
-		return "@v#.#" -- Standard Julia syntax for default env (e.g. ~/.julia/environments/v1.12)
-	end
-
-	return env
-end
-
 function M.setup_lsp(opts)
 	if not M.config.enabled then
 		return
@@ -74,25 +51,17 @@ function M.setup_lsp(opts)
 	local lsp_config = {
 		cmd = {
 			"julia",
-			"--project=@.", -- Placeholder, will be updated in on_new_config
+			"--project=" .. M.config.julia_project,
 			"--startup-file=" .. startup_flag,
 			"--history-file=" .. history_flag,
 			"-e",
 			[[
 				using Pkg
-				-- We don't need Pkg.instantiate() here necessarily if we trust the env,
-				-- but it's safer. However, for default envs it might be slow.
-				-- Let's keep it but be aware.
-				try
-					using LanguageServer
-				catch
-					@warn "LanguageServer not found in current environment"
-					exit(1)
-				end
+				Pkg.instantiate()
+				using LanguageServer
 
 				depot_path = get(ENV, "JULIA_DEPOT_PATH", "")
 
-				# Ensure we resolve the project path correctly from the julia process perspective
 				project_path = let
 					dirname(something(
 						Base.load_path_expand((
@@ -122,24 +91,6 @@ function M.setup_lsp(opts)
 				or vim.fn.getcwd()
 		end,
 
-		on_new_config = function(new_config, new_root_dir)
-			local project_flag = get_project_flag(new_root_dir)
-
-			-- Update the --project arg
-			for i, arg in ipairs(new_config.cmd) do
-				if arg:match("^%-%-project=") then
-					new_config.cmd[i] = "--project=" .. project_flag
-					vim.notify("Julia LSP: Using environment " .. project_flag, vim.log.levels.DEBUG)
-					break
-				end
-			end
-
-			-- User might have provided their own on_new_config
-			if opts and opts.on_new_config then
-				opts.on_new_config(new_config, new_root_dir)
-			end
-		end,
-
 		on_attach = function(client, bufnr)
 			lsp_client_id = client.id
 
@@ -149,7 +100,7 @@ function M.setup_lsp(opts)
 				opts.on_attach(client, bufnr)
 			end
 
-			vim.notify("Julia LSP started", vim.log.levels.INFO)
+			vim.notify("Julia LSP started with library detection", vim.log.levels.INFO)
 		end,
 
 		settings = {
@@ -159,10 +110,6 @@ function M.setup_lsp(opts)
 				},
 				lint = {
 					run = true,
-					missingrefs = "all",
-					iter = true,
-					lazy = true,
-					modname = true,
 				},
 				symbolCacheDownload = true,
 				runtimeCompletions = true,
@@ -172,34 +119,15 @@ function M.setup_lsp(opts)
 		flags = {
 			debounce_text_changes = 150,
 		},
-
-		capabilities = opts and opts.capabilities or nil,
 	}
 
-	-- Deep merge user options, but handle function keys carefully if needed.
-	-- tbl_deep_extend overwrites keys.
-	-- We handled on_new_config and on_attach manually inside our wrappers to ensure
-	-- our logic runs AND user logic runs.
-	-- However, if the user provides `on_attach` in `opts`, `tbl_deep_extend` will overwrite
-	-- our `on_attach` wrapper if we just do this:
-	-- lsp_config = vim.tbl_deep_extend("force", lsp_config, opts)
-
-	-- So we must separate the "safe to merge" options from the functional hooks.
-
-	local user_on_attach = opts and opts.on_attach
-	local user_on_new_config = opts and opts.on_new_config
-
-	-- Remove them from opts before merging to avoid overwriting our wrappers
-	local safe_opts = vim.deepcopy(opts or {})
-	safe_opts.on_attach = nil
-	safe_opts.on_new_config = nil
-
-	lsp_config = vim.tbl_deep_extend("force", lsp_config, safe_opts)
+	if opts then
+		lsp_config = vim.tbl_deep_extend("force", lsp_config, opts)
+	end
 
 	vim.lsp.config("julials", lsp_config)
 	vim.lsp.enable("julials")
 end
-
 function M.setup_import_detection(client, bufnr)
 	if not M.config.detect_imports then
 		return
@@ -235,11 +163,9 @@ function M.setup_import_detection(client, bufnr)
 		end,
 	})
 end
-
 function M.get_imports()
 	return detected_imports
 end
-
 function M.is_package_imported(package_name)
 	for _, import in ipairs(detected_imports) do
 		if import.name == package_name or import.name:match("^" .. package_name .. "%.") then
@@ -248,7 +174,6 @@ function M.is_package_imported(package_name)
 	end
 	return false
 end
-
 function M.get_diagnostics()
 	if not lsp_client_id then
 		return {}
@@ -257,7 +182,6 @@ function M.get_diagnostics()
 	local diagnostics = vim.diagnostic.get(0, { severity = { min = vim.diagnostic.severity.HINT } })
 	return diagnostics
 end
-
 function M.show_import_status()
 	if #detected_imports == 0 then
 		vim.notify("No imports detected", vim.log.levels.INFO)
@@ -271,7 +195,6 @@ function M.show_import_status()
 
 	vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO)
 end
-
 function M.goto_definition()
 	if not lsp_client_id then
 		vim.notify("LSP not running", vim.log.levels.WARN)
@@ -280,7 +203,6 @@ function M.goto_definition()
 
 	vim.lsp.buf.definition()
 end
-
 function M.find_references()
 	if not lsp_client_id then
 		vim.notify("LSP not running", vim.log.levels.WARN)
@@ -289,7 +211,6 @@ function M.find_references()
 
 	vim.lsp.buf.references()
 end
-
 function M.hover_doc()
 	if not lsp_client_id then
 		vim.notify("LSP not running", vim.log.levels.WARN)
@@ -298,7 +219,6 @@ function M.hover_doc()
 
 	vim.lsp.buf.hover()
 end
-
 function M.rename_symbol()
 	if not lsp_client_id then
 		vim.notify("LSP not running", vim.log.levels.WARN)
@@ -307,7 +227,6 @@ function M.rename_symbol()
 
 	vim.lsp.buf.rename()
 end
-
 function M.code_action()
 	if not lsp_client_id then
 		vim.notify("LSP not running", vim.log.levels.WARN)
@@ -316,7 +235,6 @@ function M.code_action()
 
 	vim.lsp.buf.code_action()
 end
-
 function M.format_buffer()
 	if not lsp_client_id then
 		vim.notify("LSP not running", vim.log.levels.WARN)
@@ -325,7 +243,6 @@ function M.format_buffer()
 
 	vim.lsp.buf.format({ async = true })
 end
-
 function M.get_package_info(package_name)
 	local cmd = string.format(
 		'julia -e "using Pkg; try pkg = Pkg.TOML.parsefile(joinpath(pkgdir(%s), \\"Project.toml\\")); println(pkg[\\"version\\"]); catch; println(\\"not found\\"); end"',
@@ -371,7 +288,6 @@ function M.install_package(package_name, callback)
 		end,
 	})
 end
-
 function M.get_status()
 	return {
 		enabled = M.config.enabled,
@@ -382,12 +298,10 @@ function M.get_status()
 		imports = detected_imports,
 	}
 end
-
 function M.enable()
 	M.config.enabled = true
 	vim.notify("Julia LSP integration enabled. Restart Neovim to apply.", vim.log.levels.INFO)
 end
-
 function M.disable()
 	M.config.enabled = false
 	vim.notify("Julia LSP integration disabled. Restart Neovim to apply.", vim.log.levels.INFO)
