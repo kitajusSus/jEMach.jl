@@ -93,11 +93,11 @@ end
 
 function _get_items(mod::Module, all::Bool)::Vector{Dict{String,String}}
     items = Dict{String,String}[]
-    for sym in names(mod; all = all, imported = false)
+    for sym in Base.invokelatest(names, mod; all = all, imported = false)
         name = string(sym)
         _skip_name(name) && continue
 
-        val = try getfield(mod, sym) catch; continue end
+        val = try Base.invokelatest(getfield, mod, sym) catch; continue end
 
         kind = if isa(val, Function);        "function"
                elseif isa(val, Module);      "module"
@@ -138,9 +138,9 @@ function _collect_state()::Vector
 
     # 2. Collect modules explicitly loaded/imported in Main
     user_loaded_modules = Set{Module}()
-    for sym in names(Main; all=true, imported=true)
+    for sym in Base.invokelatest(names, Main; all=true, imported=true)
         try
-            val = getfield(Main, sym)
+            val = Base.invokelatest(getfield, Main, sym)
             if isa(val, Module)
                 push!(user_loaded_modules, val)
             end
