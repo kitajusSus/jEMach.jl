@@ -1,5 +1,7 @@
 # jemach
 
+![zdjęce](jemachpic.png)
+
 A comprehensive Neovim plugin for Julia development with an integrated REPL, workspace panel, and unified workflow mode for fast and efficient coding.
 
 More info: [Reddit Discussion](https://www.reddit.com/r/Julia/s/keFuc7dhnV)
