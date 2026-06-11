@@ -8,6 +8,18 @@ More info: [Reddit Discussion](https://www.reddit.com/r/Julia/s/keFuc7dhnV)
 > later in text you may seen instructions of building native module written in zig and cpp
  forget about it its in my experimental branch
 
+How to install in `julia`
+
+```julia 
+julia .
+]  
+# pkg> 
+add https://github.com/kitajusSus/jEMach
+
+
+```
+
+
 
 
 
