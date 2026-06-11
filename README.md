@@ -17,6 +17,13 @@ julia .
 add https://github.com/kitajusSus/jEMach
 
 
+
+
+# or 
+
+    using Pkg
+    Pkg.add(url="https://github.com/kitajusSus/jEMach")
+
 ```
 
 
