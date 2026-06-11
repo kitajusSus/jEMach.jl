@@ -231,4 +231,4 @@ end
 end  # module jEMach
 
 # Auto-start watcher silently (without split) when include()'d
-jEMach.start(split=false)
+#jEMach.start(split=false)
