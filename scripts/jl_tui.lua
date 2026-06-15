@@ -479,7 +479,7 @@ local function render(term_rows, term_cols)
 	io.write(DIM .. string.rep("─", term_cols) .. RESET)
 
 	io.write(move(term_rows, 1))
-	local help = "  j/k:move  h/l:col/fold  ↵:eval  i:inspect  s:save  c:clear  d:hide  q:quit"
+	local help = "  j/k:move  h/l:col/fold  ↵:eval  TAB:insert  i:inspect  s:save  c:clear  q:quit"
 	io.write(DIM .. pad_right(help, term_cols) .. RESET)
 
 	io.flush()
@@ -589,6 +589,21 @@ local function handle_key(key, term_rows, term_cols)
 	-- Save clean session (s)
 	elseif key == "s" then
 		tmux_send("jEMach.save_clean_session()")
+
+	-- Insert/Edit in REPL (e or Tab)
+	elseif key == "e" or key == "\t" then
+		local dr = display_rows[cursor]
+		if dr and dr.kind == "item" then
+			if dr.name:match("^[%a_][%w_!]*$") then
+				if dr.item_kind == "function" then
+					-- Type function_name() and move cursor inside parentheses
+					os.execute(string.format("tmux send-keys -t '%s' '%s()' Left", repl_pane, dr.name))
+				else
+					-- Type variable_name and a space
+					os.execute(string.format("tmux send-keys -t '%s' '%s '", repl_pane, dr.name))
+				end
+			end
+		end
 
 	-- Hide (d)
 	elseif key == "d" then
