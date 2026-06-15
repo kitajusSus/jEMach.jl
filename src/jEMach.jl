@@ -29,6 +29,12 @@ module jEMach
                 write(buf, "\\r")
             elseif c == '\t'
                 write(buf, "\\t")
+            elseif c == '\b'
+                write(buf, "\\b")
+            elseif c == '\f'
+                write(buf, "\\f")
+            elseif iscntrl(c)
+                write(buf, "\\u$(lpad(string(Int(c), base=16), 4, '0'))")
             else
                 write(buf, c)
             end
@@ -89,7 +95,7 @@ module jEMach
 
     function _value_preview(val)::String
         return try
-            s = sprint(show, val; context = IOContext(devnull, :limit => true, :compact => true))
+            s = sprint((io, x) -> Base.invokelatest(show, io, x), val; context = IOContext(devnull, :limit => true, :compact => true))
             # strip newlines and limit length
             s = replace(s, '\n' => ' ')
             length(s) > 60 ? s[1:60] * "…" : s
@@ -130,6 +136,15 @@ module jEMach
                 if all || isa(val, Number) || isa(val, AbstractString) || isa(val, Symbol) || isa(val, Bool)
                     value_str = _value_preview(val)
                 end
+            elseif kind == "function"
+                try
+                    ms = methods(val)
+                    value_str = "($(length(ms)) method" * (length(ms) == 1 ? "" : "s") * ")"
+                catch
+                    value_str = "(function)"
+                end
+            elseif kind == "type"
+                value_str = "(type)"
             end
 
             push!(
@@ -142,6 +157,74 @@ module jEMach
             )
         end
         return sort!(items; by = x -> (x["kind"] == "variable" ? 0 : 1, x["name"]))
+    end
+
+    function inspect_var(mod::Module, name_str::String)
+        sym = Symbol(name_str)
+        if !isdefined(mod, sym)
+            println("Symbol $name_str is not defined in module $mod.")
+            return nothing
+        end
+        val = getfield(mod, sym)
+        
+        println("\n" * "="^60)
+        println("Variable: $mod.$name_str")
+        println("Type:     $(typeof(val))")
+        if hasmethod(size, Tuple{typeof(val)})
+            try
+                println("Size:     $(size(val))")
+            catch
+            end
+        end
+        
+        # Search REPL history for creation/assignment
+        hist_path = joinpath(homedir(), ".julia", "logs", "repl_history.jl")
+        if isfile(hist_path)
+            try
+                lines = readlines(hist_path)
+                var_regex = Regex("\\b" * name_str * "\\b")
+                found_cmd = ""
+                current_block = String[]
+                for line in reverse(lines)
+                    if startswith(line, "# time:")
+                        block_str = join(reverse(current_block), "\n")
+                        if occursin(var_regex, block_str) && occursin(r"=|function|macro|struct", block_str)
+                            if !occursin("inspect_var", block_str) && !occursin("println", block_str) && !occursin("typeof", block_str) && !occursin("dump", block_str)
+                                found_cmd = block_str
+                                break
+                            end
+                        end
+                        empty!(current_block)
+                    elseif !startswith(line, "#")
+                        push!(current_block, line)
+                    end
+                end
+                if !isempty(found_cmd)
+                    println("Created/Modified by:")
+                    println("  ", replace(found_cmd, "\n" => "\n  "))
+                end
+            catch
+            end
+        end
+
+        # Documentation
+        try
+            doc = Base.Docs.doc(Base.Docs.Binding(mod, sym))
+            doc_str = string(doc)
+            if !isempty(doc_str) && !occursin("No documentation found", doc_str)
+                println("Documentation:")
+                doc_lines = split(doc_str, '\n')
+                for l in first(doc_lines, 15)
+                    println("  ", l)
+                end
+                if length(doc_lines) > 15
+                    println("  ...")
+                end
+            end
+        catch
+        end
+        println("="^60)
+        return nothing
     end
 
     function _collect_state()::Vector
@@ -206,9 +289,11 @@ module jEMach
                     try
                         state = _collect_state()
                         json = _serialize(state)
-                        open(STATE_FILE, "w") do f
+                        temp_file = STATE_FILE * ".tmp"
+                        open(temp_file, "w") do f
                             write(f, json)
                         end
+                        mv(temp_file, STATE_FILE; force=true)
                     catch e
                         @warn "jEMach Watcher error" exception = e
                     end

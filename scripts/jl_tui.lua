@@ -276,6 +276,7 @@ local collapsed = {}
 --   { kind="gap" }
 local display_rows = {}
 local cursor = 1
+local col_cursor = 1 -- 1: Name, 2: Type, 3: Value
 local state = nil -- last parsed JSON state
 local last_mtime = 0
 local last_state_ts = 0
@@ -451,12 +452,20 @@ local function render(term_rows, term_cols)
 			if #val_col > val_max then
 				val_col = val_col:sub(1, val_max - 1) .. "…"
 			end
-			local line = name_col .. "  " .. type_col .. "  " .. val_col
+			val_col = pad_right(val_col, term_cols - 26 - 18 - 4)
 
 			if sel then
-				io.write(REV .. pad_right(line, term_cols) .. RESET)
+				local out_str
+				if col_cursor == 1 then
+					out_str = REV .. name_col .. RESET .. kc .. "  " .. type_col .. "  " .. val_col
+				elseif col_cursor == 2 then
+					out_str = name_col .. "  " .. REV .. type_col .. RESET .. kc .. "  " .. val_col
+				else
+					out_str = name_col .. "  " .. type_col .. "  " .. REV .. val_col .. RESET
+				end
+				io.write(kc .. out_str .. RESET)
 			else
-				io.write(kc .. pad_right(line, term_cols) .. RESET)
+				io.write(kc .. name_col .. "  " .. type_col .. "  " .. val_col .. RESET)
 			end
 		elseif dr.kind == "msg" then
 			io.write(DIM .. pad_right("  " .. (dr.text or ""), term_cols) .. RESET)
@@ -470,7 +479,7 @@ local function render(term_rows, term_cols)
 	io.write(DIM .. string.rep("─", term_cols) .. RESET)
 
 	io.write(move(term_rows, 1))
-	local help = "  j/k:move  h:fold  l/↵:expand/print  d:hide  D:restore  r:refresh  q:quit"
+	local help = "  j/k:move  h/l:col/fold  ↵:eval  i:inspect  c:clear REPL  d:hide  q:quit"
 	io.write(DIM .. pad_right(help, term_cols) .. RESET)
 
 	io.flush()
@@ -504,13 +513,17 @@ local function handle_key(key, term_rows, term_cols)
 			if dr.kind == "module" then
 				collapsed[dr.name] = true
 			elseif dr.kind == "item" then
-				-- jump to parent and collapse
-				collapsed[dr.module_name] = true
-				-- re-position cursor to parent module row
-				for i, r in ipairs(display_rows) do
-					if r.kind == "module" and r.name == dr.module_name then
-						cursor = i
-						break
+				if col_cursor > 1 then
+					col_cursor = col_cursor - 1
+				else
+					-- jump to parent and collapse
+					collapsed[dr.module_name] = true
+					-- re-position cursor to parent module row
+					for i, r in ipairs(display_rows) do
+						if r.kind == "module" and r.name == dr.module_name then
+							cursor = i
+							break
+						end
 					end
 				end
 			end
@@ -519,7 +532,24 @@ local function handle_key(key, term_rows, term_cols)
 		end
 
 	-- Expand / print (l or Enter)
-	elseif key == "l" or key == "\r" or key == "\n" or key == "\27[C" then
+	elseif key == "l" or key == "\27[C" then
+		local dr = display_rows[cursor]
+		if dr then
+			if dr.kind == "module" then
+				if dr.collapsed then
+					collapsed[dr.name] = nil
+					build_display_rows()
+					clamp_cursor()
+				end
+			elseif dr.kind == "item" then
+				if col_cursor < 3 then
+					col_cursor = col_cursor + 1
+				end
+			end
+		end
+
+	-- Enter key
+	elseif key == "\r" or key == "\n" then
 		local dr = display_rows[cursor]
 		if dr then
 			if dr.kind == "module" and dr.collapsed then
@@ -527,14 +557,34 @@ local function handle_key(key, term_rows, term_cols)
 				build_display_rows()
 				clamp_cursor()
 			elseif dr.kind == "item" then
-				-- Validate name to prevent injection: only allow valid Julia identifiers
-				-- (letters, digits, underscores, Unicode letters — no whitespace or operators)
+				-- Validate name to prevent injection
 				if dr.name:match("^[%a_][%w_!]*$") then
-					local code = "println(" .. dr.name .. ")"
+					local code
+					if col_cursor == 1 then
+						code = "println(" .. dr.name .. ")"
+					elseif col_cursor == 2 then
+						code = "typeof(" .. dr.name .. ")"
+					else
+						code = "dump(" .. dr.name .. ")"
+					end
 					tmux_send(code)
 				end
 			end
 		end
+
+	-- Inspect (i)
+	elseif key == "i" then
+		local dr = display_rows[cursor]
+		if dr and dr.kind == "item" then
+			if dr.name:match("^[%a_][%w_!]*$") then
+				local code = string.format("jEMach.inspect_var(%s, %q)", dr.module_name, dr.name)
+				tmux_send(code)
+			end
+		end
+
+	-- Clear REPL (c)
+	elseif key == "c" then
+		os.execute(string.format("tmux send-keys -t '%s' C-l", repl_pane))
 
 	-- Hide (d)
 	elseif key == "d" then
