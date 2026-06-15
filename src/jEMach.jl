@@ -452,16 +452,17 @@ module jEMach
             return
         end
         
-        # Reactivate original project
-        Pkg.activate(current_project)
-        
-        # Load PackageCompiler dynamically
+        # Load PackageCompiler dynamically while global environment is active
         PackageCompiler = try
-            Base.require(Base.PkgId(Base.UUID("9b87118b-dbb9-11e9-10c9-df29585e1e1b"), "PackageCompiler"))
+            Base.require(Base.PkgId(Base.UUID("9b87118b-4619-50d2-8e1e-99f35a4d4d9d"), "PackageCompiler"))
         catch e
             println("Could not load PackageCompiler.jl: ", e)
+            Pkg.activate(current_project)
             return
         end
+
+        # Reactivate original project
+        Pkg.activate(current_project)
         
         # 2. Define the output path
         sysimage_dir = joinpath(homedir(), ".julia", "sysimages")
@@ -480,7 +481,7 @@ module jEMach
                 PackageCompiler.create_sysimage,
                 pkgs_to_compile,
                 sysimage_path = sysimage_path,
-                project = current_project
+                project = dirname(current_project)
             )
             println("\n" * "✓"^60)
             println(" System image compiled successfully!")
