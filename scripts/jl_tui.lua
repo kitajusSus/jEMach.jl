@@ -479,7 +479,7 @@ local function render(term_rows, term_cols)
 	io.write(DIM .. string.rep("─", term_cols) .. RESET)
 
 	io.write(move(term_rows, 1))
-	local help = "  j/k:move  h/l:col/fold  ↵:eval  i:inspect  c:clear REPL  d:hide  q:quit"
+	local help = "  j/k:move  h/l:col/fold  ↵:eval  i:inspect  s:save  c:clear  d:hide  q:quit"
 	io.write(DIM .. pad_right(help, term_cols) .. RESET)
 
 	io.flush()
@@ -585,6 +585,10 @@ local function handle_key(key, term_rows, term_cols)
 	-- Clear REPL (c)
 	elseif key == "c" then
 		os.execute(string.format("tmux send-keys -t '%s' C-l", repl_pane))
+
+	-- Save clean session (s)
+	elseif key == "s" then
+		tmux_send("jEMach.save_clean_session()")
 
 	-- Hide (d)
 	elseif key == "d" then
