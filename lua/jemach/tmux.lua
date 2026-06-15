@@ -357,4 +357,24 @@ function M.close_inspector_pane()
     end
 end
 
+function M.toggle_tui_popup()
+    if not M.is_available() then
+        vim.notify("Tmux not found or not in a session", vim.log.levels.ERROR)
+        return
+    end
+
+    local plugin_root = require("jemach.utils").get_plugin_root()
+    local tui_script = plugin_root .. "/scripts/jl_tui.lua"
+    local pane_arg = state.pane_id or "{left-of}"
+
+    local cmd = string.format(
+        "tmux display-popup -w 85%% -h 80%% -d %s -E 'luajit %s %s'",
+        vim.fn.shellescape(vim.fn.getcwd()),
+        vim.fn.shellescape(tui_script),
+        vim.fn.shellescape(pane_arg)
+    )
+
+    vim.fn.system(cmd)
+end
+
 return M

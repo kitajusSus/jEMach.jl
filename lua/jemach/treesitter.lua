@@ -159,6 +159,66 @@ function M.get_code_to_send()
 		end
 		return vim.api.nvim_get_current_line()
 	end
+local function is_testset_node(node, bufnr)
+	if node:type() ~= "macrocall_expression" then
+		return false
+	end
+	local macro_name_node = node:child(0)
+	if not macro_name_node then
+		return false
+	end
+	local name = vim.treesitter.get_node_text(macro_name_node, bufnr)
+	return name == "@testset"
+end
+
+function M.detect_testset()
+	local bufnr = vim.api.nvim_get_current_buf()
+	local cursor = vim.api.nvim_win_get_cursor(0)
+	local row, col = cursor[1] - 1, cursor[2]
+
+	local ok, parser = pcall(vim.treesitter.get_parser, bufnr, "julia")
+	if not ok or not parser then
+		return nil
+	end
+
+	local tree = parser:parse()[1]
+	local root = tree:root()
+
+	local node = root:named_descendant_for_range(row, col, row, col)
+	if not node then
+		return nil
+	end
+
+	local current = node
+	while current do
+		if is_testset_node(current, bufnr) then
+			return current
+		end
+		current = current:parent()
+	end
+
+	return nil
+end
+
+function M.run_testset()
+	local bufnr = vim.api.nvim_get_current_buf()
+	local node = M.detect_testset()
+	if not node then
+		vim.notify("⚠️ No @testset found under cursor", vim.log.levels.WARN)
+		return
+	end
+
+	local code = vim.treesitter.get_node_text(node, bufnr)
+	if code and code ~= "" then
+		local repl = require("jemach.repl")
+		if repl.is_repl_running() then
+			repl.send_to_backend(code)
+			local name = code:match('@testset%s+%"([^%"]+)%"') or code:match("@testset%s+([^%s\n]+)") or "testset"
+			vim.notify("🧪 Running testset: " .. name, vim.log.levels.INFO)
+		else
+			vim.notify("⚠️ Julia REPL not running", vim.log.levels.WARN)
+		end
+	end
 end
 
 return M

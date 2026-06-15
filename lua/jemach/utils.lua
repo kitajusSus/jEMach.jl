@@ -64,4 +64,12 @@ function M.get_repl_window(repl)
 	return nil
 end
 
+function M.get_plugin_root()
+	local source = debug.getinfo(1).source
+	if source:sub(1, 1) == "@" then
+		source = source:sub(2)
+	end
+	return vim.fn.fnamemodify(source, ":p:h:h:h")
+end
+
 return M

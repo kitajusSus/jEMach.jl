@@ -53,7 +53,7 @@ module jEMach
             "\"value\":$(_json_str(item["value"]))}"
     end
 
-    function _serialize(modules_data::Vector)::String
+    function _serialize(modules_data::Vector, packages_data::Vector)::String
         buf = IOBuffer()
         write(buf, "{\"timestamp\":")
         write(buf, string(round(Int, time())))
@@ -70,8 +70,32 @@ module jEMach
             write(buf, "]}")
             i < length(modules_data) && write(buf, ",")
         end
+        write(buf, "],\"packages\":[")
+        for (i, pkg) in enumerate(packages_data)
+            write(buf, "{\"name\":$(_json_str(pkg["name"])),\"version\":$(_json_str(pkg["version"]))}")
+            i < length(packages_data) && write(buf, ",")
+        end
         write(buf, "]}")
         return String(take!(buf))
+    end
+
+    function _get_packages()::Vector{Dict{String, String}}
+        pkgs = Dict{String, String}[]
+        try
+            for (name, uuid) in Pkg.project().dependencies
+                ver = "unknown"
+                try
+                    dep_info = Pkg.dependencies()[uuid]
+                    if dep_info.version !== nothing
+                        ver = string(dep_info.version)
+                    end
+                catch
+                end
+                push!(pkgs, Dict("name" => name, "version" => ver))
+            end
+        catch e
+        end
+        return sort!(pkgs; by = x -> x["name"])
     end
 
     # ---------------------------------------------------------------------------
@@ -474,6 +498,32 @@ module jEMach
     const _task_ref = Ref{Union{Task, Nothing}}(nothing)
     const _running = Ref{Bool}(false)
 
+    function publish_state()
+        try
+            state = _collect_state()
+            pkgs = _get_packages()
+            json = _serialize(state, pkgs)
+            
+            # Write to file (fallback / legacy)
+            temp_file = STATE_FILE * ".tmp"
+            open(temp_file, "w") do f
+                write(f, json)
+            end
+            mv(temp_file, STATE_FILE; force=true)
+
+            # Publish to Zig broker
+            try
+                import Sockets
+                conn = Sockets.connect("/tmp/jemach.sock")
+                write(conn, json)
+                close(conn)
+            catch
+            end
+        catch e
+            @warn "jEMach Watcher error" exception = e
+        end
+    end
+
     function start(; split::Bool = true)
         if _running[]
             @info "jEMach Watcher already running"
@@ -482,17 +532,7 @@ module jEMach
             _task_ref[] = @async begin
                 @info "jEMach Watcher started — writing state to $STATE_FILE"
                 while _running[]
-                    try
-                        state = _collect_state()
-                        json = _serialize(state)
-                        temp_file = STATE_FILE * ".tmp"
-                        open(temp_file, "w") do f
-                            write(f, json)
-                        end
-                        mv(temp_file, STATE_FILE; force=true)
-                    catch e
-                        @warn "jEMach Watcher error" exception = e
-                    end
+                    publish_state()
                     sleep(UPDATE_INTERVAL)
                 end
                 @info "jEMach Watcher stopped"

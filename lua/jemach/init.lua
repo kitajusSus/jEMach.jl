@@ -118,6 +118,15 @@ M.cycle_terminal_direction = repl.cycle_terminal_direction
 M.save_workspace = workspace.save_workspace
 M.restore_workspace = workspace.restore_workspace
 M.clear_saved_workspace = workspace.clear_saved_workspace
+M.show_variables = function()
+	require("jemach.picker").show_variables()
+end
+M.run_testset = function()
+	require("jemach.treesitter").run_testset()
+end
+M.toggle_tui_popup = function()
+	require("jemach.tmux").toggle_tui_popup()
+end
 
 function M.set_backend(backend)
 	local valid_backends = { "toggleterm", "vim-slime", "auto" }

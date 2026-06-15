@@ -11,14 +11,9 @@ M.state = {
 		data = nil,
 		debounce_timer = nil,
 	},
-	rpc_server = nil,
-	rpc_pipe_path = vim.fn.stdpath("cache") .. "/jemach_workspace.sock",
+	rpc_client = nil,
+	rpc_pipe_path = "/tmp/jemach.sock",
 }
-
--- Usuwamy stary socket jeśli istnieje (by móc bez problemów postawić nowy)
-local function cleanup_socket()
-	pcall(vim.loop.fs_unlink, M.state.rpc_pipe_path)
-end
 
 -- Obsługa otrzymanej asynchronicznie wiadomości od Julii (JSON)
 local function handle_rpc_data(data)
@@ -40,18 +35,33 @@ local function handle_rpc_data(data)
 			"",
 		}
 
-		if not decoded or vim.tbl_isempty(decoded) then
+		local items = {}
+		if decoded.modules then
+			for _, mod in ipairs(decoded.modules) do
+				if mod.items then
+					for _, item in ipairs(mod.items) do
+						table.insert(items, item)
+					end
+				end
+			end
+		elseif type(decoded) == "table" then
+			items = decoded
+		end
+
+		M.state.cache.raw_data = items
+
+		if vim.tbl_isempty(items) then
 			table.insert(lines, "  No variables defined")
 		else
 			table.insert(lines, "  Name              Type                Value")
 			table.insert(lines, "  ────────────────  ──────────────────  ─────────────")
 
 			-- Sort by name
-			table.sort(decoded, function(a, b)
+			table.sort(items, function(a, b)
 				return a.name < b.name
 			end)
 
-			for _, v in ipairs(decoded) do
+			for _, v in ipairs(items) do
 				-- basic format padding
 				local n = v.name .. string.rep(" ", math.max(0, 16 - #v.name))
 				local t = v.type .. string.rep(" ", math.max(0, 18 - #v.type))
@@ -81,55 +91,81 @@ local function handle_rpc_data(data)
 end
 
 function M.start_server_if_needed()
-	if M.state.rpc_server and not M.state.rpc_server:is_closing() then
+	if M.state.rpc_client and not M.state.rpc_client:is_closing() then
 		return
 	end
 
-	cleanup_socket()
-
-	M.state.rpc_server = vim.loop.new_pipe(false)
-	local err = M.state.rpc_server:bind(M.state.rpc_pipe_path)
-	if err and err ~= 0 then
-		vim.notify("⚠️ Failed to bind workspace socket: " .. tostring(err), vim.log.levels.WARN)
-		M.state.rpc_server:close()
-		M.state.rpc_server = nil
+	local now = vim.loop.now()
+	if M.state.last_connect_time and now - M.state.last_connect_time < 1000 then
 		return
 	end
+	M.state.last_connect_time = now
 
-	M.state.rpc_server:listen(128, function(listen_err)
-		if listen_err then
-			vim.schedule(function()
-				vim.notify("⚠️ Workspace listen error: " .. listen_err, vim.log.levels.WARN)
-			end)
+	M.state.rpc_client = vim.loop.new_pipe(false)
+	M.state.rpc_client:connect(M.state.rpc_pipe_path, function(err)
+		if err then
+			if M.state.rpc_client then
+				M.state.rpc_client:close()
+				M.state.rpc_client = nil
+			end
+
+			-- Start the broker in the background using jobstart
+			local broker_bin = require("jemach.utils").get_plugin_root() .. "/zig/zig-out/bin/jemach-broker"
+			if vim.fn.executable(broker_bin) == 1 then
+				vim.fn.jobstart({ broker_bin }, { detach = true })
+				-- Wait a little bit and retry once.
+				vim.defer_fn(function()
+					M.start_server_if_needed()
+				end, 200)
+			else
+				vim.schedule(function()
+					vim.notify("⚠️ jEMach broker binary not found or not executable: " .. broker_bin, vim.log.levels.ERROR)
+				end)
+			end
 			return
 		end
 
-		local client = vim.loop.new_pipe(false)
-		M.state.rpc_server:accept(client)
+		-- Connection succeeded!
+		-- Register as SUB
+		M.state.rpc_client:write("SUB\n")
 
-		local buffer = {}
-		client:read_start(function(read_err, chunk)
+		-- Read start
+		local buffer = ""
+		M.state.rpc_client:read_start(function(read_err, chunk)
 			if read_err then
-				client:close()
-			elseif chunk then
-				table.insert(buffer, chunk)
-			else
-				local full_data = table.concat(buffer)
-				if full_data and full_data ~= "" then
-					handle_rpc_data(full_data)
+				if M.state.rpc_client then
+					M.state.rpc_client:close()
+					M.state.rpc_client = nil
 				end
-				client:close()
+			elseif chunk then
+				buffer = buffer .. chunk
+				while true do
+					local nl = string.find(buffer, "\n")
+					if not nl then
+						break
+					end
+					local line = string.sub(buffer, 1, nl - 1)
+					buffer = string.sub(buffer, nl + 1)
+					if line ~= "" then
+						handle_rpc_data(line)
+					end
+				end
+			else
+				-- EOF
+				if M.state.rpc_client then
+					M.state.rpc_client:close()
+					M.state.rpc_client = nil
+				end
 			end
 		end)
 	end)
 end
 
 function M.stop_server()
-	if M.state.rpc_server and not M.state.rpc_server:is_closing() then
-		M.state.rpc_server:close()
-		M.state.rpc_server = nil
+	if M.state.rpc_client and not M.state.rpc_client:is_closing() then
+		M.state.rpc_client:close()
+		M.state.rpc_client = nil
 	end
-	cleanup_socket()
 end
 
 function M.update_workspace_panel()
@@ -148,84 +184,8 @@ function M.update_workspace_panel()
 
 	M.start_server_if_needed()
 
-	-- Generate Julia code that connects to Neovim's socket and sends state
-	local julia_code = string.format(
-		[[
-let
-    socket_path = raw"%s"
-    try
-        import Sockets
-        # Get active variables
-        all_names = sort(collect(names(Main, all=true)))
-        user_vars = filter(all_names) do name
-            str_name = string(name)
-            !startswith(str_name, "#") &&
-            !startswith(str_name, "__nvim") &&
-            name != :Main &&
-            name != :Core &&
-            name != :Base
-        end
-
-        var_info = []
-        for name in user_vars
-            try
-                val = getfield(Main, name)
-                val_type = typeof(val)
-
-                size_info = ""
-                if val_type <: AbstractArray
-                    dims = size(val)
-                    size_info = " [" * join(dims, "×") * "]"
-                end
-
-                val_str = try
-                    if val_type <: AbstractArray
-                        "$(eltype(val))$size_info"
-                    elseif val_type <: Number
-                        string(val)
-                    elseif val_type <: String
-                        v = string(val)
-                        length(v) > 30 ? "\"$(first(v, 27))...\"" : "\"$v\""
-                    elseif val_type <: Function
-                        "function"
-                    elseif val_type <: Type
-                        "Type"
-                    elseif val_type <: Module
-                        "Module"
-                    else
-                        s = repr(val, context=:compact=>true)
-                        length(s) > 35 ? s[1:32]*"..." : s
-                    end
-                catch
-                    "?"
-                end
-
-                # manual json escaping (or standard dict -> json array)
-                # for minimal dependency we'll just format it as a manual string array here
-                push!(var_info, "{\"name\":\"$(string(name))\", \"type\":\"$(string(nameof(val_type)))\", \"value\":$(repr(val_str))}")
-            catch
-            end
-        end
-
-        json_output = "[" * join(var_info, ", ") * "]"
-
-        # Connect and send
-        conn = Sockets.connect(socket_path)
-        write(conn, json_output)
-        close(conn)
-    catch e
-    end
-end
-nothing
-]],
-		M.state.rpc_pipe_path
-	)
-
-	-- We send it over directly without file creation, minimizing I/O
-	-- using try-catch to avoid polluting the REPL visually if possible.
-	-- We can wrap it in base64 if needed, but for now simple format is okay
-	local single_line_code = string.gsub(julia_code, "\n", " ")
-	repl.send_to_backend(single_line_code)
+	-- Trigger immediate state publish in the Julia REPL
+	repl.send_to_backend("try jEMach.publish_state() catch; end")
 end
 
 local function get_variable_under_cursor()

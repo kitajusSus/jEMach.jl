@@ -306,3 +306,39 @@ vim.api.nvim_create_user_command("Jfw", function()
 end, {
 	desc = "Julia: Toggle Workflow Mode (alias)",
 })
+
+vim.api.nvim_create_user_command("JuliaVariables", function()
+	require("jemach").show_variables()
+end, {
+	desc = "Show Julia workspace variables in Telescope",
+})
+
+vim.api.nvim_create_user_command("JuliaRunTestset", function()
+	require("jemach").run_testset()
+end, {
+	desc = "Run current Julia testset under cursor",
+})
+
+vim.api.nvim_create_user_command("Jv", function()
+	require("jemach").show_variables()
+end, {
+	desc = "Julia: Show Variables (alias)",
+})
+
+vim.api.nvim_create_user_command("Jt", function()
+	require("jemach").run_testset()
+end, {
+	desc = "Julia: Run Testset (alias)",
+})
+
+vim.api.nvim_create_user_command("JuliaTmuxPopup", function()
+	require("jemach").toggle_tui_popup()
+end, {
+	desc = "Open jEMach TUI in a floating tmux popup",
+})
+
+vim.api.nvim_create_user_command("Jp", function()
+	require("jemach").toggle_tui_popup()
+end, {
+	desc = "Julia: Toggle TUI Popup (alias)",
+})

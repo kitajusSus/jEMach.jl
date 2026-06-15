@@ -17,7 +17,7 @@
 local ffi = require("ffi")
 
 -- ---------------------------------------------------------------------------
--- FFI: non-blocking stdin read via select(2) + read(2)
+-- FFI: non-blocking stdin read via select(2) + read(2) + sockets
 -- ---------------------------------------------------------------------------
 ffi.cdef([[
   typedef long          ssize_t;
@@ -34,6 +34,16 @@ ffi.cdef([[
 
   int     select(int, fd_set_t *, fd_set_t *, fd_set_t *, timeval_t *);
   ssize_t read  (int, void *, size_t);
+
+  struct sockaddr_un {
+    unsigned short sun_family;
+    char           sun_path[108];
+  };
+
+  int     socket(int domain, int type, int protocol);
+  int     connect(int sockfd, const struct sockaddr_un *addr, unsigned int addrlen);
+  int     close(int fd);
+  ssize_t write(int fd, const void *buf, size_t count);
 ]])
 
 local STDIN = 0
@@ -53,28 +63,116 @@ local function fd_set_set(s, fd)
 	s.fds_bits[word] = s.fds_bits[word] + math.floor(2 ^ b)
 end
 
+local function fd_set_isset(s, fd)
+	local word = math.floor(fd / 64)
+	local b = fd % 64
+	local mask = math.floor(2 ^ b)
+	return (s.fds_bits[word] % (2 * mask)) >= mask
+end
+
+local socket_fd = -1
+local last_connect_try = 0
+local socket_buffer = ""
+
+local function try_connect_socket()
+	if socket_fd >= 0 then
+		return
+	end
+
+	local now = os.time()
+	if now - last_connect_try < 3 then
+		return
+	end
+	last_connect_try = now
+
+	local fd = ffi.C.socket(1, 1, 0) -- AF_UNIX = 1, SOCK_STREAM = 1
+	if fd < 0 then
+		return
+	end
+
+	local addr = ffi.new("struct sockaddr_un")
+	addr.sun_family = 1
+	ffi.copy(addr.sun_path, "/tmp/jemach.sock", 16)
+
+	local res = ffi.C.connect(fd, addr, 110)
+	if res == 0 then
+		socket_fd = fd
+		ffi.C.write(socket_fd, "SUB\n", 4)
+	else
+		ffi.C.close(fd)
+	end
+end
+
+local function handle_socket_read()
+	local buf = ffi.new("char[4096]")
+	local n = tonumber(ffi.C.read(socket_fd, buf, 4096))
+	if not n or n <= 0 then
+		ffi.C.close(socket_fd)
+		socket_fd = -1
+		return
+	end
+
+	local chunk = ffi.string(buf, n)
+	socket_buffer = socket_buffer .. chunk
+
+	while true do
+		local nl = socket_buffer:find("\n")
+		if not nl then
+			break
+		end
+		local line = socket_buffer:sub(1, nl - 1)
+		socket_buffer = socket_buffer:sub(nl + 1)
+
+		local ok, parsed = pcall(json_parse, line)
+		if ok and parsed then
+			state = parsed
+			last_state_ts = os.time()
+		end
+	end
+end
+
 -- Read a single key-press (or escape sequence) with a timeout in ms.
+-- Also reads from socket if connected.
 -- Returns nil if no input arrived within the timeout.
 local function read_key(timeout_ms)
+	try_connect_socket()
+
 	local fds = fd_set_new()
 	fd_set_set(fds, STDIN)
+
+	local max_fd = STDIN
+	if socket_fd >= 0 then
+		fd_set_set(fds, socket_fd)
+		if socket_fd > max_fd then
+			max_fd = socket_fd
+		end
+	end
+
 	local tv = ffi.new("timeval_t", { tv_sec = 0, tv_usec = (timeout_ms or 100) * 1000 })
-	local ready = ffi.C.select(STDIN + 1, fds, nil, nil, tv)
+	local ready = ffi.C.select(max_fd + 1, fds, nil, nil, tv)
 	if ready <= 0 then
 		return nil
 	end
 
-	local buf = ffi.new("char[8]")
-	local n = tonumber(ffi.C.read(STDIN, buf, 8))
-	if not n or n <= 0 then
-		return nil
+	if socket_fd >= 0 and fd_set_isset(fds, socket_fd) then
+		handle_socket_read()
 	end
 
-	local s = ""
-	for i = 0, n - 1 do
-		s = s .. string.char(buf[i])
+	if fd_set_isset(fds, STDIN) then
+		local buf = ffi.new("char[8]")
+		local n = tonumber(ffi.C.read(STDIN, buf, 8))
+		if not n or n <= 0 then
+			return nil
+		end
+
+		local s = ""
+		for i = 0, n - 1 do
+			s = s .. string.char(buf[i])
+		end
+		return s
 	end
-	return s
+
+	return nil
 end
 
 -- ---------------------------------------------------------------------------
@@ -274,6 +372,23 @@ local collapsed = {}
 --   { kind="module", name, row_idx }
 --   { kind="item",   module_name, name, item_type, item_kind, value, row_idx }
 --   { kind="gap" }
+local view_mode = "workspace" -- "workspace" or "packages"
+
+local function prompt_input(prompt_str)
+	raw_mode_off()
+	io.write(SHOW_CUR)
+	io.write("\n" .. prompt_str)
+	io.flush()
+	local val = io.read("*l")
+	raw_mode_on()
+	io.write(HIDE_CUR)
+	return val
+end
+
+-- Flat list of "display rows" rebuilt each render pass
+--   { kind="module", name, row_idx }
+--   { kind="item",   module_name, name, item_type, item_kind, value, row_idx }
+--   { kind="gap" }
 local display_rows = {}
 local cursor = 1
 local col_cursor = 1 -- 1: Name, 2: Type, 3: Value
@@ -295,6 +410,10 @@ local function file_mtime(path)
 end
 
 local function load_state()
+	if socket_fd >= 0 then
+		return
+	end
+
 	local mt = file_mtime(STATE_FILE)
 	if mt == last_mtime then
 		return
@@ -320,6 +439,29 @@ end
 -- ---------------------------------------------------------------------------
 local function build_display_rows()
 	display_rows = {}
+
+	if view_mode == "packages" then
+		if not state or not state.packages then
+			display_rows[1] = {
+				kind = "msg",
+				text = "Waiting for packages state…",
+			}
+			return
+		end
+
+		for _, pkg in ipairs(state.packages) do
+			table.insert(display_rows, {
+				kind = "package",
+				name = pkg.name,
+				version = pkg.version,
+			})
+		end
+
+		if #display_rows == 0 then
+			display_rows[1] = { kind = "msg", text = "No packages in active environment." }
+		end
+		return
+	end
 
 	if not state or not state.modules then
 		display_rows[1] = {
@@ -408,7 +550,7 @@ local function render(term_rows, term_cols)
 	io.write(HIDE_CUR .. CLEAR)
 
 	-- Title bar
-	local title = " jEMach Panel C-a +l/+h to enter/quit  [" .. repl_pane .. "]"
+	local title = " jEMach " .. (view_mode == "packages" and "Packages" or "Workspace") .. " Panel C-a +l/+h to enter/quit  [" .. repl_pane .. "]"
 	if last_state_ts > 0 then
 		title = title .. "  ✓ " .. os.date("%H:%M:%S", last_state_ts)
 	end
@@ -467,6 +609,14 @@ local function render(term_rows, term_cols)
 			else
 				io.write(kc .. name_col .. "  " .. type_col .. "  " .. val_col .. RESET)
 			end
+		elseif dr.kind == "package" then
+			local name_col = pad_right("  📦 " .. dr.name, 35)
+			local ver_col = pad_right("v" .. dr.version, 15)
+			if sel then
+				io.write(REV .. FG_CYAN .. name_col .. "  " .. FG_GREEN .. ver_col .. RESET)
+			else
+				io.write(FG_CYAN .. name_col .. "  " .. FG_YELLOW .. ver_col .. RESET)
+			end
 		elseif dr.kind == "msg" then
 			io.write(DIM .. pad_right("  " .. (dr.text or ""), term_cols) .. RESET)
 		end
@@ -479,7 +629,12 @@ local function render(term_rows, term_cols)
 	io.write(DIM .. string.rep("─", term_cols) .. RESET)
 
 	io.write(move(term_rows, 1))
-	local help = "  j/k:move  h/l:col/fold  ↵:eval  TAB:insert  i:inspect  s:save  c:clear  q:quit"
+	local help
+	if view_mode == "packages" then
+		help = "  j/k:move  a:add  d:remove  u:update  P:workspace  q:quit"
+	else
+		help = "  j/k:move  h/l:col/fold  ↵:eval  TAB:insert  i:inspect  s:save  P:packages  q:quit"
+	end
 	io.write(DIM .. pad_right(help, term_cols) .. RESET)
 
 	io.flush()
@@ -605,30 +760,54 @@ local function handle_key(key, term_rows, term_cols)
 			end
 		end
 
-	-- Hide (d)
+	-- Hide/Remove (d)
 	elseif key == "d" then
-		local dr = display_rows[cursor]
-		if dr then
-			if dr.kind == "module" then
-				hidden[dr.name] = true
-			elseif dr.kind == "item" then
-				hidden[dr.module_name .. "/" .. dr.name] = true
+		if view_mode == "packages" then
+			local dr = display_rows[cursor]
+			if dr and dr.kind == "package" then
+				local confirm = prompt_input("Remove package '" .. dr.name .. "'? (y/n): ")
+				if confirm == "y" or confirm == "yes" or confirm == "Y" then
+					tmux_send(string.format("import Pkg; Pkg.rm(%q)", dr.name))
+				end
 			end
-			build_display_rows()
-			if cursor > #display_rows then
-				cursor = #display_rows
+		else
+			local dr = display_rows[cursor]
+			if dr then
+				if dr.kind == "module" then
+					hidden[dr.name] = true
+				elseif dr.kind == "item" then
+					hidden[dr.module_name .. "/" .. dr.name] = true
+				end
+				build_display_rows()
+				if cursor > #display_rows then
+					cursor = #display_rows
+				end
+				clamp_cursor()
 			end
-			clamp_cursor()
 		end
+
+	-- Add package (a)
+	elseif key == "a" and view_mode == "packages" then
+		local pkg_name = prompt_input("Enter package name to add: ")
+		if pkg_name and pkg_name ~= "" then
+			tmux_send(string.format("import Pkg; Pkg.add(%q)", pkg_name))
+		end
+
+	-- Update package (u)
+	elseif key == "u" and view_mode == "packages" then
+		local dr = display_rows[cursor]
+		if dr and dr.kind == "package" then
+			tmux_send(string.format("import Pkg; Pkg.update(%q)", dr.name))
+		else
+			tmux_send("import Pkg; Pkg.update()")
+		end
+
+	-- Toggle view mode (P)
 	elseif key == "P" then
-		local dr = display_rows[cursor]
-		if dr then
-			if dr.kind == "module" then
-				print("Module: " .. dr.name)
-			elseif dr.kind == "item" then
-				print(string.format("Item: %s  Type: %s  Value: %s", dr.name, dr.item_type, dr.value))
-			end
-		end
+		view_mode = (view_mode == "workspace") and "packages" or "workspace"
+		cursor = 1
+		build_display_rows()
+		clamp_cursor()
 
 	-- Restore all hidden (D)
 	elseif key == "D" then
