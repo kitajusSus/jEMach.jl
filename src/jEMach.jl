@@ -169,12 +169,17 @@ module jEMach
         end
         val = getfield(mod, sym)
         
-        println("\n" * "="^60)
-        println("Variable: $mod.$name_str")
-        println("Type:     $(typeof(val))")
+        # ANSI styles
+        bold = "\e[1m"
+        green = "\e[32m"
+        reset = "\e[0m"
+        
+        println("\n" * green * bold * "━"^60 * reset)
+        println(bold * "Variable:      " * reset * "$mod.$name_str")
+        println(bold * "Type:          " * reset * "$(typeof(val))")
         if hasmethod(size, Tuple{typeof(val)})
             try
-                println("Size:     $(size(val))")
+                println(bold * "Size:          " * reset * "$(size(val))")
             catch
             end
         end
@@ -202,8 +207,10 @@ module jEMach
                     end
                 end
                 if !isempty(found_cmd)
-                    println("Created/Modified by:")
-                    println("  ", replace(found_cmd, "\n" => "\n  "))
+                    println(bold * "Created/Modified by:" * reset)
+                    code_md = Base.Docs.Markdown.parse("```julia\n" * found_cmd * "\n```")
+                    show(IOContext(stdout, :color => true), MIME("text/plain"), code_md)
+                    println()
                 end
             catch
             end
@@ -214,18 +221,13 @@ module jEMach
             doc = Base.Docs.doc(Base.Docs.Binding(mod, sym))
             doc_str = string(doc)
             if !isempty(doc_str) && !occursin("No documentation found", doc_str)
-                println("Documentation:")
-                doc_lines = split(doc_str, '\n')
-                for l in first(doc_lines, 15)
-                    println("  ", l)
-                end
-                if length(doc_lines) > 15
-                    println("  ...")
-                end
+                println(bold * "Documentation:" * reset)
+                show(IOContext(stdout, :color => true), MIME("text/plain"), doc)
+                println()
             end
         catch
         end
-        println("="^60)
+        println(green * bold * "━"^60 * reset)
         return nothing
     end
 
