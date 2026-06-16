@@ -1,6 +1,6 @@
 name = "jEMach"
 uuid = "67289db4-f2a6-40b9-80a9-9c8949710e38"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["kitajusSus <kitajusus@users.noreply.github.com>"]
 
 [deps]
