@@ -61,11 +61,81 @@ function _json_str(s::AbstractString)::String
     return String(take!(buf))
 end
 
-function _item_to_json(item::Dict{String, String})::String
-    return "{\"name\":$(_json_str(item["name"]))," *
+function _item_to_json(item::Dict{String, Any})::String
+    s = "{\"name\":$(_json_str(item["name"]))," *
         "\"kind\":$(_json_str(item["kind"]))," *
         "\"type\":$(_json_str(item["type"]))," *
-        "\"value\":$(_json_str(item["value"]))}"
+        "\"value\":$(_json_str(item["value"]))," *
+        "\"expr\":$(_json_str(item["expr"]))"
+    if haskey(item, "children")
+        children = item["children"]::Vector{Dict{String, Any}}
+        child_strs = String[]
+        for c in children
+            push!(child_strs, _item_to_json(c))
+        end
+        s *= ",\"children\":[" * join(child_strs, ",") * "]"
+    end
+    s *= "}"
+    return s
+end
+
+function _get_children(val, parent_expr::String)::Vector{Dict{String, Any}}
+    children = Dict{String, Any}[]
+    T = typeof(val)
+
+    try
+        if val isa Dict
+            for (k, v) in val
+                length(children) >= 15 && break
+                k_str = string(k)
+                k_expr = parent_expr * "[" * repr(k) * "]"
+                push!(children, Dict{String, Any}(
+                    "name" => k_str,
+                    "kind" => "variable",
+                    "type" => string(typeof(v)),
+                    "value" => _value_preview(v),
+                    "expr" => k_expr
+                ))
+            end
+        elseif val isa AbstractArray && ndims(val) == 1
+            for i in 1:min(length(val), 15)
+                push!(children, Dict{String, Any}(
+                    "name" => "[$i]",
+                    "kind" => "variable",
+                    "type" => string(typeof(val[i])),
+                    "value" => _value_preview(val[i]),
+                    "expr" => parent_expr * "[$i]"
+                ))
+            end
+        elseif val isa NamedTuple
+            for name in keys(val)
+                v = val[name]
+                name_str = string(name)
+                push!(children, Dict{String, Any}(
+                    "name" => name_str,
+                    "kind" => "variable",
+                    "type" => string(typeof(v)),
+                    "value" => _value_preview(v),
+                    "expr" => parent_expr * "." * name_str
+                ))
+            end
+        elseif !isprimitivetype(T) && T !== Module && T !== Function && T !== DataType && T !== UnionAll
+            fns = fieldnames(T)
+            for f in fns
+                f_str = string(f)
+                f_val = getfield(val, f)
+                push!(children, Dict{String, Any}(
+                    "name" => f_str,
+                    "kind" => "variable",
+                    "type" => string(typeof(f_val)),
+                    "value" => _value_preview(f_val),
+                    "expr" => parent_expr * "." * f_str
+                ))
+            end
+        end
+    catch
+    end
+    return children
 end
 
 function _serialize(modules_data::Vector, packages_data::Vector)::String
@@ -146,8 +216,8 @@ function _value_preview(val)::String
     end
 end
 
-function _get_items(mod::Module, all::Bool)::Vector{Dict{String, String}}
-    items = Dict{String, String}[]
+function _get_items(mod::Module, all::Bool)::Vector{Dict{String, Any}}
+    items = Dict{String, Any}[]
     for sym in Base.invokelatest(names, mod; all = all, imported = false)
         name = string(sym)
         _skip_name(name) && continue
@@ -189,25 +259,36 @@ function _get_items(mod::Module, all::Bool)::Vector{Dict{String, String}}
             value_str = "(type)"
         end
 
-        push!(
-            items, Dict(
-                "name" => name,
-                "kind" => kind,
-                "type" => type_str,
-                "value" => value_str,
-            )
+        item_expr = (mod == Main) ? name : (string(mod) * "." * name)
+
+        item = Dict{String, Any}(
+            "name" => name,
+            "kind" => kind,
+            "type" => type_str,
+            "value" => value_str,
+            "expr" => item_expr
         )
+
+        if kind == "variable"
+            children = _get_children(val, item_expr)
+            if !isempty(children)
+                item["children"] = children
+            end
+        end
+
+        push!(items, item)
     end
     return sort!(items; by = x -> (x["kind"] == "variable" ? 0 : 1, x["name"]))
 end
 
-function inspect_var(mod::Module, name_str::String)
-    sym = Symbol(name_str)
-    if !isdefined(mod, sym)
-        println("Symbol $name_str is not defined in module $mod.")
+function inspect_var(mod::Module, expr_str::String)
+    val = try
+        expr = Meta.parse(expr_str)
+        Base.invokelatest(Core.eval, mod, expr)
+    catch
+        println("Could not evaluate expression $expr_str in module $mod.")
         return nothing
     end
-    val = getfield(mod, sym)
 
     # ANSI styles
     bold = "\e[1m"
@@ -251,11 +332,15 @@ function inspect_var(mod::Module, name_str::String)
     end
 
     # Search REPL history for creation/assignment
+    base_m = match(r"^[a-zA-Z_][a-zA-Z0-9_]*", expr_str)
+    base_var_str = isnothing(base_m) ? expr_str : base_m.match
+    sym = Symbol(base_var_str)
+
     hist_path = joinpath(homedir(), ".julia", "logs", "repl_history.jl")
     if isfile(hist_path)
         try
             lines = readlines(hist_path)
-            var_regex = Regex("\\b" * name_str * "\\b")
+            var_regex = Regex("\\b" * base_var_str * "\\b")
             found_cmd = ""
             current_block = String[]
             for line in reverse(lines)

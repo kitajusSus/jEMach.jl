@@ -180,7 +180,7 @@ local function start_native_terminal()
 	end
 	table.insert(cmd_parts, "-i")
 	if config.options.use_revise then
-		table.insert(cmd_parts, '-e "using Revise"')
+		table.insert(cmd_parts, '-e "try using Revise catch; end"')
 	end
 
 	return M.state.terminal_bufnr, table.concat(cmd_parts, " ")
@@ -321,7 +321,7 @@ function M.toggle_repl()
 	table.insert(cmd_parts, "-i")
 
 	if config.options.use_revise then
-		table.insert(cmd_parts, '-e "using Revise"')
+		table.insert(cmd_parts, '-e "try using Revise catch; end"')
 	end
 
 	local cmd = table.concat(cmd_parts, " ")

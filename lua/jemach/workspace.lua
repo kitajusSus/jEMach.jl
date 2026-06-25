@@ -62,24 +62,52 @@ local function handle_rpc_data(data)
 			items = decoded
 		end
 
-		M.state.cache.raw_data = items
+		local flat_items = {}
+		local function add_formatted_items(item, depth)
+			table.insert(flat_items, {
+				name = item.name,
+				type = item.type,
+				value = item.value,
+				expr = item.expr or item.name,
+				depth = depth,
+			})
+			if item.children then
+				table.sort(item.children, function(a, b) return a.name < b.name end)
+				for _, child in ipairs(item.children) do
+					add_formatted_items(child, depth + 1)
+				end
+			end
+		end
 
-		if vim.tbl_isempty(items) then
+		table.sort(items, function(a, b)
+			return a.name < b.name
+		end)
+
+		for _, item in ipairs(items) do
+			add_formatted_items(item, 0)
+		end
+
+		M.state.cache.raw_data = flat_items
+		M.state.line_exprs = {}
+
+		if vim.tbl_isempty(flat_items) then
 			table.insert(lines, "  No variables defined")
 		else
 			table.insert(lines, "  Name              Type                Value")
 			table.insert(lines, "  ────────────────  ──────────────────  ─────────────")
 
-			-- Sort by name
-			table.sort(items, function(a, b)
-				return a.name < b.name
-			end)
-
-			for _, v in ipairs(items) do
-				-- basic format padding
-				local n = v.name .. string.rep(" ", math.max(0, 16 - #v.name))
+			for _, v in ipairs(flat_items) do
+				local indent = string.rep("  ", v.depth)
+				local name_prefix = ""
+				if v.depth > 0 then
+					name_prefix = "└─ "
+				end
+				local name_str = indent .. name_prefix .. v.name
+				local n = name_str .. string.rep(" ", math.max(0, 16 - #name_str))
 				local t = v.type .. string.rep(" ", math.max(0, 18 - #v.type))
-				table.insert(lines, "  " .. n .. "  " .. t .. "  " .. v.value)
+				local line_text = "  " .. n .. "  " .. t .. "  " .. v.value
+				table.insert(lines, line_text)
+				M.state.line_exprs[#lines] = v.expr
 			end
 		end
 
@@ -200,11 +228,35 @@ function M.update_workspace_panel()
 
 	M.start_server_if_needed()
 
+	-- Auto-load watcher if not yet loaded in this session
+	local active_buf = repl.state.terminal_bufnr or (repl.state.julia_terminal_obj and repl.state.julia_terminal_obj.bufnr)
+	if active_buf then
+		if not M.state.watcher_loaded_for_buf then
+			M.state.watcher_loaded_for_buf = {}
+		end
+		if not M.state.watcher_loaded_for_buf[active_buf] then
+			local watcher_path = require("jemach.utils").get_plugin_root() .. "/scripts/jl_watcher.jl"
+			repl.send_to_backend(string.format('try if !isdefined(Main, :jEMach); include("%s"); end catch; end', watcher_path))
+			M.state.watcher_loaded_for_buf[active_buf] = true
+			-- Wait a short moment for the background task to start before triggering the first state publish
+			vim.defer_fn(function()
+				repl.send_to_backend("try jEMach.publish_state() catch; end")
+			end, 500)
+			return
+		end
+	end
+
 	-- Trigger immediate state publish in the Julia REPL
 	repl.send_to_backend("try jEMach.publish_state() catch; end")
 end
 
 local function get_variable_under_cursor()
+	local cursor = vim.api.nvim_win_get_cursor(0)
+	local row = cursor[1]
+	if M.state.line_exprs and M.state.line_exprs[row] then
+		return M.state.line_exprs[row]
+	end
+
 	local line = vim.api.nvim_get_current_line()
 	local var = line:match("^%s+(%S+)%s+%S+%s*")
 	return var
@@ -226,7 +278,7 @@ local function setup_workspace_keymaps(bufnr)
 	vim.keymap.set("n", "i", function()
 		local var = get_variable_under_cursor()
 		if var and repl.is_repl_running() then
-			repl.send_to_backend(string.format("@show typeof(%s); @show size(%s)", var, var))
+			repl.send_to_backend(string.format("jEMach.inspect_var(Main, %q)", var))
 			vim.notify("🔍 Inspecting: " .. var, vim.log.levels.INFO)
 		end
 	end, { buffer = bufnr, desc = "Inspect variable" })
@@ -236,7 +288,16 @@ local function setup_workspace_keymaps(bufnr)
 		if var and repl.is_repl_running() then
 			local confirm = vim.fn.confirm(string.format("Delete '%s'?", var), "&Yes\n&No", 2)
 			if confirm == 1 then
-				repl.send_to_backend(string.format("%s = nothing", var))
+				if var:find("%.") or var:find("%[") then
+					local dict_expr, key_expr = var:match("^(.+)%[(.+)%]$")
+					if dict_expr and key_expr then
+						repl.send_to_backend(string.format("delete!(%s, %s)", dict_expr, key_expr))
+					else
+						repl.send_to_backend(string.format("%s = nothing", var))
+					end
+				else
+					repl.send_to_backend(string.format("%s = nothing", var))
+				end
 				vim.notify("🗑️ Deleted: " .. var, vim.log.levels.WARN)
 				M.state.cache.data = nil
 				vim.defer_fn(M.update_workspace_panel, 400)

@@ -141,6 +141,13 @@ function M.get_code_to_send()
 			return table.concat(lines, "\n")
 		end
 
+		if vim.api.nvim_buf_get_text then
+			local ok, text = pcall(vim.api.nvim_buf_get_text, 0, start_row - 1, start_col - 1, end_row - 1, end_col, {})
+			if ok then
+				return table.concat(text, "\n")
+			end
+		end
+
 		if #lines == 1 then
 			lines[1] = string.sub(lines[1], start_col, end_col)
 		else

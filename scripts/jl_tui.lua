@@ -499,6 +499,41 @@ local function build_display_rows()
 		return
 	end
 
+	local function add_item_rows(mname, item, depth, path)
+		local iname = item.name or "?"
+		local key = path .. "/" .. iname
+		if hidden[key] then
+			return
+		end
+
+		local has_children = item.children and #item.children > 0
+		local is_collapsed = collapsed[key]
+		local icon = ""
+		if has_children then
+			icon = is_collapsed and "▶" or "▼"
+		end
+
+		table.insert(display_rows, {
+			kind = "item",
+			module_name = mname,
+			name = iname,
+			item_kind = item.kind or "variable",
+			item_type = item.type or "",
+			value = item.value or "",
+			expr = item.expr or iname,
+			depth = depth,
+			path = key,
+			has_children = has_children,
+			icon = icon,
+		})
+
+		if has_children and not is_collapsed then
+			for _, child in ipairs(item.children) do
+				add_item_rows(mname, child, depth + 1, key)
+			end
+		end
+	end
+
 	for _, mod in ipairs(state.modules) do
 		local mname = mod.name or "?"
 		if not hidden[mname] then
@@ -513,18 +548,7 @@ local function build_display_rows()
 
 			if not is_collapsed and mod.items then
 				for _, item in ipairs(mod.items) do
-					local iname = item.name or "?"
-					local key = mname .. "/" .. iname
-					if not hidden[key] then
-						table.insert(display_rows, {
-							kind = "item",
-							module_name = mname,
-							name = iname,
-							item_kind = item.kind or "variable",
-							item_type = item.type or "",
-							value = item.value or "",
-						})
-					end
+					add_item_rows(mname, item, 0, mname)
 				end
 			end
 		end
@@ -613,7 +637,10 @@ local function render(term_rows, term_cols)
 			end
 		elseif dr.kind == "item" then
 			local kc = KIND_COLOR[dr.item_kind] or FG_WHITE
-			local name_col = pad_right("    " .. dr.name, 26)
+			local indent = string.rep("  ", dr.depth or 0)
+			local item_icon = dr.icon ~= "" and (dr.icon .. " ") or "  "
+			local name_text = "    " .. indent .. item_icon .. dr.name
+			local name_col = pad_right(name_text, 26)
 			local type_col = pad_right(dr.item_type, 18)
 			local val_col = dr.value
 			-- fit value inside remaining space
@@ -698,14 +725,27 @@ local function handle_key(key, term_rows, term_cols)
 			elseif dr.kind == "item" then
 				if col_cursor > 1 then
 					col_cursor = col_cursor - 1
+				elseif dr.has_children and not collapsed[dr.path] then
+					collapsed[dr.path] = true
 				else
-					-- jump to parent and collapse
-					collapsed[dr.module_name] = true
-					-- re-position cursor to parent module row
-					for i, r in ipairs(display_rows) do
-						if r.kind == "module" and r.name == dr.module_name then
-							cursor = i
-							break
+					local parent_path = dr.path:match("(.*)/[^/]+$")
+					if parent_path and parent_path ~= dr.module_name then
+						collapsed[parent_path] = true
+						build_display_rows()
+						for i, r in ipairs(display_rows) do
+							if r.kind == "item" and r.path == parent_path then
+								cursor = i
+								break
+							end
+						end
+					else
+						collapsed[dr.module_name] = true
+						build_display_rows()
+						for i, r in ipairs(display_rows) do
+							if r.kind == "module" and r.name == dr.module_name then
+								cursor = i
+								break
+							end
 						end
 					end
 				end
@@ -725,7 +765,11 @@ local function handle_key(key, term_rows, term_cols)
 					clamp_cursor()
 				end
 			elseif dr.kind == "item" then
-				if col_cursor < 3 then
+				if dr.has_children and collapsed[dr.path] then
+					collapsed[dr.path] = nil
+					build_display_rows()
+					clamp_cursor()
+				elseif col_cursor < 3 then
 					col_cursor = col_cursor + 1
 				end
 			end
@@ -740,15 +784,14 @@ local function handle_key(key, term_rows, term_cols)
 				build_display_rows()
 				clamp_cursor()
 			elseif dr.kind == "item" then
-				-- Validate name to prevent injection
-				if dr.name:match("^[%a_][%w_!]*$") then
+				if dr.expr:match("^[%a_][%w_!%.%[%]%s%\"%:%']*$") then
 					local code
 					if col_cursor == 1 then
-						code = "println(" .. dr.name .. ")"
+						code = "println(" .. dr.expr .. ")"
 					elseif col_cursor == 2 then
-						code = "typeof(" .. dr.name .. ")"
+						code = "typeof(" .. dr.expr .. ")"
 					else
-						code = "dump(" .. dr.name .. ")"
+						code = "dump(" .. dr.expr .. ")"
 					end
 					tmux_send(code)
 				end
@@ -759,8 +802,8 @@ local function handle_key(key, term_rows, term_cols)
 	elseif key == "i" then
 		local dr = display_rows[cursor]
 		if dr and dr.kind == "item" then
-			if dr.name:match("^[%a_][%w_!]*$") then
-				local code = string.format("jEMach.inspect_var(%s, %q)", dr.module_name, dr.name)
+			if dr.expr:match("^[%a_][%w_!%.%[%]%s%\"%:%']*$") then
+				local code = string.format("jEMach.inspect_var(%s, %q)", dr.module_name, dr.expr)
 				tmux_send(code)
 			end
 		end
@@ -777,13 +820,11 @@ local function handle_key(key, term_rows, term_cols)
 	elseif key == "e" or key == "\t" then
 		local dr = display_rows[cursor]
 		if dr and dr.kind == "item" then
-			if dr.name:match("^[%a_][%w_!]*$") then
+			if dr.expr:match("^[%a_][%w_!%.%[%]%s%\"%:%']*$") then
 				if dr.item_kind == "function" then
-					-- Type function_name() and move cursor inside parentheses
-					os.execute(string.format("tmux send-keys -t '%s' '%s()' Left", repl_pane, dr.name))
+					os.execute(string.format("tmux send-keys -t '%s' '%s()' Left", repl_pane, dr.expr))
 				else
-					-- Type variable_name and a space
-					os.execute(string.format("tmux send-keys -t '%s' '%s '", repl_pane, dr.name))
+					os.execute(string.format("tmux send-keys -t '%s' '%s '", repl_pane, dr.expr))
 				end
 			end
 		end
@@ -804,7 +845,7 @@ local function handle_key(key, term_rows, term_cols)
 				if dr.kind == "module" then
 					hidden[dr.name] = true
 				elseif dr.kind == "item" then
-					hidden[dr.module_name .. "/" .. dr.name] = true
+					hidden[dr.path] = true
 				end
 				build_display_rows()
 				if cursor > #display_rows then
