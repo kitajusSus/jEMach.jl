@@ -163,17 +163,22 @@ pub fn main(init: std.process.Init) !void {
                 _ = close(client_fd);
 
                 if (pub_payload.items.len > 0) {
-                    cached_state.clearRetainingCapacity();
-                    try cached_state.appendSlice(allocator, pub_payload.items);
+                    if (pub_payload.items[pub_payload.items.len - 1] != '\n') {
+                        try pub_payload.append(allocator, '\n');
+                    }
 
-                    if (cached_state.items[cached_state.items.len - 1] != '\n') {
-                        try cached_state.append(allocator, '\n');
+                    const is_cmd = std.mem.startsWith(u8, pub_payload.items, "CMD ") or
+                        std.mem.startsWith(u8, pub_payload.items, "{\"cmd\":");
+
+                    if (!is_cmd) {
+                        cached_state.clearRetainingCapacity();
+                        try cached_state.appendSlice(allocator, pub_payload.items);
                     }
 
                     var i: usize = 0;
                     while (i < subscribers.items.len) {
                         const sub_fd = subscribers.items[i];
-                        const write_res = write(sub_fd, cached_state.items.ptr, cached_state.items.len);
+                        const write_res = write(sub_fd, pub_payload.items.ptr, pub_payload.items.len);
                         if (write_res < 0) {
                             std.debug.print("Subscriber disconnected on write, removing.\n", .{});
                             _ = close(sub_fd);
@@ -190,20 +195,31 @@ pub fn main(init: std.process.Init) !void {
         while (i < subscribers.items.len) {
             const poll_idx = i + 1;
             const revents = poll_fds.items[poll_idx].revents;
-            if (revents & (POLLHUP | POLLERR) != 0 or
-                (revents & POLLIN != 0 and isSocketClosed(subscribers.items[i]))) {
-                std.debug.print("Subscriber socket closed, removing (idx: {d})\n", .{i});
+            if (revents & (POLLHUP | POLLERR) != 0) {
+                std.debug.print("Subscriber socket hangup/err, removing (idx: {d})\n", .{i});
                 _ = close(subscribers.items[i]);
                 _ = subscribers.swapRemove(i);
                 continue;
             }
+            if (revents & POLLIN != 0) {
+                var sub_buf: [4096]u8 = undefined;
+                const n = read(subscribers.items[i], &sub_buf, sub_buf.len);
+                if (n <= 0) {
+                    std.debug.print("Subscriber socket closed, removing (idx: {d})\n", .{i});
+                    _ = close(subscribers.items[i]);
+                    _ = subscribers.swapRemove(i);
+                    continue;
+                }
+                // Forward bidirectional RPC command from subscriber to peers
+                const sender_fd = subscribers.items[i];
+                const msg_slice = sub_buf[0..@intCast(n)];
+                for (subscribers.items) |peer_fd| {
+                    if (peer_fd != sender_fd) {
+                        _ = write(peer_fd, msg_slice.ptr, msg_slice.len);
+                    }
+                }
+            }
             i += 1;
         }
     }
-}
-
-fn isSocketClosed(fd: c_int) bool {
-    var buf: [1]u8 = undefined;
-    const rc = recv(fd, &buf, buf.len, MSG_PEEK | MSG_DONTWAIT);
-    return rc == 0;
 }

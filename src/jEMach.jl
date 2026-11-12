@@ -12,7 +12,7 @@ import Dates
 import Pkg
 import Sockets
 
-export make_procedure, record, record_stop, run_procedure, list_procedures, find_procedures, search_procedures, get_recent_commands
+export make_procedure, record, record_stop, run_procedure, list_procedures, find_procedures, search_procedures, get_recent_commands, detect_backend, terminal_info, @jemach
 
 const STATE_FILE = Ref{String}("/tmp/jl_tui_state.json")
 const SOCKET_PATH = Ref{String}("/tmp/jemach.sock")
@@ -987,6 +987,8 @@ function _serialize_dod(t::WorkspaceTable, packages_data::Vector)::String
     buf = IOBuffer()
     write(buf, "{\"timestamp\":")
     write(buf, string(round(Int, time())))
+    write(buf, ",\"backend\":")
+    _write_json_str(buf, string(detect_backend()))
     write(buf, ",\"columns\":{")
 
     write(buf, "\"names\":[")
@@ -1132,8 +1134,9 @@ end
 # Names that are always present in a fresh REPL and clutter the view
 const _BUILTIN_NAMES = Set(
     [
-        "ans", "err", "eval", "include",
+        "ans", "err", "eval", "include", "clear",
         "Base", "Core", "Main", "InteractiveUtils",
+        "jEMach", "OhMyREPL", "Revise",
     ]
 )
 
@@ -1354,7 +1357,7 @@ function _collect_state_dod!(t::WorkspaceTable)::WorkspaceTable
     end
 
     # 3. Other loaded packages (from Base.loaded_modules)
-    seen = Set(["Main", "Base", "Core"])
+    seen = Set(["Main", "Base", "Core", "jEMach", "OhMyREPL", "Revise", "Pkg", "InteractiveUtils", "VSCodeServer"])
     for (_, mod) in Base.loaded_modules
         name = string(mod)
         name in seen && continue
@@ -1502,6 +1505,311 @@ function compile_sysimage(extra_pkgs::Vector{Symbol} = Symbol[])
 end
 
 # ---------------------------------------------------------------------------
+# Terminal & Multiplexer Backend Detection (Ghostty / Kitty / tmux / Zellij / Rex)
+# ---------------------------------------------------------------------------
+
+const _backend_override = Ref{Symbol}(:auto)
+
+"""
+    detect_backend(preferred::Symbol = :auto) -> Symbol
+
+Detect the active terminal multiplexer or terminal emulator backend.
+Priority order:
+1. Explicit `preferred` argument or `ENV["JEMACH_BACKEND"]`
+2. Active terminal multiplexers (since they may run inside Ghostty or Kitty):
+   - `:rex`    (upcoming multiplexer from Ghostty creators: `REX_SESSION`, `REX`, `REX_PANE_ID`, `REX_SOCKET`, `GHOSTTY_REX`)
+   - `:zellij` (`ZELLIJ`, `ZELLIJ_SESSION_NAME`, `ZELLIJ_PANE_ID`)
+   - `:tmux`   (`TMUX`)
+3. Terminal emulators with native split / window control:
+   - `:kitty`   (`KITTY_WINDOW_ID`, `KITTY_PID`, `TERM == "xterm-kitty"`)
+   - `:ghostty` (`TERM_PROGRAM == "ghostty"`, `GHOSTTY_RESOURCES_DIR`, `GHOSTTY_BIN_DIR`, `TERM == "xterm-ghostty"`)
+4. `:standalone` fallback
+"""
+function detect_backend(preferred::Symbol = :auto)::Symbol
+    if preferred != :auto
+        return preferred
+    end
+    if _backend_override[] != :auto
+        return _backend_override[]
+    end
+    env_b = strip(lowercase(get(ENV, "JEMACH_BACKEND", "")))
+    if !isempty(env_b) && env_b != "auto"
+        return Symbol(env_b)
+    end
+
+    # 1. Multiplexers
+    if haskey(ENV, "REX_SESSION") || haskey(ENV, "REX") || haskey(ENV, "REX_PANE_ID") ||
+       haskey(ENV, "REX_SOCKET") || haskey(ENV, "GHOSTTY_REX")
+        return :rex
+    elseif haskey(ENV, "ZELLIJ") || haskey(ENV, "ZELLIJ_SESSION_NAME") || haskey(ENV, "ZELLIJ_PANE_ID")
+        return :zellij
+    elseif haskey(ENV, "TMUX") && !isempty(ENV["TMUX"])
+        return :tmux
+    end
+
+    # 2. Native terminals
+    term = lowercase(get(ENV, "TERM", ""))
+    term_prog = lowercase(get(ENV, "TERM_PROGRAM", ""))
+
+    if haskey(ENV, "KITTY_WINDOW_ID") || haskey(ENV, "KITTY_PID") || term == "xterm-kitty"
+        return :kitty
+    elseif term_prog == "ghostty" || haskey(ENV, "GHOSTTY_RESOURCES_DIR") ||
+           haskey(ENV, "GHOSTTY_BIN_DIR") || term == "xterm-ghostty"
+        return :ghostty
+    end
+
+    return :standalone
+end
+
+"""
+    terminal_info() -> Dict{Symbol, Any}
+
+Return diagnostic details about the detected terminal and multiplexer environment.
+"""
+function terminal_info()::Dict{Symbol, Any}
+    b = detect_backend()
+    return Dict{Symbol, Any}(
+        :backend => b,
+        :term => get(ENV, "TERM", ""),
+        :term_program => get(ENV, "TERM_PROGRAM", ""),
+        :tmux => haskey(ENV, "TMUX"),
+        :zellij => haskey(ENV, "ZELLIJ") || haskey(ENV, "ZELLIJ_SESSION_NAME"),
+        :kitty => haskey(ENV, "KITTY_WINDOW_ID") || get(ENV, "TERM", "") == "xterm-kitty",
+        :kitty_listen_on => get(ENV, "KITTY_LISTEN_ON", ""),
+        :ghostty => lowercase(get(ENV, "TERM_PROGRAM", "")) == "ghostty" || haskey(ENV, "GHOSTTY_RESOURCES_DIR"),
+        :rex => haskey(ENV, "REX_SESSION") || haskey(ENV, "REX") || haskey(ENV, "GHOSTTY_REX"),
+        :socket_path => SOCKET_PATH[],
+        :state_file => STATE_FILE[],
+    )
+end
+
+# ---------------------------------------------------------------------------
+# Bidirectional Socket Command Parser & REPL Executor
+# ---------------------------------------------------------------------------
+
+function _parse_json_cmd(s::AbstractString)::Dict{String, Any}
+    res = Dict{String, Any}()
+    str = strip(s)
+    if startswith(str, "CMD ")
+        str = strip(str[5:end])
+    end
+    (!startswith(str, "{") || !endswith(str, "}")) && return res
+
+    # Lightweight key-value extractor for flat JSON command objects
+    pos = nextind(str, firstindex(str))
+    last_i = prevind(str, lastindex(str))
+
+    function skip_ws(i)
+        while i <= last_i && isspace(str[i])
+            i = nextind(str, i)
+        end
+        return i
+    end
+
+    function read_str(i)
+        i > last_i || str[i] != '"' && return ("", i)
+        i = nextind(str, i)
+        buf = IOBuffer()
+        while i <= last_i
+            c = str[i]
+            if c == '"'
+                return (String(take!(buf)), nextind(str, i))
+            elseif c == '\\'
+                i = nextind(str, i)
+                i > last_i && break
+                esc_c = str[i]
+                if esc_c == '"'
+                    write(buf, '"')
+                elseif esc_c == '\\'
+                    write(buf, '\\')
+                elseif esc_c == 'n'
+                    write(buf, '\n')
+                elseif esc_c == 'r'
+                    write(buf, '\r')
+                elseif esc_c == 't'
+                    write(buf, '\t')
+                else
+                    write(buf, esc_c)
+                end
+            else
+                write(buf, c)
+            end
+            i = nextind(str, i)
+        end
+        return (String(take!(buf)), i)
+    end
+
+    while pos <= last_i
+        pos = skip_ws(pos)
+        pos > last_i && break
+        if str[pos] == ','
+            pos = nextind(str, pos)
+            pos = skip_ws(pos)
+        end
+        pos > last_i || str[pos] != '"' && break
+        key, pos = read_str(pos)
+        pos = skip_ws(pos)
+        (pos > last_i || str[pos] != ':') && break
+        pos = nextind(str, pos)
+        pos = skip_ws(pos)
+        pos > last_i && break
+
+        if str[pos] == '"'
+            val, pos = read_str(pos)
+            res[key] = val
+        elseif isdigit(str[pos]) || str[pos] == '-'
+            start_num = pos
+            while pos <= last_i && (isdigit(str[pos]) || str[pos] in ('-', '.'))
+                pos = nextind(str, pos)
+            end
+            num_str = SubString(str, start_num, prevind(str, pos))
+            res[key] = something(tryparse(Int, num_str), tryparse(Float64, num_str), 0)
+        elseif startswith(SubString(str, pos), "true")
+            res[key] = true
+            pos = nextind(str, pos, 4)
+        elseif startswith(SubString(str, pos), "false")
+            res[key] = false
+            pos = nextind(str, pos, 5)
+        else
+            break
+        end
+    end
+    return res
+end
+
+function _get_mistate()
+    if isdefined(Base, :active_repl)
+        repl = Base.active_repl
+        if hasproperty(repl, :mistate) && !isnothing(repl.mistate)
+            return repl.mistate
+        end
+    end
+    return nothing
+end
+
+function _append_repl_history(code::AbstractString)
+    !_is_valid_user_cmd(code) && return
+    hist_path = joinpath(homedir(), ".julia", "logs", "repl_history.jl")
+    !isdir(dirname(hist_path)) && return
+    try
+        ts = Dates.format(Dates.now(), "yyyy-mm-dd HH:MM:SS")
+        open(hist_path, "a") do f
+            write(f, "# time: $(ts) CET\n# mode: julia\n")
+            for line in split(code, '\n')
+                write(f, "\t", line, "\n")
+            end
+        end
+    catch
+    end
+end
+
+function _repl_eval(code::AbstractString; silent::Bool = false)
+    clean_code = strip(String(code))
+    isempty(clean_code) && return
+
+    if silent
+        try
+            ex = Meta.parseall(clean_code)
+            Base.invokelatest(Core.eval, Main, ex)
+        catch e
+            @warn "jEMach background eval failed" exception = e
+        end
+        publish_state()
+        return
+    end
+
+    s = _get_mistate()
+    if !isnothing(s)
+        print(stdout, "\r\e[2K\e[32m\e[1mjulia> \e[0m", clean_code, "\n")
+        flush(stdout)
+    else
+        println(stdout, "\njulia> ", clean_code)
+    end
+
+    _append_repl_history(clean_code)
+
+    try
+        ex = Meta.parseall(clean_code)
+        val = Base.invokelatest(Core.eval, Main, ex)
+        try Core.eval(Main, Expr(:(=), :ans, QuoteNode(val))) catch; end
+
+        is_self_printing = startswith(clean_code, "println(") ||
+                           startswith(clean_code, "print(") ||
+                           startswith(clean_code, "dump(") ||
+                           startswith(clean_code, "jEMach.")
+        if val !== nothing && !endswith(clean_code, ";") && !is_self_printing
+            Base.invokelatest(
+                show,
+                IOContext(stdout, :limit => true, :color => true),
+                MIME("text/plain"),
+                val
+            )
+            println(stdout)
+        end
+    catch e
+        Base.invokelatest(Base.showerror, stdout, e, catch_backtrace())
+        println(stdout)
+    end
+
+    println(stdout)
+    flush(stdout)
+    if !isnothing(s)
+        try
+            le = parentmodule(typeof(s))
+            Base.invokelatest(le.refresh_line, s)
+        catch
+        end
+    end
+    publish_state()
+end
+
+function _repl_insert(text::AbstractString, move_left::Int = 0)
+    s = _get_mistate()
+    isnothing(s) && return
+    try
+        le = parentmodule(typeof(s))
+        Base.invokelatest(le.edit_insert, s, String(text))
+        for _ in 1:move_left
+            Base.invokelatest(le.edit_move_left, s)
+        end
+        Base.invokelatest(le.refresh_line, s)
+    catch
+    end
+end
+
+function _repl_clear()
+    s = _get_mistate()
+    try
+        print(stdout, "\e[2J\e[H")
+        flush(stdout)
+        if !isnothing(s)
+            le = parentmodule(typeof(s))
+            Base.invokelatest(le.refresh_line, s)
+        end
+    catch
+    end
+end
+
+function _handle_socket_message(line::AbstractString)
+    msg = _parse_json_cmd(line)
+    isempty(msg) && return
+    cmd = get(msg, "cmd", get(msg, "action", ""))
+    if cmd == "eval"
+        code = string(get(msg, "code", ""))
+        @async _repl_eval(code; silent = false)
+    elseif cmd == "eval_silent"
+        code = string(get(msg, "code", ""))
+        @async _repl_eval(code; silent = true)
+    elseif cmd == "insert"
+        text = string(get(msg, "text", ""))
+        move_left = Int(get(msg, "move_left", 0))
+        @async _repl_insert(text, move_left)
+    elseif cmd == "clear"
+        @async _repl_clear()
+    end
+end
+
+# ---------------------------------------------------------------------------
 # Background watcher task
 # ---------------------------------------------------------------------------
 
@@ -1511,6 +1819,8 @@ const _socket_clients = Set{Sockets.PipeEndpoint}()
 const _server_ref = Ref{Union{Sockets.PipeServer, Nothing}}(nothing)
 const _last_serialized_json = Ref{String}("")
 const _tui_pane_ref = Ref{String}("")
+const _tui_backend_ref = Ref{Symbol}(:none)
+const _tui_proc_ref = Ref{Union{Base.Process, Nothing}}(nothing)
 
 function _start_socket_server()
     path = SOCKET_PATH[]
@@ -1534,9 +1844,19 @@ function _start_socket_server()
                                         write(client, _last_serialized_json[] * "\n")
                                         flush(client)
                                     end
+                                    # Keep reading bidirectional RPC commands from this TUI subscriber
+                                    while _running[] && isopen(client) && !eof(client)
+                                        cmd_line = readline(client)
+                                        !isempty(strip(cmd_line)) && _handle_socket_message(cmd_line)
+                                    end
+                                elseif !isempty(strip(line))
+                                    _handle_socket_message(line)
+                                    try close(client) catch; end
                                 end
                             end
                         catch
+                        finally
+                            delete!(_socket_clients, client)
                         end
                     end
                 catch
@@ -1576,35 +1896,250 @@ function _stop_socket_server()
 end
 
 function _close_tui_pane()
-    # 1. Close directly tracked tmux pane if opened by jEMach.start()
-    if !isempty(_tui_pane_ref[])
-        try
-            run(`tmux kill-pane -t $(_tui_pane_ref[])`)
-        catch
-        end
-        _tui_pane_ref[] = ""
-    end
+    backend = _tui_backend_ref[] != :none ? _tui_backend_ref[] : detect_backend()
 
-    # 2. Fallback: Search current tmux window for any pane running jl-assist or jl_tui.lua
-    if haskey(ENV, "TMUX")
+    # 1. Close tracked background process if spawned directly (Ghostty / Kitty window fallback)
+    if !isnothing(_tui_proc_ref[])
         try
-            out = read(`tmux list-panes -F "#{pane_id} #{pane_current_command} #{pane_title}"`, String)
-            cur_pane = try strip(read(`tmux display-message -p "#{pane_id}"`, String)) catch; "" end
-            for line in split(strip(out), '\n')
-                parts = split(strip(line))
-                if !isempty(parts)
-                    pid = parts[1]
-                    if pid != cur_pane # Never kill Julia's own pane!
-                        line_str = lowercase(line)
-                        if occursin("luajit", line_str) || occursin("jl_tui", line_str) || occursin("jl-assist", line_str)
-                            try run(`tmux kill-pane -t $pid`) catch; end
-                        end
-                    end
-                end
+            if process_running(_tui_proc_ref[])
+                kill(_tui_proc_ref[])
             end
         catch
         end
+        _tui_proc_ref[] = nothing
     end
+
+    # 2. Close backend-specific pane/window if still open
+    if backend == :tmux || haskey(ENV, "TMUX")
+        if !isempty(_tui_pane_ref[])
+            try run(pipeline(`tmux kill-pane -t $(_tui_pane_ref[])`, devnull)) catch; end
+            _tui_pane_ref[] = ""
+        end
+        if haskey(ENV, "TMUX")
+            try
+                out = read(`tmux list-panes -F "#{pane_id} #{pane_current_command} #{pane_title}"`, String)
+                cur_pane = try strip(read(`tmux display-message -p "#{pane_id}"`, String)) catch; "" end
+                for line in split(strip(out), '\n')
+                    parts = split(strip(line))
+                    if !isempty(parts)
+                        pid = parts[1]
+                        if pid != cur_pane
+                            line_str = lowercase(line)
+                            if occursin("luajit", line_str) || occursin("jl_tui", line_str) || occursin("jl-assist", line_str)
+                                try run(pipeline(`tmux kill-pane -t $pid`, devnull)) catch; end
+                            end
+                        end
+                    end
+                end
+            catch
+            end
+        end
+    elseif backend == :kitty
+        if !isempty(_tui_pane_ref[])
+            try
+                run(pipeline(`kitten @ close-window --match id:$(_tui_pane_ref[])`, devnull))
+            catch
+            end
+            _tui_pane_ref[] = ""
+        end
+    elseif backend == :rex
+        if !isempty(_tui_pane_ref[])
+            rex_bin = get(ENV, "JEMACH_REX_BIN", "rex")
+            try
+                if haskey(ENV, "JEMACH_REX_CLOSE_CMD")
+                    cmd_str = replace(ENV["JEMACH_REX_CLOSE_CMD"], "{pane}" => _tui_pane_ref[])
+                    run(pipeline(`sh -c $cmd_str`, devnull))
+                else
+                    run(pipeline(`$rex_bin kill-pane -t $(_tui_pane_ref[])`, devnull))
+                end
+            catch
+            end
+            _tui_pane_ref[] = ""
+        end
+    end
+    _tui_backend_ref[] = :none
+end
+
+function _open_tui_pane(; backend::Symbol = detect_backend(), width::Int = 65)
+    tui_script = normpath(joinpath(@__DIR__, "..", "scripts", "jl_tui.lua"))
+    proj_dir = _get_project_dir()
+    sock = SOCKET_PATH[]
+    st_file = STATE_FILE[]
+
+    if isnothing(Sys.which("luajit"))
+        @warn "luajit not found in PATH — cannot launch jEMach TUI automatically."
+        return nothing
+    end
+
+    # Custom user override command template (works in any terminal/WM)
+    if haskey(ENV, "JEMACH_SPLIT_CMD") && !isempty(strip(ENV["JEMACH_SPLIT_CMD"]))
+        tpl = ENV["JEMACH_SPLIT_CMD"]
+        cmd_str = replace(
+            tpl,
+            "{width}" => string(width),
+            "{cwd}" => proj_dir,
+            "{socket}" => sock,
+            "{state}" => st_file,
+            "{proj}" => proj_dir,
+            "{tui_script}" => tui_script,
+        )
+        _tui_proc_ref[] = run(Cmd(`sh -c $cmd_str`; dir = proj_dir); wait = false)
+        _tui_backend_ref[] = backend
+        println("🚀 Custom jEMach TUI split launched ($backend)!")
+        return nothing
+    end
+
+    if backend == :tmux
+        try
+            already_open = false
+            if !isempty(_tui_pane_ref[])
+                try
+                    run(pipeline(`tmux display-message -t $(_tui_pane_ref[]) -p "#{pane_id}"`, devnull))
+                    already_open = true
+                catch
+                    _tui_pane_ref[] = ""
+                end
+            end
+
+            if already_open
+                println("🚀 tmux TUI split already active ($(_tui_pane_ref[]))")
+            else
+                _close_tui_pane()
+                cur_pane = try strip(read(`tmux display-message -p "#{pane_id}"`, String)) catch; "" end
+                pane_arg = !isempty(cur_pane) ? cur_pane : "{left-of}"
+                cmd = `tmux split-window -P -F "#{pane_id}" -h -l $width -c $proj_dir -e JEMACH_SOCKET=$sock -e JEMACH_STATE=$st_file -e JEMACH_PROJ=$proj_dir -e JEMACH_BACKEND=tmux luajit $tui_script $pane_arg $sock $st_file`
+                pane_id = strip(read(cmd, String))
+                _tui_pane_ref[] = pane_id
+                _tui_backend_ref[] = :tmux
+                println("🚀 tmux TUI split opened ($pane_id)!")
+            end
+        catch e
+            @warn "Failed to open tmux TUI pane" exception = e
+        end
+
+    elseif backend == :zellij
+        try
+            direction_args = get(ENV, "JEMACH_ZELLIJ_FLOATING", "0") == "1" ? ["--floating"] : ["--direction", "right"]
+            cmd = `zellij run $(direction_args) --name jEMach --cwd $proj_dir --close-on-exit -- env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=zellij luajit $tui_script zellij $sock $st_file`
+            run(cmd; wait = false)
+            _tui_backend_ref[] = :zellij
+            println("🚀 Zellij TUI pane opened!")
+        catch e
+            @warn "Failed to open Zellij TUI pane" exception = e
+        end
+
+    elseif backend == :kitty
+        try
+            # Try Kitty remote control first (in-tab vsplit)
+            rc_ok = false
+            kitty_win_id = get(ENV, "KITTY_WINDOW_ID", "kitty")
+            if !isnothing(Sys.which("kitten"))
+                try
+                    cmd = `kitten @ launch --type=window --location=vsplit --keep-focus --title=jEMach --cwd=$proj_dir --env JEMACH_SOCKET=$sock --env JEMACH_STATE=$st_file --env JEMACH_PROJ=$proj_dir --env JEMACH_BACKEND=kitty luajit $tui_script $kitty_win_id $sock $st_file`
+                    win_id = strip(read(pipeline(cmd, stderr = devnull), String))
+                    _tui_pane_ref[] = win_id
+                    _tui_backend_ref[] = :kitty
+                    rc_ok = true
+                    println("🚀 Kitty TUI vsplit opened (window $win_id)!")
+                catch
+                    rc_ok = false
+                end
+            end
+
+            # Fallback to companion Kitty OS window if remote control is disabled
+            if !rc_ok
+                cmd = `kitty --title=jEMach --directory=$proj_dir -o initial_window_width=$(width)c -o remember_window_size=no env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=kitty luajit $tui_script $kitty_win_id $sock $st_file`
+                _tui_proc_ref[] = run(cmd; wait = false)
+                _tui_backend_ref[] = :kitty
+                println("🚀 Kitty companion TUI window opened! (Tip: set `allow_remote_control yes` in kitty.conf for in-tab vsplit)")
+            end
+        catch e
+            @warn "Failed to open Kitty TUI window" exception = e
+        end
+
+    elseif backend == :ghostty
+        try
+            if haskey(ENV, "JEMACH_GHOSTTY_CMD") && !isempty(strip(ENV["JEMACH_GHOSTTY_CMD"]))
+                tpl = ENV["JEMACH_GHOSTTY_CMD"]
+                cmd_str = replace(
+                    tpl,
+                    "{width}" => string(width),
+                    "{cwd}" => proj_dir,
+                    "{socket}" => sock,
+                    "{state}" => st_file,
+                    "{proj}" => proj_dir,
+                    "{tui_script}" => tui_script,
+                )
+                _tui_proc_ref[] = run(Cmd(`sh -c $cmd_str`; dir = proj_dir); wait = false)
+            elseif Sys.isapple()
+                cmd = `open -na Ghostty.app --args --title=jEMach --working-directory=$proj_dir --window-width=$width --wait-after-command=false -e env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=ghostty luajit $tui_script ghostty $sock $st_file`
+                _tui_proc_ref[] = run(cmd; wait = false)
+            else
+                mode = lowercase(get(ENV, "JEMACH_GHOSTTY_MODE", "window"))
+                if mode == "tab"
+                    cmd = `ghostty +new-tab -e env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=ghostty luajit $tui_script ghostty $sock $st_file`
+                else
+                    cmd = `ghostty --title=jEMach --working-directory=$proj_dir --window-width=$width --wait-after-command=false -e env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=ghostty luajit $tui_script ghostty $sock $st_file`
+                end
+                _tui_proc_ref[] = run(cmd; wait = false)
+            end
+            _tui_backend_ref[] = :ghostty
+            println("🚀 Ghostty jEMach TUI window opened! (Or split in Ghostty with Ctrl+Shift+O and run `./scripts/jl-assist`)")
+        catch e
+            @warn "Failed to launch Ghostty TUI window. In Ghostty you can also press Ctrl+Shift+O to split right and run `./scripts/jl-assist`." exception = e
+        end
+
+    elseif backend == :rex
+        rex_bin = get(ENV, "JEMACH_REX_BIN", "rex")
+        try
+            if haskey(ENV, "JEMACH_REX_SPLIT_CMD") && !isempty(strip(ENV["JEMACH_REX_SPLIT_CMD"]))
+                tpl = ENV["JEMACH_REX_SPLIT_CMD"]
+                cmd_str = replace(
+                    tpl,
+                    "{width}" => string(width),
+                    "{cwd}" => proj_dir,
+                    "{socket}" => sock,
+                    "{state}" => st_file,
+                    "{proj}" => proj_dir,
+                    "{tui_script}" => tui_script,
+                )
+                out = strip(read(`sh -c $cmd_str`, String))
+                _tui_pane_ref[] = out
+                _tui_backend_ref[] = :rex
+                println("🚀 Rex TUI split opened!")
+            elseif !isnothing(Sys.which(rex_bin))
+                pane_arg = get(ENV, "REX_PANE_ID", "rex")
+                opened = false
+                # Probe candidate Rex CLI split subcommands (pane split vs tmux-compatible split-window)
+                for candidate in (
+                    `$rex_bin pane split --direction right --size $width --cwd $proj_dir -- env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=rex luajit $tui_script $pane_arg $sock $st_file`,
+                    `$rex_bin split-window -h -l $width -c $proj_dir env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=rex luajit $tui_script $pane_arg $sock $st_file`,
+                    `$rex_bin split --right --cwd $proj_dir -- env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=rex luajit $tui_script $pane_arg $sock $st_file`,
+                )
+                    try
+                        run(pipeline(candidate, stderr = devnull))
+                        opened = true
+                        break
+                    catch
+                    end
+                end
+                _tui_backend_ref[] = :rex
+                if opened
+                    println("🚀 Rex TUI split opened!")
+                else
+                    @info "Rex session detected. Open a Rex split and run:\n  ./scripts/jl-assist -i\n(Or customize ENV[\"JEMACH_REX_SPLIT_CMD\"])"
+                end
+            else
+                @info "Rex backend selected (binary '$rex_bin' not yet in PATH). Open a split and run:\n  ./scripts/jl-assist -i"
+            end
+        catch e
+            @warn "Failed to open Rex TUI split" exception = e
+        end
+
+    else
+        @info "Terminal backend: $backend. To launch the interactive TUI in any terminal split or window, run:\n  ./scripts/jl-assist -i\n  # or directly:\n  luajit $(tui_script) standalone $(sock) $(st_file)"
+    end
+    return nothing
 end
 
 function publish_state()
@@ -1649,71 +2184,103 @@ function publish_state()
     end
 end
 
-function start(; split::Bool = true)
+function start(; split::Bool = true, backend::Symbol = :auto, width::Int = 65, quiet::Bool = false)
+    if backend != :auto
+        _backend_override[] = backend
+    end
     _load_procedures!()
     if _running[]
-        @info "jEMach Watcher already running"
+        !quiet && !split && @info "jEMach Watcher already running"
     else
         _running[] = true
         _start_socket_server()
         _task_ref[] = @async begin
-            @info "jEMach Watcher started — writing state to $(STATE_FILE[]) and socket $(SOCKET_PATH[])"
+            !quiet && @info "jEMach Watcher started — writing state to $(STATE_FILE[]) and socket $(SOCKET_PATH[]) [backend: $(detect_backend())]"
             while _running[]
                 publish_state()
                 sleep(UPDATE_INTERVAL)
             end
             _stop_socket_server()
-            @info "jEMach Watcher stopped"
+            !quiet && @info "jEMach Watcher stopped"
         end
     end
 
     if split
-        tui_script = normpath(joinpath(@__DIR__, "..", "scripts", "jl_tui.lua"))
-        proj_dir = _get_project_dir()
-        sock = SOCKET_PATH[]
-        st_file = STATE_FILE[]
-
         # Publish initial state immediately so the state file is present before TUI starts
         publish_state()
-
-        if haskey(ENV, "TMUX")
-            try
-                already_open = false
-                if !isempty(_tui_pane_ref[])
-                    try
-                        run(pipeline(`tmux display-message -t $(_tui_pane_ref[]) -p "#{pane_id}"`, devnull))
-                        already_open = true
-                    catch
-                        _tui_pane_ref[] = ""
-                    end
-                end
-
-                if already_open
-                    println("🚀 tmux TUI split already active ($(_tui_pane_ref[]))")
-                else
-                    _close_tui_pane() # Clean up any orphaned panels
-                    cur_pane = try strip(read(`tmux display-message -p "#{pane_id}"`, String)) catch; "" end
-                    pane_arg = !isempty(cur_pane) ? cur_pane : "{left-of}"
-                    cmd = `tmux split-window -P -F "#{pane_id}" -h -l 65 -c $(proj_dir) -e JEMACH_SOCKET=$(sock) -e JEMACH_STATE=$(st_file) -e JEMACH_PROJ=$(proj_dir) luajit $(tui_script) $(pane_arg) $(sock) $(st_file)`
-                    pane_id = strip(read(cmd, String))
-                    _tui_pane_ref[] = pane_id
-                    println("🚀 tmux TUI split opened ($pane_id)!")
-                end
-            catch e
-                @warn "Failed to open tmux TUI pane (are you inside tmux?)" exception = e
-            end
-        else
-            @info "Not inside tmux session. To launch the TUI in another terminal:\n  luajit $(tui_script) {left-of} $(sock) $(st_file)"
-        end
+        _open_tui_pane(; backend = detect_backend(backend), width = width)
     end
     return nothing
 end
 
-function stop()
+function stop(; quiet::Bool = false)
     _running[] = false
     _stop_socket_server()
     _close_tui_pane()
-    return @info "jEMach Watcher stopped and right panel closed."
+    !quiet && @info "jEMach Watcher stopped and TUI panel closed."
+    return nothing
+end
+
+"""
+    ui(; backend::Symbol = :auto, width::Int = 65)
+
+Open the interactive jEMach TUI split/window for the current terminal or multiplexer.
+"""
+function ui(; backend::Symbol = :auto, width::Int = 65)
+    return start(; split = true, backend = backend, width = width, quiet = true)
+end
+
+function _is_tui_open()::Bool
+    for c in _socket_clients
+        isopen(c) && return true
+    end
+    if !isempty(_tui_pane_ref[]) && haskey(ENV, "TMUX")
+        try
+            run(pipeline(`tmux display-message -t $(_tui_pane_ref[]) -p "#{pane_id}"`, devnull))
+            return true
+        catch
+        end
+    end
+    if !isnothing(_tui_proc_ref[]) && process_running(_tui_proc_ref[])
+        return true
+    end
+    return false
+end
+
+"""
+    toggle(; backend::Symbol = :auto, width::Int = 65)
+
+Toggle the interactive jEMach TUI split/window open or closed while keeping the REPL watcher active.
+"""
+function toggle(; backend::Symbol = :auto, width::Int = 65)
+    if _is_tui_open()
+        stop_msg = "{\"event\":\"stop\",\"action\":\"close\"}\n"
+        for client in _socket_clients
+            try
+                if isopen(client)
+                    write(client, stop_msg)
+                    flush(client)
+                    close(client)
+                end
+            catch
+            end
+        end
+        empty!(_socket_clients)
+        _close_tui_pane()
+        println("\e[2m◆ jEMach TUI closed (watcher remains active in background)\e[0m")
+    else
+        ui(; backend = backend, width = width)
+    end
+    return nothing
+end
+
+"""
+    @jemach
+
+Toggle the interactive jEMach TUI panel directly from the Julia REPL.
+"""
+macro jemach()
+    return :($jEMach.toggle())
 end
 
 # ---------------------------------------------------------------------------
@@ -1780,10 +2347,53 @@ function enable_hot_reload(proj_dir::String = _get_project_dir())
 end
 
 function status()
+    b = detect_backend()
     return if _running[]
-        println("jEMach Watcher is RUNNING  →  $(STATE_FILE[])")
+        println("jEMach Watcher is RUNNING [backend: $b]  →  socket: $(SOCKET_PATH[]), state: $(STATE_FILE[])")
     else
-        println("jEMach Watcher is STOPPED")
+        println("jEMach Watcher is STOPPED [backend: $b]")
+    end
+end
+
+function _setup_repl_hooks(repl)
+    @async begin
+        # Wait briefly for REPL interface & OhMyREPL initialization
+        for _ in 1:25
+            if isdefined(Base, :active_repl_backend) && !isnothing(Base.active_repl_backend) &&
+               hasproperty(repl, :interface) && !isnothing(repl.interface)
+                break
+            end
+            sleep(0.05)
+        end
+        try
+            if isdefined(Base, :active_repl_backend) && !isnothing(Base.active_repl_backend)
+                push!(
+                    Base.active_repl_backend.ast_transforms,
+                    function (ast)
+                        @async (sleep(0.02); publish_state())
+                        return ast
+                    end
+                )
+            end
+        catch
+        end
+
+        # Register Alt+j (\ej) keybinding in the julia> prompt to toggle TUI split
+        try
+            sleep(0.25) # let OhMyREPL finish installing its keymap first if present
+            if hasproperty(repl, :interface) && !isnothing(repl.interface) && !isempty(repl.interface.modes)
+                julia_mode = repl.interface.modes[1]
+                le = parentmodule(typeof(julia_mode))
+                toggle_keymap = Dict{Any, Any}(
+                    "\ej" => function (s, o...)
+                        @async toggle()
+                        return :ok
+                    end,
+                )
+                julia_mode.keymap_dict = Base.invokelatest(le.keymap_merge, julia_mode.keymap_dict, toggle_keymap)
+            end
+        catch
+        end
     end
 end
 
@@ -1799,8 +2409,20 @@ function __init__()
     STATE_FILE[] = "/tmp/jl_tui_state_" * safe_name * ".json"
     SOCKET_PATH[] = "/tmp/jemach_" * safe_name * ".sock"
 
+    # Automatically clean up socket and close TUI pane when Julia exits
+    atexit(() -> stop(quiet = true))
+
+    # Hook interactive REPL (instant AST refresh + Alt+j toggle shortcut)
+    if isinteractive()
+        if isdefined(Base, :active_repl) && !isnothing(Base.active_repl)
+            _setup_repl_hooks(Base.active_repl)
+        else
+            Base.atreplinit(_setup_repl_hooks)
+        end
+    end
+
     # Auto-start watcher silently (without split) when loaded as a package
-    return start(split = false)
+    return start(split = false, quiet = true)
 end
 
 end  # module jEMach

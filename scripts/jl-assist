@@ -1,27 +1,31 @@
 #!/usr/bin/env bash
-# jl-assist — Launch Julia workspace assistant in a new tmux pane
+# jl-assist — Launch Julia workspace assistant (Ghostty / Kitty / tmux / Zellij / Rex / Inline)
 #
 # Usage:
 #   jl-assist [OPTIONS]
 #
 # Options:
-#   -p PANE_ID   Target Julia REPL pane (default: auto-detect or left-of)
-#   -w WIDTH     Width of the TUI pane in columns (default: 60)
-#   -s SOCKET    Unix domain socket path (optional)
-#   -d STATE     State JSON file path (optional)
-#   -f           Force a new pane even if one already exists
+#   -b BACKEND   Backend override: auto, tmux, zellij, kitty, ghostty, rex, inline (default: auto)
+#   -i           Run TUI inline directly in the current terminal/pane
+#   -p PANE_ID   Target Julia REPL pane/window ID (default: auto-detect)
+#   -w WIDTH     Width of the TUI pane/window in columns (default: 65)
+#   -s SOCKET    Unix domain socket path (optional, auto-discovered)
+#   -d STATE     State JSON file path (optional, auto-discovered)
+#   -f           Force opening a new pane/window even if one already exists
 #   -h           Show this help
 #
-# The script:
-#   1. Detects (or creates) the Julia REPL pane in the current tmux window.
-#   2. Splits a new pane to the right.
-#   3. Launches the jl_tui.lua TUI there, pointing it at the Julia pane.
+# Supported Environments:
+#   - tmux     : Opens a right split pane via `tmux split-window`
+#   - zellij   : Opens a right split pane via `zellij run --direction right --close-on-exit`
+#   - kitty    : Opens a vsplit via `kitten @ launch` (or companion window / inline fallback)
+#   - ghostty  : Runs inline if called from a Ghostty split (Ctrl+Shift+O), or opens a Ghostty window/tab
+#   - rex      : Opens a right split via `rex` (upcoming Ghostty multiplexer) or `JEMACH_REX_SPLIT_CMD`
+#   - inline   : Runs `jl_tui.lua` directly in the current terminal (`jl-assist -i`)
 #
 # Recommended workflow:
-#   tmux new-window
-#   julia --project=.                 ← in left pane
-#   include("scripts/jl_watcher.jl")  ← inside Julia REPL
-#   jl-assist                         ← in any other pane / shell
+#   julia --project=. -e 'using jEMach; jEMach.start()'
+#   # Or manually in any split / terminal:
+#   ./scripts/jl-assist -i
 
 set -euo pipefail
 
@@ -31,10 +35,12 @@ TUI_SCRIPT="${SCRIPT_DIR}/jl_tui.lua"
 # --------------------------------------------------------------------------
 # Defaults
 # --------------------------------------------------------------------------
+BACKEND="${JEMACH_BACKEND:-auto}"
+INLINE=0
 JULIA_PANE=""
 PANE_WIDTH=65
-SOCKET=""
-STATE=""
+SOCKET="${JEMACH_SOCKET:-}"
+STATE="${JEMACH_STATE:-}"
 FORCE_NEW=0
 
 # --------------------------------------------------------------------------
@@ -48,8 +54,10 @@ usage() {
 # --------------------------------------------------------------------------
 # Parse arguments
 # --------------------------------------------------------------------------
-while getopts "p:w:s:d:fh" opt; do
+while getopts "b:ip:w:s:d:fh" opt; do
   case "$opt" in
+    b) BACKEND="$OPTARG" ;;
+    i) INLINE=1 ;;
     p) JULIA_PANE="$OPTARG" ;;
     w) PANE_WIDTH="$OPTARG" ;;
     s) SOCKET="$OPTARG" ;;
@@ -59,14 +67,6 @@ while getopts "p:w:s:d:fh" opt; do
     *) echo "Unknown option: $opt"; usage ;;
   esac
 done
-
-# --------------------------------------------------------------------------
-# Sanity checks
-# --------------------------------------------------------------------------
-if [[ -z "${TMUX:-}" ]]; then
-  echo "Error: jl-assist must be run inside a tmux session." >&2
-  exit 1
-fi
 
 if ! command -v luajit &>/dev/null; then
   echo "Error: luajit not found." >&2
@@ -82,48 +82,192 @@ if [[ ! -f "$TUI_SCRIPT" ]]; then
 fi
 
 # --------------------------------------------------------------------------
-# Detect Julia pane (if not explicitly provided)
+# Auto-detect project root & socket/state paths
 # --------------------------------------------------------------------------
-if [[ -z "$JULIA_PANE" ]]; then
-  # Find a pane running Julia in the current window
-  JULIA_PANE="$(tmux list-panes -F "#{pane_id} #{pane_current_command}" \
-    | awk '/julia/{print $1; exit}')"
-
-  if [[ -z "$JULIA_PANE" ]]; then
-    echo "No Julia pane detected in current window." >&2
-    echo "Starting julia --project=. in the current pane first, then re-run jl-assist." >&2
-    echo "" >&2
-    echo "If Julia is running in a different window/session, pass the pane ID manually:" >&2
-    echo "  jl-assist -p %1" >&2
-    exit 1
+find_project_dir() {
+  if [[ -n "${JEMACH_PROJ:-}" ]]; then
+    echo "$JEMACH_PROJ"
+    return
   fi
+  local dir="$PWD"
+  while [[ -n "$dir" && "$dir" != "/" ]]; do
+    if [[ -f "${dir}/Project.toml" ]]; then
+      echo "$dir"
+      return
+    fi
+    dir="$(dirname "$dir")"
+  done
+  echo "$PWD"
+}
+
+PROJ_DIR="$(find_project_dir)"
+SAFE_NAME="$(printf '%s' "$PROJ_DIR" | sed 's/[^a-zA-Z0-9]/_/g')"
+
+if [[ -z "$SOCKET" ]]; then
+  SOCKET="/tmp/jemach_${SAFE_NAME}.sock"
+fi
+if [[ -z "$STATE" ]]; then
+  STATE="/tmp/jl_tui_state_${SAFE_NAME}.json"
 fi
 
-echo "Julia pane: ${JULIA_PANE}"
+# --------------------------------------------------------------------------
+# Auto-detect backend if set to "auto"
+# --------------------------------------------------------------------------
+detect_backend() {
+  if [[ "$INLINE" -eq 1 ]]; then
+    echo "inline"
+    return
+  fi
+  if [[ "$BACKEND" != "auto" && -n "$BACKEND" ]]; then
+    echo "${BACKEND,,}"
+    return
+  fi
+  if [[ -n "${REX_SESSION:-}" || -n "${REX:-}" || -n "${REX_PANE_ID:-}" || -n "${REX_SOCKET:-}" || -n "${GHOSTTY_REX:-}" ]]; then
+    echo "rex"
+  elif [[ -n "${ZELLIJ:-}" || -n "${ZELLIJ_SESSION_NAME:-}" || -n "${ZELLIJ_PANE_ID:-}" ]]; then
+    echo "zellij"
+  elif [[ -n "${TMUX:-}" ]]; then
+    echo "tmux"
+  elif [[ -n "${KITTY_WINDOW_ID:-}" || -n "${KITTY_PID:-}" || "${TERM:-}" == "xterm-kitty" ]]; then
+    echo "kitty"
+  elif [[ "${TERM_PROGRAM:-}" == "ghostty" || -n "${GHOSTTY_RESOURCES_DIR:-}" || "${TERM:-}" == "xterm-ghostty" ]]; then
+    echo "ghostty"
+  else
+    echo "inline"
+  fi
+}
+
+ACTIVE_BACKEND="$(detect_backend)"
 
 # --------------------------------------------------------------------------
-# Check for existing TUI pane
+# Execute per backend
 # --------------------------------------------------------------------------
-TUI_PANE=""
-if [[ "$FORCE_NEW" -eq 0 ]]; then
-  TUI_PANE="$(tmux list-panes -F "#{pane_id} #{pane_current_command}" \
-    | awk '/luajit/{print $1; exit}')"
-fi
+case "$ACTIVE_BACKEND" in
+  inline|standalone)
+    export JEMACH_SOCKET="$SOCKET"
+    export JEMACH_STATE="$STATE"
+    export JEMACH_PROJ="$PROJ_DIR"
+    exec luajit "$TUI_SCRIPT" "${JULIA_PANE:-inline}" "$SOCKET" "$STATE"
+    ;;
 
-if [[ -n "$TUI_PANE" ]]; then
-  echo "TUI pane already running (${TUI_PANE}). Use -f to force a new one."
-  tmux select-pane -t "$TUI_PANE"
-  exit 0
-fi
+  tmux)
+    if [[ -z "${TMUX:-}" ]]; then
+      echo "Error: tmux backend selected, but not inside a tmux session." >&2
+      exit 1
+    fi
+    if [[ -z "$JULIA_PANE" ]]; then
+      JULIA_PANE="$(tmux list-panes -F "#{pane_id} #{pane_current_command}" \
+        | awk '/julia/{print $1; exit}')"
+      if [[ -z "$JULIA_PANE" ]]; then
+        JULIA_PANE="$(tmux display-message -p "#{pane_id}" 2>/dev/null || echo "{left-of}")"
+      fi
+    fi
 
-# --------------------------------------------------------------------------
-# Split a new pane to the right and launch the TUI
-# --------------------------------------------------------------------------
-echo "Launching Julia Workspace TUI (pane width: ${PANE_WIDTH})…"
+    TUI_PANE=""
+    if [[ "$FORCE_NEW" -eq 0 ]]; then
+      TUI_PANE="$(tmux list-panes -F "#{pane_id} #{pane_current_command}" \
+        | awk '/luajit/{print $1; exit}')"
+    fi
 
-PANE_DIR="$(tmux display-message -t "${JULIA_PANE}" -p "#{pane_current_path}" 2>/dev/null || pwd)"
+    if [[ -n "$TUI_PANE" ]]; then
+      echo "TUI pane already running (${TUI_PANE}). Use -f to force a new one."
+      tmux select-pane -t "$TUI_PANE"
+      exit 0
+    fi
 
-tmux split-window -h -l "${PANE_WIDTH}" -c "${PANE_DIR}" \
-  "luajit '${TUI_SCRIPT}' '${JULIA_PANE}' '${SOCKET}' '${STATE}' || { echo 'TUI exited with error — press any key'; read -n1; }"
+    PANE_DIR="$(tmux display-message -t "${JULIA_PANE}" -p "#{pane_current_path}" 2>/dev/null || echo "$PROJ_DIR")"
+    tmux split-window -h -l "${PANE_WIDTH}" -c "${PANE_DIR}" \
+      -e "JEMACH_SOCKET=${SOCKET}" -e "JEMACH_STATE=${STATE}" -e "JEMACH_PROJ=${PROJ_DIR}" -e "JEMACH_BACKEND=tmux" \
+      "luajit '${TUI_SCRIPT}' '${JULIA_PANE}' '${SOCKET}' '${STATE}' || { echo 'TUI exited with error — press any key'; read -n1; }"
+    echo "Done. tmux TUI pane started alongside Julia REPL (${JULIA_PANE})."
+    ;;
 
-echo "Done. TUI pane started alongside Julia REPL pane ${JULIA_PANE}."
+  zellij)
+    DIRECTION_ARGS=(--direction right)
+    if [[ "${JEMACH_ZELLIJ_FLOATING:-0}" == "1" ]]; then
+      DIRECTION_ARGS=(--floating)
+    fi
+    zellij run "${DIRECTION_ARGS[@]}" --name "jEMach" --cwd "$PROJ_DIR" --close-on-exit -- \
+      env JEMACH_SOCKET="$SOCKET" JEMACH_STATE="$STATE" JEMACH_PROJ="$PROJ_DIR" JEMACH_BACKEND="zellij" \
+      luajit "$TUI_SCRIPT" "zellij" "$SOCKET" "$STATE"
+    echo "Done. Zellij TUI pane started."
+    ;;
+
+  kitty)
+    TARGET_WIN="${JULIA_PANE:-${KITTY_WINDOW_ID:-kitty}}"
+    if command -v kitten &>/dev/null && kitten @ ls &>/dev/null; then
+      WIN_ID="$(kitten @ launch --type=window --location=vsplit --keep-focus --title="jEMach" --cwd="$PROJ_DIR" \
+        --env "JEMACH_SOCKET=${SOCKET}" --env "JEMACH_STATE=${STATE}" --env "JEMACH_PROJ=${PROJ_DIR}" --env "JEMACH_BACKEND=kitty" \
+        luajit "$TUI_SCRIPT" "$TARGET_WIN" "$SOCKET" "$STATE")"
+      echo "Done. Kitty TUI vsplit started (window ${WIN_ID})."
+    elif [[ "$FORCE_NEW" -eq 0 && ( -S "$SOCKET" || -f "$STATE" ) ]]; then
+      # If the user opened a Kitty split manually and ran jl-assist, run inline
+      export JEMACH_SOCKET="$SOCKET"
+      export JEMACH_STATE="$STATE"
+      export JEMACH_PROJ="$PROJ_DIR"
+      export JEMACH_BACKEND="kitty"
+      exec luajit "$TUI_SCRIPT" "$TARGET_WIN" "$SOCKET" "$STATE"
+    else
+      nohup kitty --title="jEMach" --directory="$PROJ_DIR" -o "initial_window_width=${PANE_WIDTH}c" -o remember_window_size=no \
+        env JEMACH_SOCKET="$SOCKET" JEMACH_STATE="$STATE" JEMACH_PROJ="$PROJ_DIR" JEMACH_BACKEND="kitty" \
+        luajit "$TUI_SCRIPT" "$TARGET_WIN" "$SOCKET" "$STATE" >/dev/null 2>&1 &
+      echo "Done. Kitty companion TUI window launched."
+    fi
+    ;;
+
+  ghostty)
+    # If the user split in Ghostty (e.g. Ctrl+Shift+O) and ran jl-assist in the new split while Julia is running, run inline!
+    if [[ "$FORCE_NEW" -eq 0 && ( -S "$SOCKET" || -f "$STATE" ) ]]; then
+      export JEMACH_SOCKET="$SOCKET"
+      export JEMACH_STATE="$STATE"
+      export JEMACH_PROJ="$PROJ_DIR"
+      export JEMACH_BACKEND="ghostty"
+      exec luajit "$TUI_SCRIPT" "ghostty" "$SOCKET" "$STATE"
+    else
+      if [[ "${JEMACH_GHOSTTY_MODE:-window}" == "tab" ]]; then
+        nohup ghostty +new-tab -e env JEMACH_SOCKET="$SOCKET" JEMACH_STATE="$STATE" JEMACH_PROJ="$PROJ_DIR" JEMACH_BACKEND="ghostty" \
+          luajit "$TUI_SCRIPT" "ghostty" "$SOCKET" "$STATE" >/dev/null 2>&1 &
+      else
+        nohup ghostty --title="jEMach" --working-directory="$PROJ_DIR" --window-width="$PANE_WIDTH" --wait-after-command=false \
+          -e env JEMACH_SOCKET="$SOCKET" JEMACH_STATE="$STATE" JEMACH_PROJ="$PROJ_DIR" JEMACH_BACKEND="ghostty" \
+          luajit "$TUI_SCRIPT" "ghostty" "$SOCKET" "$STATE" >/dev/null 2>&1 &
+      fi
+      echo "Done. Ghostty jEMach window launched."
+    fi
+    ;;
+
+  rex)
+    REX_BIN="${JEMACH_REX_BIN:-rex}"
+    TARGET_PANE="${JULIA_PANE:-${REX_PANE_ID:-rex}}"
+    if [[ -n "${JEMACH_REX_SPLIT_CMD:-}" ]]; then
+      CMD_STR="${JEMACH_REX_SPLIT_CMD}"
+      CMD_STR="${CMD_STR//\{width\}/$PANE_WIDTH}"
+      CMD_STR="${CMD_STR//\{cwd\}/$PROJ_DIR}"
+      CMD_STR="${CMD_STR//\{socket\}/$SOCKET}"
+      CMD_STR="${CMD_STR//\{state\}/$STATE}"
+      CMD_STR="${CMD_STR//\{proj\}/$PROJ_DIR}"
+      CMD_STR="${CMD_STR//\{tui_script\}/$TUI_SCRIPT}"
+      eval "$CMD_STR"
+      echo "Done. Rex custom split started."
+    elif command -v "$REX_BIN" &>/dev/null; then
+      "$REX_BIN" pane split --direction right --size "$PANE_WIDTH" --cwd "$PROJ_DIR" -- \
+        env JEMACH_SOCKET="$SOCKET" JEMACH_STATE="$STATE" JEMACH_PROJ="$PROJ_DIR" JEMACH_BACKEND="rex" \
+        luajit "$TUI_SCRIPT" "$TARGET_PANE" "$SOCKET" "$STATE" 2>/dev/null \
+      || "$REX_BIN" split-window -h -l "$PANE_WIDTH" -c "$PROJ_DIR" \
+        env JEMACH_SOCKET="$SOCKET" JEMACH_STATE="$STATE" JEMACH_PROJ="$PROJ_DIR" JEMACH_BACKEND="rex" \
+        luajit "$TUI_SCRIPT" "$TARGET_PANE" "$SOCKET" "$STATE"
+      echo "Done. Rex TUI split started."
+    else
+      export JEMACH_SOCKET="$SOCKET"
+      export JEMACH_STATE="$STATE"
+      export JEMACH_PROJ="$PROJ_DIR"
+      export JEMACH_BACKEND="rex"
+      exec luajit "$TUI_SCRIPT" "$TARGET_PANE" "$SOCKET" "$STATE"
+    fi
+    ;;
+
+  *)
+    echo "Unknown backend: $ACTIVE_BACKEND" >&2
+    exit 1
+    ;;
+esac

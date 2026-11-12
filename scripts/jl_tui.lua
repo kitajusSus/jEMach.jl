@@ -40,13 +40,23 @@ ffi.cdef([[
     char           sun_path[108];
   };
 
+  struct winsize {
+    unsigned short ws_row;
+    unsigned short ws_col;
+    unsigned short ws_xpixel;
+    unsigned short ws_ypixel;
+  };
+
   int     socket(int domain, int type, int protocol);
   int     connect(int sockfd, const struct sockaddr_un *addr, unsigned int addrlen);
   int     close(int fd);
   ssize_t write(int fd, const void *buf, size_t count);
+  int     ioctl(int fd, unsigned long request, ...);
 ]])
 
 local STDIN = 0
+local STDOUT = 1
+local TIOCGWINSZ = (ffi.os == "OSX") and 0x40087468 or 0x5413
 
 local function fd_set_new()
 	local s = ffi.new("fd_set_t")
@@ -258,8 +268,8 @@ local function read_key(timeout_ms)
 	end
 
 	if fd_set_isset(fds, STDIN) then
-		local buf = ffi.new("char[8]")
-		local n = tonumber(ffi.C.read(STDIN, buf, 8))
+		local buf = ffi.new("char[32]")
+		local n = tonumber(ffi.C.read(STDIN, buf, 32))
 		if not n or n <= 0 then
 			return nil
 		end
@@ -276,14 +286,56 @@ end
 
 local input_queue = {}
 
+-- Normalize Ghostty / Kitty CSI-u & SS3 application cursor keys to standard keys
+local function normalize_key(k)
+	if not k then
+		return nil
+	end
+	-- Application cursor keys (SS3)
+	if k == "\27OA" then return "\27[A" end
+	if k == "\27OB" then return "\27[B" end
+	if k == "\27OC" then return "\27[C" end
+	if k == "\27OD" then return "\27[D" end
+	if k == "\27OM" then return "\r" end
+
+	-- Kitty keyboard protocol / CSI-u sequences (\27[<codepoint>;<modifiers>u)
+	local csi_u_code, csi_u_mod = k:match("^\27%[(%d+);?(%d*)u$")
+	if csi_u_code then
+		local code = tonumber(csi_u_code)
+		local mod = tonumber(csi_u_mod) or 1
+		if code == 27 then
+			return "\27"
+		elseif code == 13 then
+			return "\r"
+		elseif code == 9 then
+			return "\t"
+		elseif code == 127 or code == 8 then
+			return "\127"
+		elseif code == 99 and (mod == 5 or mod == 6) then -- Ctrl+C in CSI-u
+			return "\3"
+		elseif code >= 32 and code <= 126 and mod == 1 then
+			return string.char(code)
+		end
+	end
+
+	-- Extended cursor keys with modifiers (\27[1;...A)
+	local arrow_dir = k:match("^\27%[1;%d+([ABCD])$")
+	if arrow_dir then
+		return "\27[" .. arrow_dir
+	end
+
+	return k
+end
+
 local function queue_keys(raw)
 	local pos = 1
 	local len = #raw
 	while pos <= len do
 		if raw:sub(pos, pos) == "\27" then
-			local esc_seq = raw:match("^\27%[[%d;]*[a-zA-Z~]", pos)
+			local esc_seq = raw:match("^\27%[[%d;]*[a-zA-Z~u]", pos)
+				or raw:match("^\27O[a-zA-Z]", pos)
 			if esc_seq then
-				table.insert(input_queue, esc_seq)
+				table.insert(input_queue, normalize_key(esc_seq))
 				pos = pos + #esc_seq
 			else
 				table.insert(input_queue, "\27")
@@ -309,12 +361,17 @@ local function get_next_key(timeout_ms)
 end
 
 -- ---------------------------------------------------------------------------
--- Terminal control helpers (ANSI/VT100)
+-- Terminal control helpers (ANSI/VT100 + Synchronized Output Mode 2026)
 -- ---------------------------------------------------------------------------
 local ESC = "\27"
 local CLEAR = ESC .. "[2J" .. ESC .. "[H"
 local HIDE_CUR = ESC .. "[?25l"
 local SHOW_CUR = ESC .. "[?25h"
+local ALT_SCREEN_ON = ESC .. "[?1049h"
+local ALT_SCREEN_OFF = ESC .. "[?1049l"
+local SYNC_START = ESC .. "[?2026h"
+local SYNC_END = ESC .. "[?2026l"
+local SET_TITLE = ESC .. "]2;jEMach — Julia Workspace\7"
 local BOLD = ESC .. "[1m"
 local DIM = ESC .. "[2m"
 local ITALIC = ESC .. "[3m"
@@ -482,7 +539,17 @@ local function move(row, col)
 	return ESC .. "[" .. row .. ";" .. col .. "H"
 end
 
+local winsize_buf = ffi.new("struct winsize")
+
 local function get_terminal_size()
+	-- Fast path: zero-fork ioctl(TIOCGWINSZ) on STDOUT or STDIN
+	if ffi.C.ioctl(STDOUT, TIOCGWINSZ, winsize_buf) == 0 and winsize_buf.ws_row > 0 and winsize_buf.ws_col > 0 then
+		return tonumber(winsize_buf.ws_row), tonumber(winsize_buf.ws_col)
+	end
+	if ffi.C.ioctl(STDIN, TIOCGWINSZ, winsize_buf) == 0 and winsize_buf.ws_row > 0 and winsize_buf.ws_col > 0 then
+		return tonumber(winsize_buf.ws_row), tonumber(winsize_buf.ws_col)
+	end
+	-- Fallback to tput
 	local handle = io.popen("tput lines && tput cols 2>/dev/null")
 	if not handle then
 		return 24, 80
@@ -650,6 +717,7 @@ local REFRESH_MS = 1500 -- state file poll interval (ms)
 local hidden = {}
 -- collapsed[module_name] = true
 local collapsed = {}
+local initialized_modules = { ["Main"] = true }
 
 -- Flat list of "display rows" rebuilt each render pass
 --   { kind="module", name, row_idx }
@@ -871,10 +939,14 @@ local function build_display_rows()
 
 		for i = 1, count do
 			local mname = (cols.modules and cols.modules[i]) or "Main"
+			if not initialized_modules[mname] then
+				initialized_modules[mname] = true
+				collapsed[mname] = true
+			end
 			if mname ~= current_mod then
 				current_mod = mname
 				if not hidden[mname] then
-					local is_collapsed = collapsed[mname]
+					local is_collapsed = collapsed[mname] and not has_filter
 					local icon = is_collapsed and "▶" or "▼"
 					table.insert(display_rows, {
 						kind = "module",
@@ -885,7 +957,7 @@ local function build_display_rows()
 				end
 			end
 
-			if hidden[current_mod] or collapsed[current_mod] then
+			if hidden[current_mod] or (collapsed[current_mod] and not has_filter) then
 				goto continue
 			end
 
@@ -1052,11 +1124,122 @@ local function switch_tab(new_tab)
 end
 
 -- ---------------------------------------------------------------------------
--- tmux send-keys to Julia REPL
+-- Multi-Terminal & Multiplexer Backend + Bidirectional Socket RPC
+-- (Supports: Ghostty, Kitty, tmux, Zellij, Rex, and Standalone terminals)
 -- ---------------------------------------------------------------------------
-local function tmux_send(code)
+local function detect_backend()
+	local env_b = os.getenv("JEMACH_BACKEND")
+	if env_b and env_b ~= "" and env_b ~= "auto" then
+		return env_b:lower()
+	end
+	if os.getenv("REX_SESSION") or os.getenv("REX") or os.getenv("REX_PANE_ID") or os.getenv("GHOSTTY_REX") then
+		return "rex"
+	elseif os.getenv("ZELLIJ") or os.getenv("ZELLIJ_SESSION_NAME") then
+		return "zellij"
+	elseif os.getenv("TMUX") and os.getenv("TMUX") ~= "" then
+		return "tmux"
+	elseif os.getenv("KITTY_WINDOW_ID") or os.getenv("KITTY_PID") or os.getenv("TERM") == "xterm-kitty" then
+		return "kitty"
+	elseif (os.getenv("TERM_PROGRAM") or ""):lower() == "ghostty"
+		or os.getenv("GHOSTTY_RESOURCES_DIR")
+		or os.getenv("TERM") == "xterm-ghostty"
+	then
+		return "ghostty"
+	elseif state and state.backend and state.backend ~= "" then
+		return tostring(state.backend)
+	end
+	return "standalone"
+end
+
+local function get_backend_badge()
+	local b = detect_backend()
+	if b == "tmux" and repl_pane and repl_pane:match("^%%%d+$") then
+		return "tmux:" .. repl_pane
+	elseif b == "kitty" and repl_pane and repl_pane:match("^%d+$") then
+		return "kitty:" .. repl_pane
+	end
+	return b
+end
+
+local function json_escape(s)
+	s = tostring(s or "")
+	return (s:gsub("\\", "\\\\")
+		:gsub('"', '\\"')
+		:gsub("\n", "\\n")
+		:gsub("\r", "\\r")
+		:gsub("\t", "\\t"))
+end
+
+local function send_socket_json(json_line)
+	try_connect_socket()
+	if socket_fd < 0 then
+		return false
+	end
+	local payload = json_line .. "\n"
+	local written = tonumber(ffi.C.write(socket_fd, payload, #payload))
+	if not written or written <= 0 then
+		ffi.C.close(socket_fd)
+		socket_fd = -1
+		return false
+	end
+	return true
+end
+
+local function fallback_mux_send(code, enter)
+	local b = detect_backend()
 	local escaped = code:gsub("'", "'\\''")
-	os.execute(string.format("tmux send-keys -t '%s' '%s' Enter", repl_pane, escaped))
+	if b == "tmux" then
+		if enter == false then
+			os.execute(string.format("tmux send-keys -t '%s' '%s' 2>/dev/null", repl_pane, escaped))
+		else
+			os.execute(string.format("tmux send-keys -t '%s' '%s' Enter 2>/dev/null", repl_pane, escaped))
+		end
+	elseif b == "kitty" then
+		local suffix = (enter == false) and "" or "\\r"
+		local m = (repl_pane and repl_pane:match("^%d+$")) and ("--match id:" .. repl_pane) or ""
+		os.execute(string.format("kitten @ send-text %s '%s%s' 2>/dev/null", m, escaped, suffix))
+	elseif b == "zellij" then
+		os.execute(string.format("zellij action write-chars '%s' 2>/dev/null", escaped))
+	elseif b == "rex" then
+		local rex_bin = os.getenv("JEMACH_REX_BIN") or "rex"
+		os.execute(string.format("%s send-keys -t '%s' '%s' Enter 2>/dev/null", rex_bin, repl_pane, escaped))
+	end
+end
+
+local function repl_eval(code, silent)
+	local cmd_type = silent and "eval_silent" or "eval"
+	local msg = string.format('{"cmd":"%s","code":"%s"}', cmd_type, json_escape(code))
+	if not send_socket_json(msg) then
+		fallback_mux_send(code, true)
+	end
+end
+
+local function repl_insert(text, move_left)
+	local ml = tonumber(move_left) or 0
+	local msg = string.format('{"cmd":"insert","text":"%s","move_left":%d}', json_escape(text), ml)
+	if not send_socket_json(msg) then
+		local b = detect_backend()
+		if b == "tmux" and ml == 1 then
+			local escaped = text:gsub("'", "'\\''")
+			os.execute(string.format("tmux send-keys -t '%s' '%s' Left 2>/dev/null", repl_pane, escaped))
+		else
+			fallback_mux_send(text, false)
+		end
+	end
+end
+
+local function repl_clear()
+	local msg = '{"cmd":"clear"}'
+	if not send_socket_json(msg) then
+		local b = detect_backend()
+		if b == "tmux" then
+			os.execute(string.format("tmux send-keys -t '%s' C-l 2>/dev/null", repl_pane))
+		end
+	end
+end
+
+local function tmux_send(code)
+	repl_eval(code, false)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1064,7 +1247,7 @@ end
 -- ---------------------------------------------------------------------------
 local function render(term_rows, term_cols)
 	local out_buf = {}
-	table.insert(out_buf, HIDE_CUR .. CLEAR)
+	table.insert(out_buf, SYNC_START .. HIDE_CUR .. CLEAR)
 
 	-- Row 1: Header / Tab bar
 	table.insert(out_buf, move(1, 1))
@@ -1107,7 +1290,7 @@ local function render(term_rows, term_cols)
 	else
 		local sock_icon = (socket_fd >= 0) and (FG_GREEN .. "● ONLINE" .. RESET) or (DIM .. FG_RED .. "○ OFFLINE" .. RESET)
 		local ts_str = (last_state_ts > 0) and os.date("%H:%M:%S", last_state_ts) or "--:--:--"
-		right_info = DIM .. FG_GRAY .. "[" .. repl_pane .. "] " .. RESET .. sock_icon .. " " .. DIM .. FG_GRAY .. ts_str .. RESET
+		right_info = DIM .. FG_GRAY .. "[" .. get_backend_badge() .. "] " .. RESET .. sock_icon .. " " .. DIM .. FG_GRAY .. ts_str .. RESET
 	end
 
 	local left_len = visible_len(left_title)
@@ -1383,6 +1566,7 @@ local function render(term_rows, term_cols)
 		table.insert(out_buf, move(top + 3, left) .. BOLD .. FG_CYAN .. bot_border .. RESET)
 	end
 
+	table.insert(out_buf, SYNC_END)
 	io.write(table.concat(out_buf))
 	io.flush()
 end
@@ -1599,7 +1783,7 @@ local function handle_key(key, term_rows, term_cols)
 				end
 			end
 		elseif key == "c" then
-			os.execute(string.format("tmux send-keys -t '%s' C-l", repl_pane))
+			repl_clear()
 		elseif key == "s" then
 			tmux_send("jEMach.save_clean_session()")
 		elseif key == "e" then
@@ -1607,10 +1791,11 @@ local function handle_key(key, term_rows, term_cols)
 			if dr and dr.kind == "item" then
 				if dr.expr:match("^[%a_][%w_!%.%[%]%s%\"%:%']*$") then
 					if dr.item_kind == "function" then
-						os.execute(string.format("tmux send-keys -t '%s' '%s()' Left", repl_pane, dr.expr))
+						repl_insert(dr.expr .. "()", 1)
 					else
-						os.execute(string.format("tmux send-keys -t '%s' '%s '", repl_pane, dr.expr))
+						repl_insert(dr.expr .. " ", 0)
 					end
+					set_toast("Inserted " .. dr.expr .. " into REPL")
 				end
 			end
 		elseif key == "d" then
@@ -1685,7 +1870,7 @@ local function handle_key(key, term_rows, term_cols)
 				switch_tab(3)
 			end
 		elseif key == "c" then
-			os.execute(string.format("tmux send-keys -t '%s' C-l", repl_pane))
+			repl_clear()
 		end
 
 	-- -----------------------------------------------------------------------
@@ -1700,7 +1885,7 @@ local function handle_key(key, term_rows, term_cols)
 			end
 		elseif key == "e" then
 			if dr and dr.kind == "procedure" then
-				os.execute(string.format("tmux send-keys -t '%s' '%s()' Left", repl_pane, dr.name))
+				repl_insert(dr.name .. "()", 1)
 				set_toast("Pasted " .. dr.name .. "() into REPL")
 			end
 		elseif key == "d" then
@@ -1711,16 +1896,16 @@ local function handle_key(key, term_rows, term_cols)
 				modal_callback = function(ans)
 					local a = ans:lower():gsub("%s+", "")
 					if a == "y" or a == "yes" then
-						tmux_send(string.format("rm(joinpath(jEMach._get_project_dir(), %q), force=true); jEMach._load_procedures!(); jEMach.publish_state()", dr.file))
+						repl_eval(string.format("rm(joinpath(jEMach._get_project_dir(), %q), force=true); jEMach._load_procedures!(); jEMach.publish_state()", dr.file), true)
 						set_toast("Deleted procedure " .. dr.name)
 					end
 				end
 			end
 		elseif key == "r" then
-			tmux_send("jEMach._load_procedures!(); jEMach.publish_state()")
+			repl_eval("jEMach._load_procedures!(); jEMach.publish_state()", true)
 			set_toast("Reloaded procedures")
 		elseif key == "c" then
-			os.execute(string.format("tmux send-keys -t '%s' C-l", repl_pane))
+			repl_clear()
 		end
 
 	-- -----------------------------------------------------------------------
@@ -1769,19 +1954,19 @@ end
 -- ---------------------------------------------------------------------------
 local function main()
 	raw_mode_on()
+	io.write(ALT_SCREEN_ON .. HIDE_CUR .. SET_TITLE)
+	io.flush()
 
 	-- Ensure terminal is restored on exit
 	local function cleanup()
 		raw_mode_off()
-		io.write(SHOW_CUR .. CLEAR)
+		io.write(SHOW_CUR .. ALT_SCREEN_OFF)
 		io.flush()
 	end
 
 	-- Run cleanup on normal exit or Lua error
 	local ok, err = pcall(function()
-		local last_render_key = 0
 		local term_rows, term_cols = get_terminal_size()
-		local resize_counter = 0
 
 		load_state()
 		build_display_rows()
@@ -1790,15 +1975,11 @@ local function main()
 		dirty = false
 
 		while true do
-			-- Poll terminal size every ~20 cycles (~2s)
-			resize_counter = resize_counter + 1
-			if resize_counter >= 20 then
-				resize_counter = 0
-				local new_rows, new_cols = get_terminal_size()
-				if new_rows ~= term_rows or new_cols ~= term_cols then
-					term_rows, term_cols = new_rows, new_cols
-					dirty = true
-				end
+			-- Zero-fork ioctl size check on every cycle for instant resize in Ghostty/Kitty/Zellij/tmux/Rex
+			local new_rows, new_cols = get_terminal_size()
+			if new_rows ~= term_rows or new_cols ~= term_cols then
+				term_rows, term_cols = new_rows, new_cols
+				dirty = true
 			end
 
 			if load_state() then

@@ -2,7 +2,7 @@
 
 ![zdjęcie](jemachpic.png)
 
-A high-performance, Data-Oriented **Julia Workspace Assistant & REPL Monitor** with an interactive tmux TUI and native Zig IPC broker.
+A high-performance, Data-Oriented **Julia Workspace Assistant & REPL Monitor** with a multi-terminal interactive TUI (**Ghostty**, **Kitty**, **tmux**, **Zellij**, **Rex**) and native Zig IPC broker.
 
 Inspect variables, dataframes, matrices, composite structs, and package dependencies in real time alongside your Julia REPL — completely standalone, with zero Neovim or external package requirements.
 
@@ -12,9 +12,9 @@ Inspect variables, dataframes, matrices, composite structs, and package dependen
 
 `jEMach` is built around **Data-Oriented Design (DoD)** principles for minimum latency, zero GC pressure, and optimal cache locality:
 
-- **Julia Engine (`src/jEMach.jl`)**: Asynchronous background introspection task organizing workspace symbols into a Struct-of-Arrays (SoA) columnar table (`WorkspaceTable`). Reusable buffers eliminate GC allocation overhead during periodic polling.
-- **Interactive tmux TUI (`scripts/jl_tui.lua`)**: Standalone LuaJIT terminal UI connecting over UNIX domain sockets (`/tmp/jemach_<project>.sock`). Single-pass linear scan with dirty-rendering (0.0% CPU usage when idle).
-- **Native Zig Broker (`zig/`)**: Ultra-fast fan-out IPC broker and SoA multi-array structures (`std.MultiArrayList`) for high-throughput zero-copy event streaming.
+- **Julia Engine (`src/jEMach.jl`)**: Asynchronous background introspection task organizing workspace symbols into a Struct-of-Arrays (SoA) columnar table (`WorkspaceTable`), plus a full-duplex UNIX domain socket server for direct REPL evaluation and `LineEdit` buffer injection without external multiplexer dependencies.
+- **Multi-Terminal TUI (`scripts/jl_tui.lua`)**: Standalone LuaJIT terminal UI connecting over UNIX domain sockets (`/tmp/jemach_<project>.sock`). Features DEC Mode 2026 Synchronized Output, Alternate Screen Buffer, Kitty/Ghostty CSI-u keyboard protocol support, zero-fork FFI `ioctl(TIOCGWINSZ)` resize detection, and 0.0% idle CPU usage.
+- **Native Zig Broker (`zig/`)**: Ultra-fast bidirectional fan-out IPC broker and SoA multi-array structures (`std.MultiArrayList`) for high-throughput zero-copy event streaming.
 
 ---
 
@@ -35,38 +35,51 @@ Pkg.add(url="https://github.com/kitajusSus/jEMach")
 
 ---
 
-## Quick Start (tmux TUI)
+## Quick Start (Ghostty / Kitty / tmux / Zellij / Rex)
 
-### Option 1: Automatic Split (Recommended)
+### Option 1: Automatic Split / Window from Julia REPL (Recommended)
 
-1. Start your Julia REPL inside a tmux session:
+1. Start your Julia REPL in **Ghostty**, **Kitty**, **tmux**, **Zellij**, or **Rex**:
    ```bash
    julia -t auto --project=.
    ```
 2. Load and start `jEMach`:
    ```julia
    using jEMach
-   jEMach.start()   # Automatically opens the interactive TUI in a side pane
+   jEMach.start()                 # Auto-detects active multiplexer/terminal and opens TUI
+   # Or explicitly specify a backend (:auto, :ghostty, :kitty, :tmux, :zellij, :rex):
+   jEMach.start(backend=:ghostty)
    ```
 3. When finished:
    ```julia
-   jEMach.stop()    # Stops the watcher and closes the side panel automatically
+   jEMach.stop()                  # Stops the watcher and closes the TUI pane/window automatically
    ```
 
 ---
 
-### Option 2: Manual Split via CLI
+### Option 2: Manual Split or Inline Launch via CLI (`jl-assist`)
 
-1. Split your current tmux window and launch the assistant:
-   ```bash
-   tmux split-window -h -l 60 "./scripts/jl-assist"
-   ```
-2. In the Julia REPL:
-   ```julia
-   using jEMach
-   # or fallback via include:
-   include("scripts/jl_watcher.jl")
-   ```
+- **Inside Ghostty / Kitty / Any Native Split**:
+  1. Open a split in your terminal (e.g., `Ctrl+Shift+O` in **Ghostty** for `new_split:right`) and run:
+     ```bash
+     ./scripts/jl-assist          # Auto-attaches inline when a jEMach session is active!
+     # or explicitly inline:
+     ./scripts/jl-assist -i
+     ```
+- **Inside tmux / Zellij / Kitty Remote Control / Rex**:
+  ```bash
+  ./scripts/jl-assist            # Automatically spawns a side split for the detected backend
+  ```
+
+### Supported Terminal & Multiplexer Backends
+
+| Backend | Auto-Detection | Split / Launch Mechanism | Bidirectional REPL Sync |
+|:---|:---|:---|:---|
+| **`tmux`** | `$TMUX` | `tmux split-window -h` | UNIX Socket RPC + `send-keys` fallback |
+| **`zellij`** | `$ZELLIJ` / `$ZELLIJ_SESSION_NAME` | `zellij run --direction right --close-on-exit` | UNIX Socket RPC (`LineEdit` + `Main` eval) |
+| **`kitty`** | `$KITTY_WINDOW_ID` / `xterm-kitty` | `kitten @ launch --location=vsplit` (or companion window) | UNIX Socket RPC + `kitten @ send-text` fallback |
+| **`ghostty`** | `$TERM_PROGRAM=ghostty` / `xterm-ghostty` | Native split (`Ctrl+Shift+O` + `jl-assist`) or `ghostty` companion window/tab (`JEMACH_GHOSTTY_MODE=tab`) | UNIX Socket RPC (`LineEdit` + `Main` eval) |
+| **`rex`** *(Ghostty mux)* | `$REX_SESSION` / `$REX` / `$GHOSTTY_REX` | `rex pane split` / `rex split-window` / `$JEMACH_REX_SPLIT_CMD` | UNIX Socket RPC + `rex send-keys` fallback |
 
 ---
 
@@ -189,11 +202,15 @@ jEMach.find_procedures("sample")
 ## CLI Options (`jl-assist`)
 
 ```
-./scripts/jl-assist [-p PANE_ID] [-w WIDTH] [-f]
+./scripts/jl-assist [-b BACKEND] [-i] [-p PANE_ID] [-w WIDTH] [-s SOCKET] [-d STATE] [-f]
 
-  -p PANE_ID   Target tmux pane running Julia (auto-detected by default)
-  -w WIDTH     Width of the TUI pane in columns (default: 60)
-  -f           Force a new TUI pane even if one is already open
+  -b BACKEND   Backend override: auto, tmux, zellij, kitty, ghostty, rex, inline (default: auto)
+  -i           Run TUI inline directly in the current terminal/split
+  -p PANE_ID   Target pane/window running Julia (auto-detected by default)
+  -w WIDTH     Width of the TUI pane/window in columns (default: 65)
+  -s SOCKET    Custom UNIX socket path
+  -d STATE     Custom state JSON file path
+  -f           Force a new TUI pane/window even if one is already open
 ```
 
 ---
@@ -213,5 +230,5 @@ zig build        # Builds zig-out/bin/jemach-broker
 ## System Requirements
 
 - **Julia** >= 1.10
-- **tmux** >= 3.0
 - **luajit** (`sudo pacman -S luajit` on Arch Linux, `sudo apt install luajit` on Ubuntu/Debian)
+- **Terminal / Multiplexer**: Any of **Ghostty**, **Kitty**, **tmux** (>= 3.0), **Zellij**, **Rex**, or any ANSI/VT100 terminal emulator
