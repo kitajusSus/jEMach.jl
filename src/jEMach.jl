@@ -19,7 +19,11 @@ const SOCKET_PATH = Ref{String}("/tmp/jemach.sock")
 const UPDATE_INTERVAL = 0.5  # seconds between state refreshes
 
 function _get_project_dir()::String
-    proj_path = try Pkg.project().path catch; nothing end
+    proj_path = try
+        Pkg.project().path
+    catch
+        nothing
+    end
     if !isnothing(proj_path) && isfile(proj_path) && !occursin(".julia/environments", proj_path)
         return dirname(proj_path)
     else
@@ -58,7 +62,7 @@ function _write_json_str(buf::IO, s::AbstractString)
             write(buf, c)
         end
     end
-    write(buf, '"')
+    return write(buf, '"')
 end
 
 function _json_str(s::AbstractString)::String
@@ -87,7 +91,7 @@ function _write_item_json(buf::IO, item::Dict{String, Any})
         end
         write(buf, ']')
     end
-    write(buf, '}')
+    return write(buf, '}')
 end
 
 function _item_to_json(item::Dict{String, Any})::String
@@ -140,17 +144,17 @@ function Base.empty!(t::WorkspaceTable)
 end
 
 function _add_entry!(
-    t::WorkspaceTable,
-    name::String,
-    kind::String,
-    type_str::String,
-    value_str::String,
-    expr_str::String,
-    mod_str::String,
-    depth::Int,
-    parent_idx::Int,
-    has_children::Bool
-)::Int
+        t::WorkspaceTable,
+        name::String,
+        kind::String,
+        type_str::String,
+        value_str::String,
+        expr_str::String,
+        mod_str::String,
+        depth::Int,
+        parent_idx::Int,
+        has_children::Bool
+    )::Int
     push!(t.names, name)
     push!(t.kinds, kind)
     push!(t.types, type_str)
@@ -166,16 +170,16 @@ end
 const _shared_workspace_table = Ref{WorkspaceTable}(WorkspaceTable())
 
 function _collect_children_dod!(
-    t::WorkspaceTable,
-    val,
-    parent_expr::String,
-    mod_name::String,
-    depth::Int,
-    parent_idx::Int
-)
+        t::WorkspaceTable,
+        val,
+        parent_expr::String,
+        mod_name::String,
+        depth::Int,
+        parent_idx::Int
+    )
     depth > 5 && return
     T = typeof(val)
-    try
+    return try
         type_name_str = string(T)
         # 1. DataFrames / Tables.jl interface
         if occursin("DataFrame", type_name_str) || (hasmethod(names, Tuple{T}) && hasmethod(getindex, Tuple{T, Symbol}))
@@ -225,7 +229,7 @@ function _collect_children_dod!(
                 )
                 count += 1
             end
-        # 3. 1D Arrays
+            # 3. 1D Arrays
         elseif val isa AbstractArray && ndims(val) == 1
             for i in 1:min(length(val), 20)
                 _add_entry!(
@@ -241,7 +245,7 @@ function _collect_children_dod!(
                     false
                 )
             end
-        # 4. 2D Matrices / Arrays
+            # 4. 2D Matrices / Arrays
         elseif val isa AbstractArray && ndims(val) == 2
             rows, cols = size(val)
             for i in 1:min(rows, 5)
@@ -260,7 +264,7 @@ function _collect_children_dod!(
                     )
                 end
             end
-        # 5. Multidimensional Arrays
+            # 5. Multidimensional Arrays
         elseif val isa AbstractArray && ndims(val) > 2
             _add_entry!(
                 t,
@@ -274,7 +278,7 @@ function _collect_children_dod!(
                 parent_idx,
                 false
             )
-        # 6. Tuples and NamedTuples
+            # 6. Tuples and NamedTuples
         elseif val isa NamedTuple
             for name in keys(val)
                 v = val[name]
@@ -308,12 +312,16 @@ function _collect_children_dod!(
                     false
                 )
             end
-        # 7. Arbitrary composite structs
+            # 7. Arbitrary composite structs
         elseif !isprimitivetype(T) && T !== Module && T !== Function && T !== DataType && T !== UnionAll
             fns = fieldnames(T)
             for f in fns
                 f_str = string(f)
-                f_val = try getfield(val, f) catch; continue end
+                f_val = try
+                    getfield(val, f)
+                catch
+                    continue
+                end
                 _add_entry!(
                     t,
                     f_str,
@@ -358,7 +366,7 @@ function _is_valid_user_cmd(cmd::AbstractString)::Bool
     s = strip(cmd)
     isempty(s) && return false
     if occursin("jEMach.", s) || occursin("save_clean_session", s) ||
-       occursin("inspect_var", s) || occursin("publish_state", s)
+            occursin("inspect_var", s) || occursin("publish_state", s)
         return false
     end
     return true
@@ -427,9 +435,17 @@ function _load_procedures!()
         for file in files
             !endswith(file, ".jl") && continue
             filepath = joinpath(root, file)
-            content = try read(filepath, String) catch; continue end
+            content = try
+                read(filepath, String)
+            catch
+                continue
+            end
 
-            parsed = try Meta.parse("begin\n" * content * "\nend") catch; continue end
+            parsed = try
+                Meta.parse("begin\n" * content * "\nend")
+            catch
+                continue
+            end
             doc_str = ""
             sig_str = ""
             func_name = Symbol(splitext(file)[1])
@@ -437,9 +453,11 @@ function _load_procedures!()
             for a in parsed.args
                 if a isa Expr && a.head == :macrocall && length(a.args) >= 3
                     mac_name = a.args[1]
-                    is_doc_mac = (mac_name == Symbol("@doc") || 
-                                  mac_name == GlobalRef(Core, Symbol("@doc")) ||
-                                  (mac_name isa GlobalRef && mac_name.name == Symbol("@doc")))
+                    is_doc_mac = (
+                        mac_name == Symbol("@doc") ||
+                            mac_name == GlobalRef(Core, Symbol("@doc")) ||
+                            (mac_name isa GlobalRef && mac_name.name == Symbol("@doc"))
+                    )
                     if is_doc_mac && length(a.args) >= 4
                         doc_str = string(a.args[3])
                         target_fexpr = a.args[4]
@@ -548,7 +566,7 @@ function _is_global_or_type(sym::Symbol)::Bool
 end
 
 function _collect_ast_symbols!(ex, assigned::Set{Symbol}, referenced::Set{Symbol}, local_scope::Set{Symbol} = Set{Symbol}())
-    if ex isa Symbol
+    return if ex isa Symbol
         if !(ex in local_scope) && !(ex in assigned)
             push!(referenced, ex)
         end
@@ -627,7 +645,11 @@ end
 
 function _default_param_str(sym::Symbol)::Tuple{String, Bool}
     if isdefined(Main, sym)
-        val = try getfield(Main, sym) catch; nothing end
+        val = try
+            getfield(Main, sym)
+        catch
+            nothing
+        end
         if !isnothing(val)
             try
                 rep = repr(val)
@@ -645,14 +667,14 @@ function _default_param_str(sym::Symbol)::Tuple{String, Bool}
 end
 
 function make_procedure(
-    name::Union{Symbol, AbstractString};
-    last::Int = 0,
-    indices::Vector{Int} = Int[],
-    commands::Vector{String} = String[],
-    params::Vector{Symbol} = Symbol[],
-    doc::String = "",
-    save::Bool = true
-)
+        name::Union{Symbol, AbstractString};
+        last::Int = 0,
+        indices::Vector{Int} = Int[],
+        commands::Vector{String} = String[],
+        params::Vector{Symbol} = Symbol[],
+        doc::String = "",
+        save::Bool = true
+    )
     proc_name = Symbol(name)
     all_cmds = get_recent_commands(limit = 100)
 
@@ -688,7 +710,11 @@ function make_procedure(
     computation_start_idx = 1
 
     for (i, cmd) in enumerate(clean_cmds)
-        ex = try Meta.parse("begin\n" * cmd * "\nend") catch; nothing end
+        ex = try
+            Meta.parse("begin\n" * cmd * "\nend")
+        catch
+            nothing
+        end
         isnothing(ex) && break
         sub = filter(a -> !(a isa LineNumberNode), ex.args)
         isempty(sub) && continue
@@ -721,7 +747,11 @@ function make_procedure(
     parsed_exprs = Expr[]
 
     for cmd in body_cmds
-        ex = try Meta.parse("begin\n" * cmd * "\nend") catch; nothing end
+        ex = try
+            Meta.parse("begin\n" * cmd * "\nend")
+        catch
+            nothing
+        end
         if !isnothing(ex)
             push!(parsed_exprs, ex)
             _collect_ast_symbols!(ex, assigned, referenced)
@@ -771,16 +801,16 @@ function make_procedure(
     doc_text = isempty(doc) ? "Automated procedure extracted from Julia REPL." : doc
 
     code = """
-# Generated by jEMach on $timestamp
-\"\"\"
-    $func_sig
+    # Generated by jEMach on $timestamp
+    \"\"\"
+        $func_sig
 
-$doc_text
-\"\"\"
-function $func_sig
-$body_code
-end
-"""
+    $doc_text
+    \"\"\"
+    function $func_sig
+    $body_code
+    end
+    """
 
     if save
         proc_dir = joinpath(_get_project_dir(), "procedures")
@@ -937,10 +967,10 @@ function search_procedures(query::AbstractString = "")::Vector{ProcedureInfo}
     end
     return filter(procs) do p
         occursin(q, lowercase(string(p.name))) ||
-        occursin(q, lowercase(p.signature)) ||
-        occursin(q, lowercase(p.doc)) ||
-        occursin(q, lowercase(p.file)) ||
-        occursin(q, lowercase(p.code))
+            occursin(q, lowercase(p.signature)) ||
+            occursin(q, lowercase(p.doc)) ||
+            occursin(q, lowercase(p.file)) ||
+            occursin(q, lowercase(p.code))
     end
 end
 
@@ -967,10 +997,10 @@ function list_procedures(query::AbstractString = "")
     end
 
     header = isempty(query) ? "Available Procedures ($(length(procs))):" : "Matching Procedures for \"$query\" ($(length(procs))/$(length(_procedures))):"
-    println(bold * cyan * "┌─ " * header * " " * ("─" ^ max(0, 48 - length(header))) * reset)
+    println(bold * cyan * "┌─ " * header * " " * ("─"^max(0, 48 - length(header))) * reset)
     for p in procs
         status_icon = (p.last_run_status == :ok) ? (green * "✓" * reset) :
-                      (p.last_run_status == :error) ? (red * "✗" * reset) : (dim * "○" * reset)
+            (p.last_run_status == :error) ? (red * "✗" * reset) : (dim * "○" * reset)
         time_str = (p.last_run_status != :never) ? " $(yellow)($(p.last_run_time_ms)ms, $(Base.format_bytes(p.last_run_alloc_bytes)))$(reset)" : ""
         println("│ $status_icon " * cyan * bold * string(p.name) * reset * " → " * p.signature * time_str)
         if !isempty(p.doc)
@@ -979,7 +1009,7 @@ function list_procedures(query::AbstractString = "")
         end
         println("│   $(dim)File: $(p.file)$(reset)")
     end
-    println(bold * cyan * "└" * ("─" ^ 52) * reset)
+    println(bold * cyan * "└" * ("─"^52) * reset)
     return nothing
 end
 
@@ -1211,13 +1241,13 @@ function _collect_module_items_dod!(t::WorkspaceTable, mod::Module, mod_name::St
         end
 
         item_expr = (mod == Main) ? name : (mod_name * "." * name)
-        
+
         has_kids = (kind == "variable") && (
-            val isa AbstractDict || 
-            (val isa AbstractArray && length(val) > 0) || 
-            val isa Tuple || 
-            val isa NamedTuple || 
-            (!isprimitivetype(typeof(val)) && typeof(val) !== Module && typeof(val) !== Function && typeof(val) !== DataType && typeof(val) !== UnionAll)
+            val isa AbstractDict ||
+                (val isa AbstractArray && length(val) > 0) ||
+                val isa Tuple ||
+                val isa NamedTuple ||
+                (!isprimitivetype(typeof(val)) && typeof(val) !== Module && typeof(val) !== Function && typeof(val) !== DataType && typeof(val) !== UnionAll)
         )
 
         entry_idx = _add_entry!(t, name, kind, type_str, value_str, item_expr, mod_name, 0, -1, has_kids)
@@ -1225,6 +1255,7 @@ function _collect_module_items_dod!(t::WorkspaceTable, mod::Module, mod_name::St
             _collect_children_dod!(t, val, item_expr, mod_name, 1, entry_idx)
         end
     end
+    return
 end
 
 function _get_items(mod::Module, all::Bool)::Vector{Dict{String, Any}}
@@ -1539,7 +1570,7 @@ function detect_backend(preferred::Symbol = :auto)::Symbol
 
     # 1. Multiplexers
     if haskey(ENV, "REX_SESSION") || haskey(ENV, "REX") || haskey(ENV, "REX_PANE_ID") ||
-       haskey(ENV, "REX_SOCKET") || haskey(ENV, "GHOSTTY_REX")
+            haskey(ENV, "REX_SOCKET") || haskey(ENV, "GHOSTTY_REX")
         return :rex
     elseif haskey(ENV, "ZELLIJ") || haskey(ENV, "ZELLIJ_SESSION_NAME") || haskey(ENV, "ZELLIJ_PANE_ID")
         return :zellij
@@ -1554,7 +1585,7 @@ function detect_backend(preferred::Symbol = :auto)::Symbol
     if haskey(ENV, "KITTY_WINDOW_ID") || haskey(ENV, "KITTY_PID") || term == "xterm-kitty"
         return :kitty
     elseif term_prog == "ghostty" || haskey(ENV, "GHOSTTY_RESOURCES_DIR") ||
-           haskey(ENV, "GHOSTTY_BIN_DIR") || term == "xterm-ghostty"
+            haskey(ENV, "GHOSTTY_BIN_DIR") || term == "xterm-ghostty"
         return :ghostty
     end
 
@@ -1691,7 +1722,7 @@ function _append_repl_history(code::AbstractString)
     !_is_valid_user_cmd(code) && return
     hist_path = joinpath(homedir(), ".julia", "logs", "repl_history.jl")
     !isdir(dirname(hist_path)) && return
-    try
+    return try
         ts = Dates.format(Dates.now(), "yyyy-mm-dd HH:MM:SS")
         open(hist_path, "a") do f
             write(f, "# time: $(ts) CET\n# mode: julia\n")
@@ -1731,12 +1762,15 @@ function _repl_eval(code::AbstractString; silent::Bool = false)
     try
         ex = Meta.parseall(clean_code)
         val = Base.invokelatest(Core.eval, Main, ex)
-        try Core.eval(Main, Expr(:(=), :ans, QuoteNode(val))) catch; end
+        try
+            Core.eval(Main, Expr(:(=), :ans, QuoteNode(val)))
+        catch
+        end
 
         is_self_printing = startswith(clean_code, "println(") ||
-                           startswith(clean_code, "print(") ||
-                           startswith(clean_code, "dump(") ||
-                           startswith(clean_code, "jEMach.")
+            startswith(clean_code, "print(") ||
+            startswith(clean_code, "dump(") ||
+            startswith(clean_code, "jEMach.")
         if val !== nothing && !endswith(clean_code, ";") && !is_self_printing
             Base.invokelatest(
                 show,
@@ -1760,13 +1794,13 @@ function _repl_eval(code::AbstractString; silent::Bool = false)
         catch
         end
     end
-    publish_state()
+    return publish_state()
 end
 
 function _repl_insert(text::AbstractString, move_left::Int = 0)
     s = _get_mistate()
     isnothing(s) && return
-    try
+    return try
         le = parentmodule(typeof(s))
         Base.invokelatest(le.edit_insert, s, String(text))
         for _ in 1:move_left
@@ -1779,7 +1813,7 @@ end
 
 function _repl_clear()
     s = _get_mistate()
-    try
+    return try
         print(stdout, "\e[2J\e[H")
         flush(stdout)
         if !isnothing(s)
@@ -1794,7 +1828,7 @@ function _handle_socket_message(line::AbstractString)
     msg = _parse_json_cmd(line)
     isempty(msg) && return
     cmd = get(msg, "cmd", get(msg, "action", ""))
-    if cmd == "eval"
+    return if cmd == "eval"
         code = string(get(msg, "code", ""))
         @async _repl_eval(code; silent = false)
     elseif cmd == "eval_silent"
@@ -1825,11 +1859,17 @@ const _tui_proc_ref = Ref{Union{Base.Process, Nothing}}(nothing)
 function _start_socket_server()
     path = SOCKET_PATH[]
     if !isnothing(_server_ref[])
-        try close(_server_ref[]) catch; end
+        try
+            close(_server_ref[])
+        catch
+        end
         _server_ref[] = nothing
     end
-    try rm(path; force = true) catch; end
     try
+        rm(path; force = true)
+    catch
+    end
+    return try
         server = Sockets.listen(path)
         _server_ref[] = server
         @async begin
@@ -1853,7 +1893,10 @@ function _start_socket_server()
                                     end
                                 elseif !isempty(strip(line))
                                     _handle_socket_message(line)
-                                    try close(client) catch; end
+                                    try
+                                        close(client)
+                                    catch
+                                    end
                                 end
                             end
                         catch
@@ -1885,18 +1928,27 @@ function _stop_socket_server()
     end
 
     if !isnothing(_server_ref[])
-        try close(_server_ref[]) catch; end
+        try
+            close(_server_ref[])
+        catch
+        end
         _server_ref[] = nothing
     end
     for client in _socket_clients
-        try close(client) catch; end
+        try
+            close(client)
+        catch
+        end
     end
     empty!(_socket_clients)
-    try rm(SOCKET_PATH[]; force = true) catch; end
+    return try
+        rm(SOCKET_PATH[]; force = true)
+    catch
+    end
 end
 
 function _ensure_ghostty_shell_hook()
-    try
+    return try
         zshenv = joinpath(homedir(), ".zshenv")
         hook_line = "[[ -o interactive && -f \"/tmp/jemach_ghostty_split_\${PPID}.sh\" ]] && source \"/tmp/jemach_ghostty_split_\${PPID}.sh\""
         existing = isfile(zshenv) ? read(zshenv, String) : ""
@@ -1918,11 +1970,19 @@ function _find_ghostty_ancestor_pid()::Int
         comm_file = "/proc/$pid/comm"
         stat_file = "/proc/$pid/stat"
         (isfile(comm_file) && isfile(stat_file)) || break
-        comm = try lowercase(strip(read(comm_file, String))) catch; "" end
+        comm = try
+            lowercase(strip(read(comm_file, String)))
+        catch
+            ""
+        end
         if comm == "ghostty"
             return pid
         end
-        stat_str = try read(stat_file, String) catch; "" end
+        stat_str = try
+            read(stat_file, String)
+        catch
+            ""
+        end
         idx = findlast(')', stat_str)
         isnothing(idx) && break
         fields = split(strip(stat_str[(idx + 1):end]))
@@ -1984,11 +2044,17 @@ function _trigger_ghostty_dbus_split(proj_dir::String, sock::String, st_file::St
         run(pipeline(`gdbus call --session --dest $dbus_dest --object-path $win_path --method org.gtk.Actions.Activate split-right "[]" "{}"`, stdout = devnull, stderr = devnull))
         @async begin
             sleep(3.0)
-            try rm(split_script; force = true) catch; end
+            try
+                rm(split_script; force = true)
+            catch
+            end
         end
         return true
     catch
-        try rm(split_script; force = true) catch; end
+        try
+            rm(split_script; force = true)
+        catch
+        end
         return false
     end
 end
@@ -2010,13 +2076,20 @@ function _close_tui_pane()
     # 2. Close backend-specific pane/window if still open
     if backend == :tmux || haskey(ENV, "TMUX")
         if !isempty(_tui_pane_ref[])
-            try run(pipeline(`tmux kill-pane -t $(_tui_pane_ref[])`, devnull)) catch; end
+            try
+                run(pipeline(`tmux kill-pane -t $(_tui_pane_ref[])`, devnull))
+            catch
+            end
             _tui_pane_ref[] = ""
         end
         if haskey(ENV, "TMUX")
             try
                 out = read(`tmux list-panes -F "#{pane_id} #{pane_current_command} #{pane_title}"`, String)
-                cur_pane = try strip(read(`tmux display-message -p "#{pane_id}"`, String)) catch; "" end
+                cur_pane = try
+                    strip(read(`tmux display-message -p "#{pane_id}"`, String))
+                catch
+                    ""
+                end
                 for line in split(strip(out), '\n')
                     parts = split(strip(line))
                     if !isempty(parts)
@@ -2024,7 +2097,10 @@ function _close_tui_pane()
                         if pid != cur_pane
                             line_str = lowercase(line)
                             if occursin("luajit", line_str) || occursin("jl_tui", line_str) || occursin("jl-assist", line_str)
-                                try run(pipeline(`tmux kill-pane -t $pid`, devnull)) catch; end
+                                try
+                                    run(pipeline(`tmux kill-pane -t $pid`, devnull))
+                                catch
+                                end
                             end
                         end
                     end
@@ -2055,7 +2131,7 @@ function _close_tui_pane()
             _tui_pane_ref[] = ""
         end
     end
-    _tui_backend_ref[] = :none
+    return _tui_backend_ref[] = :none
 end
 
 function _open_tui_pane(; backend::Symbol = detect_backend(), width::Int = 65)
@@ -2103,7 +2179,11 @@ function _open_tui_pane(; backend::Symbol = detect_backend(), width::Int = 65)
                 println("🚀 tmux TUI split already active ($(_tui_pane_ref[]))")
             else
                 _close_tui_pane()
-                cur_pane = try strip(read(`tmux display-message -p "#{pane_id}"`, String)) catch; "" end
+                cur_pane = try
+                    strip(read(`tmux display-message -p "#{pane_id}"`, String))
+                catch
+                    ""
+                end
                 pane_arg = !isempty(cur_pane) ? cur_pane : "{left-of}"
                 cmd = `tmux split-window -P -F "#{pane_id}" -h -l $width -c $proj_dir -e JEMACH_SOCKET=$sock -e JEMACH_STATE=$st_file -e JEMACH_PROJ=$proj_dir -e JEMACH_BACKEND=tmux luajit $tui_script $pane_arg $sock $st_file`
                 pane_id = strip(read(cmd, String))
@@ -2216,10 +2296,10 @@ function _open_tui_pane(; backend::Symbol = detect_backend(), width::Int = 65)
                 opened = false
                 # Probe candidate Rex CLI split subcommands (pane split vs tmux-compatible split-window)
                 for candidate in (
-                    `$rex_bin pane split --direction right --size $width --cwd $proj_dir -- env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=rex luajit $tui_script $pane_arg $sock $st_file`,
-                    `$rex_bin split-window -h -l $width -c $proj_dir env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=rex luajit $tui_script $pane_arg $sock $st_file`,
-                    `$rex_bin split --right --cwd $proj_dir -- env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=rex luajit $tui_script $pane_arg $sock $st_file`,
-                )
+                        `$rex_bin pane split --direction right --size $width --cwd $proj_dir -- env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=rex luajit $tui_script $pane_arg $sock $st_file`,
+                        `$rex_bin split-window -h -l $width -c $proj_dir env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=rex luajit $tui_script $pane_arg $sock $st_file`,
+                        `$rex_bin split --right --cwd $proj_dir -- env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=rex luajit $tui_script $pane_arg $sock $st_file`,
+                    )
                     try
                         run(pipeline(candidate, stderr = devnull))
                         opened = true
@@ -2399,13 +2479,13 @@ end
 
 function _hot_reload_callback(file_path::String, source::String)
     @info "[jEMach Hot-Reload] File changed: $file_path"
-    try
+    return try
         # Evaluate the changed file in the Main module or attempt to guess the module
         expr = Meta.parse("begin\n" * source * "\nend")
         Base.invokelatest(Core.eval, Main, expr)
         @info "[jEMach Hot-Reload] Successfully reloaded into Main."
     catch e
-        @error "[jEMach Hot-Reload] Error evaluating $file_path" exception=(e, catch_backtrace())
+        @error "[jEMach Hot-Reload] Error evaluating $file_path" exception = (e, catch_backtrace())
     end
 end
 
@@ -2452,8 +2532,8 @@ function enable_hot_reload(proj_dir::String = _get_project_dir())
             end
         end
     end
-    
-    @info "Registered $watched_count files for instantaneous FFI Hot-Reload."
+
+    return @info "Registered $watched_count files for instantaneous FFI Hot-Reload."
 end
 
 function status()
@@ -2466,11 +2546,11 @@ function status()
 end
 
 function _setup_repl_hooks(repl)
-    @async begin
+    return @async begin
         # Wait briefly for REPL interface & OhMyREPL initialization
         for _ in 1:25
             if isdefined(Base, :active_repl_backend) && !isnothing(Base.active_repl_backend) &&
-               hasproperty(repl, :interface) && !isnothing(repl.interface)
+                    hasproperty(repl, :interface) && !isnothing(repl.interface)
                 break
             end
             sleep(0.05)
@@ -2531,7 +2611,6 @@ function __init__()
         end
     end
 
-    # Auto-start watcher silently (without split) when loaded as a package
     return start(split = false, quiet = true)
 end
 
