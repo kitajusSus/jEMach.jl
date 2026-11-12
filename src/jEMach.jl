@@ -1824,9 +1824,11 @@ const _tui_proc_ref = Ref{Union{Base.Process, Nothing}}(nothing)
 
 function _start_socket_server()
     path = SOCKET_PATH[]
-    if isfile(path) || isfifo(path)
-        try rm(path; force = true) catch; end
+    if !isnothing(_server_ref[])
+        try close(_server_ref[]) catch; end
+        _server_ref[] = nothing
     end
+    try rm(path; force = true) catch; end
     try
         server = Sockets.listen(path)
         _server_ref[] = server
@@ -1890,8 +1892,104 @@ function _stop_socket_server()
         try close(client) catch; end
     end
     empty!(_socket_clients)
-    if isfile(SOCKET_PATH[])
-        try rm(SOCKET_PATH[]; force = true) catch; end
+    try rm(SOCKET_PATH[]; force = true) catch; end
+end
+
+function _ensure_ghostty_shell_hook()
+    try
+        zshenv = joinpath(homedir(), ".zshenv")
+        hook_line = "[[ -o interactive && -f \"/tmp/jemach_ghostty_split_\${PPID}.sh\" ]] && source \"/tmp/jemach_ghostty_split_\${PPID}.sh\""
+        existing = isfile(zshenv) ? read(zshenv, String) : ""
+        if !occursin("jemach_ghostty_split_", existing)
+            open(zshenv, "a") do f
+                !isempty(existing) && !endswith(existing, "\n") && write(f, "\n")
+                write(f, "# jEMach Ghostty native split bootstrap\n" * hook_line * "\n")
+            end
+        end
+    catch
+    end
+end
+
+function _find_ghostty_ancestor_pid()::Int
+    Sys.islinux() || return 0
+    pid = Int(getpid())
+    for _ in 1:16
+        pid <= 1 && break
+        comm_file = "/proc/$pid/comm"
+        stat_file = "/proc/$pid/stat"
+        (isfile(comm_file) && isfile(stat_file)) || break
+        comm = try lowercase(strip(read(comm_file, String))) catch; "" end
+        if comm == "ghostty"
+            return pid
+        end
+        stat_str = try read(stat_file, String) catch; "" end
+        idx = findlast(')', stat_str)
+        isnothing(idx) && break
+        fields = split(strip(stat_str[(idx + 1):end]))
+        length(fields) < 2 && break
+        ppid = tryparse(Int, fields[2])
+        isnothing(ppid) && break
+        pid = ppid
+    end
+    return 0
+end
+
+function _trigger_ghostty_dbus_split(proj_dir::String, sock::String, st_file::String, tui_script::String)::Bool
+    Sys.islinux() || return false
+    (isnothing(Sys.which("gdbus")) || isnothing(Sys.which("busctl"))) && return false
+
+    ghostty_pid = _find_ghostty_ancestor_pid()
+    ghostty_pid <= 0 && return false
+
+    _ensure_ghostty_shell_hook()
+
+    dbus_dest = "com.mitchellh.ghostty"
+    try
+        out = read(`busctl --user list --no-pager`, String)
+        for line in split(out, '\n')
+            parts = split(strip(line))
+            if length(parts) >= 3 && startswith(parts[1], ":") && parts[2] == string(ghostty_pid)
+                dbus_dest = String(parts[1])
+                break
+            end
+        end
+    catch
+    end
+
+    win_path = "/com/mitchellh/ghostty/window/1"
+    try
+        intro = read(pipeline(`gdbus introspect --session --dest $dbus_dest --object-path /com/mitchellh/ghostty/window`, stderr = devnull), String)
+        m = match(r"node\s+(?:/com/mitchellh/ghostty/window/)?(\d+)", intro)
+        if !isnothing(m)
+            win_path = "/com/mitchellh/ghostty/window/" * m.captures[1]
+        end
+    catch
+    end
+
+    split_script = "/tmp/jemach_ghostty_split_$(ghostty_pid).sh"
+    sq_escape(s) = "'" * replace(s, "'" => "'\\''") * "'"
+    script_body = """
+    rm -f $(sq_escape(split_script))
+    cd $(sq_escape(proj_dir)) 2>/dev/null || true
+    export JEMACH_SOCKET=$(sq_escape(sock))
+    export JEMACH_STATE=$(sq_escape(st_file))
+    export JEMACH_PROJ=$(sq_escape(proj_dir))
+    export JEMACH_BACKEND='ghostty'
+    exec luajit $(sq_escape(tui_script)) ghostty $(sq_escape(sock)) $(sq_escape(st_file))
+    """
+    try
+        open(split_script, "w") do f
+            write(f, script_body)
+        end
+        run(pipeline(`gdbus call --session --dest $dbus_dest --object-path $win_path --method org.gtk.Actions.Activate split-right "[]" "{}"`, stdout = devnull, stderr = devnull))
+        @async begin
+            sleep(3.0)
+            try rm(split_script; force = true) catch; end
+        end
+        return true
+    catch
+        try rm(split_script; force = true) catch; end
+        return false
     end
 end
 
@@ -2071,22 +2169,28 @@ function _open_tui_pane(; backend::Symbol = detect_backend(), width::Int = 65)
                     "{tui_script}" => tui_script,
                 )
                 _tui_proc_ref[] = run(Cmd(`sh -c $cmd_str`; dir = proj_dir); wait = false)
+                println("🚀 Ghostty jEMach TUI custom command launched!")
             elseif Sys.isapple()
                 cmd = `open -na Ghostty.app --args --title=jEMach --working-directory=$proj_dir --window-width=$width --wait-after-command=false -e env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=ghostty luajit $tui_script ghostty $sock $st_file`
                 _tui_proc_ref[] = run(cmd; wait = false)
+                println("🚀 Ghostty jEMach TUI window opened!")
             else
-                mode = lowercase(get(ENV, "JEMACH_GHOSTTY_MODE", "window"))
-                if mode == "tab"
+                mode = lowercase(get(ENV, "JEMACH_GHOSTTY_MODE", "split"))
+                if mode == "split" && _trigger_ghostty_dbus_split(proj_dir, sock, st_file, tui_script)
+                    println("🚀 Ghostty TUI right-split opened!")
+                elseif mode == "tab"
                     cmd = `ghostty +new-tab -e env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=ghostty luajit $tui_script ghostty $sock $st_file`
+                    _tui_proc_ref[] = run(cmd; wait = false)
+                    println("🚀 Ghostty jEMach TUI tab opened!")
                 else
-                    cmd = `ghostty --title=jEMach --working-directory=$proj_dir --window-width=$width --wait-after-command=false -e env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=ghostty luajit $tui_script ghostty $sock $st_file`
+                    cmd = `ghostty --gtk-single-instance=false --title=jEMach --working-directory=$proj_dir --window-width=$width --wait-after-command=false -e env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=ghostty luajit $tui_script ghostty $sock $st_file`
+                    _tui_proc_ref[] = run(cmd; wait = false)
+                    println("🚀 Ghostty jEMach TUI window opened!")
                 end
-                _tui_proc_ref[] = run(cmd; wait = false)
             end
             _tui_backend_ref[] = :ghostty
-            println("🚀 Ghostty jEMach TUI window opened! (Or split in Ghostty with Ctrl+Shift+O and run `./scripts/jl-assist`)")
         catch e
-            @warn "Failed to launch Ghostty TUI window. In Ghostty you can also press Ctrl+Shift+O to split right and run `./scripts/jl-assist`." exception = e
+            @warn "Failed to launch Ghostty TUI split/window." exception = e
         end
 
     elseif backend == :rex
@@ -2144,6 +2248,9 @@ end
 
 function publish_state()
     return try
+        if _running[] && (isnothing(_server_ref[]) || !isopen(_server_ref[]) || !ispath(SOCKET_PATH[]))
+            _start_socket_server()
+        end
         state = _collect_state_dod!(_shared_workspace_table[])
         pkgs = _get_packages()
         json = _serialize_dod(state, pkgs)
@@ -2190,6 +2297,9 @@ function start(; split::Bool = true, backend::Symbol = :auto, width::Int = 65, q
     end
     _load_procedures!()
     if _running[]
+        if isnothing(_server_ref[]) || !isopen(_server_ref[]) || !ispath(SOCKET_PATH[])
+            _start_socket_server()
+        end
         !quiet && !split && @info "jEMach Watcher already running"
     else
         _running[] = true

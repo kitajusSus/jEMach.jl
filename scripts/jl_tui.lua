@@ -137,11 +137,13 @@ local STATE_FILE = (arg and arg[3] and arg[3] ~= "") and arg[3]
 	or os.getenv("JEMACH_STATE")
 	or ("/tmp/jl_tui_state_" .. default_safe_name .. ".json")
 
-local function check_and_discover()
-	local f = io.open(STATE_FILE, "r")
-	if f then
-		f:close()
-		return
+local function check_and_discover(force)
+	if not force then
+		local f = io.open(STATE_FILE, "r")
+		if f then
+			f:close()
+			return
+		end
 	end
 	local auto_sock, auto_state = find_active_jemach()
 	if auto_state then
@@ -155,7 +157,7 @@ local function check_and_discover()
 		end
 	end
 end
-check_and_discover()
+check_and_discover(false)
 
 local socket_fd = -1
 local last_connect_try = 0
@@ -173,14 +175,6 @@ local function try_connect_socket()
 	end
 	last_connect_try = now
 
-	-- If socket file doesn't exist at socket_path, retry discovery
-	local sf = io.open(socket_path, "r")
-	if not sf then
-		check_and_discover()
-	else
-		sf:close()
-	end
-
 	local fd = ffi.C.socket(1, 1, 0) -- AF_UNIX = 1, SOCK_STREAM = 1
 	if fd < 0 then
 		return
@@ -196,6 +190,23 @@ local function try_connect_socket()
 		ffi.C.write(socket_fd, "SUB\n", 4)
 	else
 		ffi.C.close(fd)
+		-- If connect failed, try discovering active session and retry immediately
+		local old_sock = socket_path
+		check_and_discover(true)
+		if socket_path ~= old_sock then
+			local fd2 = ffi.C.socket(1, 1, 0)
+			if fd2 >= 0 then
+				ffi.fill(addr, ffi.sizeof(addr))
+				addr.sun_family = 1
+				ffi.copy(addr.sun_path, socket_path)
+				if ffi.C.connect(fd2, addr, 110) == 0 then
+					socket_fd = fd2
+					ffi.C.write(socket_fd, "SUB\n", 4)
+				else
+					ffi.C.close(fd2)
+				end
+			end
+		end
 	end
 end
 

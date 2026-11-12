@@ -216,7 +216,7 @@ case "$ACTIVE_BACKEND" in
     ;;
 
   ghostty)
-    # If the user split in Ghostty (e.g. Ctrl+Shift+O) and ran jl-assist in the new split while Julia is running, run inline!
+    # If the user split in Ghostty (e.g. Alt+\ or Ctrl+Shift+O) and ran jl-assist in the new split while Julia is running, run inline!
     if [[ "$FORCE_NEW" -eq 0 && ( -S "$SOCKET" || -f "$STATE" ) ]]; then
       export JEMACH_SOCKET="$SOCKET"
       export JEMACH_STATE="$STATE"
@@ -224,15 +224,55 @@ case "$ACTIVE_BACKEND" in
       export JEMACH_BACKEND="ghostty"
       exec luajit "$TUI_SCRIPT" "ghostty" "$SOCKET" "$STATE"
     else
-      if [[ "${JEMACH_GHOSTTY_MODE:-window}" == "tab" ]]; then
-        nohup ghostty +new-tab -e env JEMACH_SOCKET="$SOCKET" JEMACH_STATE="$STATE" JEMACH_PROJ="$PROJ_DIR" JEMACH_BACKEND="ghostty" \
-          luajit "$TUI_SCRIPT" "ghostty" "$SOCKET" "$STATE" >/dev/null 2>&1 &
-      else
-        nohup ghostty --title="jEMach" --working-directory="$PROJ_DIR" --window-width="$PANE_WIDTH" --wait-after-command=false \
-          -e env JEMACH_SOCKET="$SOCKET" JEMACH_STATE="$STATE" JEMACH_PROJ="$PROJ_DIR" JEMACH_BACKEND="ghostty" \
-          luajit "$TUI_SCRIPT" "ghostty" "$SOCKET" "$STATE" >/dev/null 2>&1 &
+      MODE="${JEMACH_GHOSTTY_MODE:-split}"
+      SPLIT_OK=0
+      if [[ "$MODE" == "split" ]] && command -v gdbus &>/dev/null && command -v busctl &>/dev/null; then
+        # Find ancestor ghostty PID
+        CUR_PID=$$
+        GHOSTTY_PID=""
+        while [[ "$CUR_PID" -gt 1 && -f "/proc/$CUR_PID/comm" ]]; do
+          if [[ "$(cat "/proc/$CUR_PID/comm" 2>/dev/null)" == "ghostty" ]]; then
+            GHOSTTY_PID="$CUR_PID"
+            break
+          fi
+          CUR_PID="$(awk '{print $4}' "/proc/$CUR_PID/stat" 2>/dev/null || echo 1)"
+        done
+        if [[ -n "$GHOSTTY_PID" ]]; then
+          grep -q "jemach_ghostty_split_" "$HOME/.zshenv" 2>/dev/null || \
+            printf '\n# jEMach Ghostty native split bootstrap\n[[ -o interactive && -f "/tmp/jemach_ghostty_split_${PPID}.sh" ]] && source "/tmp/jemach_ghostty_split_${PPID}.sh"\n' >> "$HOME/.zshenv"
+          DBUS_DEST="$(busctl --user list --no-pager 2>/dev/null | awk -v pid="$GHOSTTY_PID" '$1 ~ /^:/ && $2 == pid {print $1; exit}')"
+          [[ -z "$DBUS_DEST" ]] && DBUS_DEST="com.mitchellh.ghostty"
+          SPLIT_SCRIPT="/tmp/jemach_ghostty_split_${GHOSTTY_PID}.sh"
+          cat > "$SPLIT_SCRIPT" <<EOF
+rm -f "$SPLIT_SCRIPT"
+cd "$PROJ_DIR" 2>/dev/null || true
+export JEMACH_SOCKET="$SOCKET"
+export JEMACH_STATE="$STATE"
+export JEMACH_PROJ="$PROJ_DIR"
+export JEMACH_BACKEND="ghostty"
+exec luajit "$TUI_SCRIPT" "ghostty" "$SOCKET" "$STATE"
+EOF
+          if gdbus call --session --dest "$DBUS_DEST" --object-path /com/mitchellh/ghostty/window/1 \
+               --method org.gtk.Actions.Activate split-right "[]" "{}" >/dev/null 2>&1; then
+            ( sleep 3 && rm -f "$SPLIT_SCRIPT" ) >/dev/null 2>&1 &
+            echo "Done. Ghostty right-split started."
+            SPLIT_OK=1
+          else
+            rm -f "$SPLIT_SCRIPT"
+          fi
+        fi
       fi
-      echo "Done. Ghostty jEMach window launched."
+      if [[ "$SPLIT_OK" -eq 0 ]]; then
+        if [[ "$MODE" == "tab" ]]; then
+          nohup ghostty +new-tab -e env JEMACH_SOCKET="$SOCKET" JEMACH_STATE="$STATE" JEMACH_PROJ="$PROJ_DIR" JEMACH_BACKEND="ghostty" \
+            luajit "$TUI_SCRIPT" "ghostty" "$SOCKET" "$STATE" >/dev/null 2>&1 &
+        else
+          nohup ghostty --gtk-single-instance=false --title="jEMach" --working-directory="$PROJ_DIR" --window-width="$PANE_WIDTH" --wait-after-command=false \
+            -e env JEMACH_SOCKET="$SOCKET" JEMACH_STATE="$STATE" JEMACH_PROJ="$PROJ_DIR" JEMACH_BACKEND="ghostty" \
+            luajit "$TUI_SCRIPT" "ghostty" "$SOCKET" "$STATE" >/dev/null 2>&1 &
+        fi
+        echo "Done. Ghostty jEMach window launched."
+      fi
     fi
     ;;
 
