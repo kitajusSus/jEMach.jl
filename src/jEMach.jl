@@ -1,9 +1,7 @@
 # src/jEMach.jl — Julia Background Watcher & REPL Assistant for jEMach TUI
 #
-# Load in your Julia REPL:
 #   using jEMach
 #
-# Key REPL features:
 #   • Press `}` at the start of an empty line (or `Alt+m`) to enter `jemach>` mode
 #   • Press `Alt+j` (or `@jemach`) to toggle the TUI split/window
 #   • Press `Alt+r` to start/stop live procedure recording
@@ -3195,13 +3193,10 @@ function _install_jemach_mode!(repl)
 end
 
 # ---------------------------------------------------------------------------
-# Zero-Overhead FFI Hot-Reloading via JuliaZigCompiler
-# ---------------------------------------------------------------------------
 
 function _hot_reload_callback(file_path::String, source::String)
     @info "[jEMach Hot-Reload] File changed: $file_path"
     return try
-        # Evaluate the changed file in the Main module or attempt to guess the module
         expr = Meta.parse("begin\n" * source * "\nend")
         Base.invokelatest(Core.eval, Main, expr)
         @info "[jEMach Hot-Reload] Successfully reloaded into Main."

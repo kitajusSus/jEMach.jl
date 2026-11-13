@@ -1,6 +1,5 @@
 const std = @import("std");
 
-/// Item category in the DoD workspace
 pub const ItemKind = enum(u8) {
     variable = 0,
     function = 1,
