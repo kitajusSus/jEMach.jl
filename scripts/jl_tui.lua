@@ -163,6 +163,9 @@ local socket_fd = -1
 local last_connect_try = 0
 local socket_buffer = ""
 local dirty = true
+local state = nil -- last parsed JSON state
+local last_mtime = 0
+local last_state_ts = 0
 
 local function try_connect_socket()
 	if socket_fd >= 0 then
@@ -212,15 +215,25 @@ end
 
 local function handle_socket_read()
 	local buf = ffi.new("char[65536]")
-	local n = tonumber(ffi.C.read(socket_fd, buf, 65536))
-	if not n or n <= 0 then
-		ffi.C.close(socket_fd)
-		socket_fd = -1
-		return nil
-	end
+	while socket_fd >= 0 do
+		local n = tonumber(ffi.C.read(socket_fd, buf, 65536))
+		if not n or n <= 0 then
+			ffi.C.close(socket_fd)
+			socket_fd = -1
+			return nil
+		end
 
-	local chunk = ffi.string(buf, n)
-	socket_buffer = socket_buffer .. chunk
+		socket_buffer = socket_buffer .. ffi.string(buf, n)
+		if socket_buffer:sub(-1) == "\n" then
+			break
+		end
+		local rfds = fd_set_new()
+		fd_set_set(rfds, socket_fd)
+		local rtv = ffi.new("timeval_t", { tv_sec = 0, tv_usec = 2000 })
+		if ffi.C.select(socket_fd + 1, rfds, nil, nil, rtv) <= 0 then
+			break
+		end
+	end
 
 	local should_quit = false
 	while true do
@@ -582,7 +595,7 @@ end
 -- ---------------------------------------------------------------------------
 -- Minimal JSON parser (handles the format emitted by jl_watcher.jl)
 -- ---------------------------------------------------------------------------
-local function json_parse(s)
+json_parse = function(s)
 	local pos = 1
 
 	local function skip_ws()
@@ -616,6 +629,17 @@ local function json_parse(s)
 					buf[#buf + 1] = "\r"
 				elseif esc == "t" then
 					buf[#buf + 1] = "\t"
+				elseif esc == "b" then
+					buf[#buf + 1] = "\b"
+				elseif esc == "f" then
+					buf[#buf + 1] = "\f"
+				elseif esc == "u" then
+					local hex = s:sub(pos + 1, pos + 4)
+					local cp = tonumber(hex, 16)
+					if cp and cp < 128 then
+						buf[#buf + 1] = string.char(cp)
+					end
+					pos = pos + 4
 				else
 					buf[#buf + 1] = esc
 				end
@@ -771,9 +795,6 @@ end
 local display_rows = {}
 local cursor = 1
 local col_cursor = 1 -- 1: Name, 2: Type, 3: Value
-local state = nil -- last parsed JSON state
-local last_mtime = 0
-local last_state_ts = 0
 
 -- ---------------------------------------------------------------------------
 -- Read & refresh state
@@ -789,7 +810,7 @@ local function file_mtime(path)
 end
 
 local function load_state()
-	if socket_fd >= 0 then
+	if socket_fd >= 0 and last_state_ts > 0 and (os.time() - last_state_ts) < 3 then
 		return false
 	end
 

@@ -73,13 +73,13 @@ Pkg.add(url="https://github.com/kitajusSus/jEMach")
 
 ### Supported Terminal & Multiplexer Backends
 
-| Backend | Auto-Detection | Split / Launch Mechanism | Bidirectional REPL Sync |
-|:---|:---|:---|:---|
-| **`tmux`** | `$TMUX` | `tmux split-window -h` | UNIX Socket RPC + `send-keys` fallback |
-| **`zellij`** | `$ZELLIJ` / `$ZELLIJ_SESSION_NAME` | `zellij run --direction right --close-on-exit` | UNIX Socket RPC (`LineEdit` + `Main` eval) |
-| **`kitty`** | `$KITTY_WINDOW_ID` / `xterm-kitty` | `kitten @ launch --location=vsplit` (or companion window) | UNIX Socket RPC + `kitten @ send-text` fallback |
-| **`ghostty`** | `$TERM_PROGRAM=ghostty` / `xterm-ghostty` | Native split (`Ctrl+Shift+O` + `jl-assist`) or `ghostty` companion window/tab (`JEMACH_GHOSTTY_MODE=tab`) | UNIX Socket RPC (`LineEdit` + `Main` eval) |
-| **`rex`** *(Ghostty mux)* | `$REX_SESSION` / `$REX` / `$GHOSTTY_REX` | `rex pane split` / `rex split-window` / `$JEMACH_REX_SPLIT_CMD` | UNIX Socket RPC + `rex send-keys` fallback |
+| Backend                   | Auto-Detection                            | Split / Launch Mechanism                                                                                  | Bidirectional REPL Sync                         |
+| :------------------------ | :---------------------------------------- | :-------------------------------------------------------------------------------------------------------- | :---------------------------------------------- |
+| **`tmux`**                | `$TMUX`                                   | `tmux split-window -h`                                                                                    | UNIX Socket RPC + `send-keys` fallback          |
+| **`zellij`**              | `$ZELLIJ` / `$ZELLIJ_SESSION_NAME`        | `zellij run --direction right --close-on-exit`                                                            | UNIX Socket RPC (`LineEdit` + `Main` eval)      |
+| **`kitty`**               | `$KITTY_WINDOW_ID` / `xterm-kitty`        | `kitten @ launch --location=vsplit` (or companion window)                                                 | UNIX Socket RPC + `kitten @ send-text` fallback |
+| **`ghostty`**             | `$TERM_PROGRAM=ghostty` / `xterm-ghostty` | Native split (`Ctrl+Shift+O` + `jl-assist`) or `ghostty` companion window/tab (`JEMACH_GHOSTTY_MODE=tab`) | UNIX Socket RPC (`LineEdit` + `Main` eval)      |
+| **`rex`** _(Ghostty mux)_ | `$REX_SESSION` / `$REX` / `$GHOSTTY_REX`  | `rex pane split` / `rex split-window` / `$JEMACH_REX_SPLIT_CMD`                                           | UNIX Socket RPC + `rex send-keys` fallback      |
 
 ---
 
@@ -116,6 +116,7 @@ The TUI provides 4 dedicated panels accessible via `1`, `2`, `3`, `4` or `Tab`:
 Turn your experimental REPL commands into parameterized, reproducible procedures with automatic AST variable analysis:
 
 ### 1. From the Interactive TUI (`jl-assist`)
+
 1. Press `2` to switch to **History**.
 2. Press `Space` to toggle `[x]` on the commands you want in your procedure.
 3. Press `p` (**Make Procedure**): an inline modal dialog will prompt for the procedure name.
@@ -123,6 +124,7 @@ Turn your experimental REPL commands into parameterized, reproducible procedures
 5. In **`[3] Procedures`**, hit `Enter` to run with profiling or `e` to edit arguments in the REPL.
 
 ### 2. Directly in Julia REPL
+
 ```julia
 using jEMach
 
@@ -150,37 +152,38 @@ jEMach.find_procedures("sample")
 
 ## TUI Keybindings
 
-| Key | Context | Action |
-|:---|:---|:---|
-| `/` | Global | **Search & Live Filter** (procedures, workspace variables, history, packages) |
-| `Esc` / `x` | Global | Clear search filter and restore full list |
-| `1` / `2` / `3` / `4` | Global | Jump directly to Workspace / History / Procedures / Packages |
-| `Tab` / `]` / `[` | Global | Cycle to next / previous tab |
-| `j` / `k` (or `↓` / `↑`) | Global | Move cursor down / up |
-| `Space` | History | Toggle selection `[x]` / `[ ]` on command |
-| `a` | History | Toggle select all / clear all |
-| `p` | History | **Make Procedure** from selected commands (opens modal prompt) |
-| `↵` (Enter) | History | Send highlighted command to REPL |
-| `↵` (Enter) | Procedures | Run highlighted procedure with benchmark profiling |
-| `e` | Procedures | Paste `<proc_name>()` into REPL line to customize parameters |
-| `d` | Procedures | Delete procedure file from disk (with in-TUI confirmation) |
-| `r` | Procedures | Reload procedure definitions from disk |
-| `l` / `↵` (Enter) | Workspace | Expand node **or** evaluate `println(var)` in REPL |
-| `h` (or `←`) | Workspace | Collapse node / jump to parent |
-| `i` | Workspace | Inspect variable details, methods, and creation history |
-| `e` | Workspace | Insert variable expression directly into REPL command line |
-| `d` | Workspace | Hide item from view |
-| `D` | Workspace | Restore all hidden items |
-| `s` | Workspace | Save clean reproducible session script |
-| `a` / `d` / `u` | Packages | Add / Remove / Update package (in-TUI dialogs) |
-| `c` | Global | Clear REPL screen (`Ctrl-L`) |
-| `q` / `Ctrl-C` | Global | Quit assistant |
+| Key                      | Context    | Action                                                                        |
+| :----------------------- | :--------- | :---------------------------------------------------------------------------- |
+| `/`                      | Global     | **Search & Live Filter** (procedures, workspace variables, history, packages) |
+| `Esc` / `x`              | Global     | Clear search filter and restore full list                                     |
+| `1` / `2` / `3` / `4`    | Global     | Jump directly to Workspace / History / Procedures / Packages                  |
+| `Tab` / `]` / `[`        | Global     | Cycle to next / previous tab                                                  |
+| `j` / `k` (or `↓` / `↑`) | Global     | Move cursor down / up                                                         |
+| `Space`                  | History    | Toggle selection `[x]` / `[ ]` on command                                     |
+| `a`                      | History    | Toggle select all / clear all                                                 |
+| `p`                      | History    | **Make Procedure** from selected commands (opens modal prompt)                |
+| `↵` (Enter)              | History    | Send highlighted command to REPL                                              |
+| `↵` (Enter)              | Procedures | Run highlighted procedure with benchmark profiling                            |
+| `e`                      | Procedures | Paste `<proc_name>()` into REPL line to customize parameters                  |
+| `d`                      | Procedures | Delete procedure file from disk (with in-TUI confirmation)                    |
+| `r`                      | Procedures | Reload procedure definitions from disk                                        |
+| `l` / `↵` (Enter)        | Workspace  | Expand node **or** evaluate `println(var)` in REPL                            |
+| `h` (or `←`)             | Workspace  | Collapse node / jump to parent                                                |
+| `i`                      | Workspace  | Inspect variable details, methods, and creation history                       |
+| `e`                      | Workspace  | Insert variable expression directly into REPL command line                    |
+| `d`                      | Workspace  | Hide item from view                                                           |
+| `D`                      | Workspace  | Restore all hidden items                                                      |
+| `s`                      | Workspace  | Save clean reproducible session script                                        |
+| `a` / `d` / `u`          | Packages   | Add / Remove / Update package (in-TUI dialogs)                                |
+| `c`                      | Global     | Clear REPL screen (`Ctrl-L`)                                                  |
+| `q` / `Ctrl-C`           | Global     | Quit assistant                                                                |
 
 ---
 
 ## Tree & Complex Type Introspection
 
 `jEMach` includes specialized introspection extractors for:
+
 - **DataFrames & Tables.jl**: Column names, row counts, and column types.
 - **1D Arrays & 2D Matrices**: Dimensions, element types, and value slices.
 - **Dictionaries & Sets**: Key-value pairs and entry expressions.

@@ -1,12 +1,16 @@
+authors = ["kitajusSus <kitajusus@users.noreply.github.com>"]
 name = "jEMach"
 uuid = "67289db4-f2a6-40b9-80a9-9c8949710e38"
 version = "0.1.2"
-authors = ["kitajusSus <kitajusus@users.noreply.github.com>"]
+
+[compat]
+Sockets = "1.11.0"
 
 [deps]
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
+REPL = "3fa0cd96-eef1-5676-8a61-b3b8758bbffb"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 
-[compat]
-Sockets = "1.11.0"
+[extras]
+Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"

@@ -1,18 +1,39 @@
-# src/jEMach.jl — Julia Background Watcher for jemach TUI
+# src/jEMach.jl — Julia Background Watcher & REPL Assistant for jEMach TUI
 #
 # Load in your Julia REPL:
 #   using jEMach
 #
-# The watcher runs as a background task and writes the current workspace
-# state to /tmp/jl_tui_state.json every UPDATE_INTERVAL seconds.
+# Key REPL features:
+#   • Press `}` at the start of an empty line (or `Alt+m`) to enter `jemach>` mode
+#   • Press `Alt+j` (or `@jemach`) to toggle the TUI split/window
+#   • Press `Alt+r` to start/stop live procedure recording
+#   • Use `@jemach ls`, `@jemach inspect x`, `@jemach ws`, or `workspace()`
 
+"""
+    jEMach
+
+Data-Oriented Julia Workspace Assistant & REPL Monitor with multi-terminal TUI
+(`Ghostty`, `Kitty`, `tmux`, `Zellij`, `Rex`) and dedicated `jemach>` REPL mode.
+
+### Quick REPL Shortcuts
+- **`}`** (at start of line) or **`Alt+m`**: Enter interactive `jemach>` REPL mode (`help` for commands)
+- **`Alt+j`** or **`@jemach`**: Toggle the interactive TUI panel open/closed
+- **`Alt+r`**: Start / stop live procedure recording (`⏺ [rec] julia>`)
+- **`workspace()`** or **`@jemach ws`**: Print a formatted workspace variable table in the REPL
+- **`@inspect expr`** or **`@jemach inspect expr`**: Deep inspect variable/function & creation history
+"""
 module jEMach
 
 import Dates
 import Pkg
+import REPL
+import REPL.LineEdit
 import Sockets
 
-export make_procedure, record, record_stop, run_procedure, list_procedures, find_procedures, search_procedures, get_recent_commands, detect_backend, terminal_info, @jemach
+export make_procedure, record, record_stop, run_procedure, list_procedures,
+    find_procedures, search_procedures, autoload_procedures!, get_recent_commands,
+    detect_backend, terminal_info, workspace, inspect_var, save_clean_session,
+    @jemach, @inspect
 
 const STATE_FILE = Ref{String}("/tmp/jl_tui_state.json")
 const SOCKET_PATH = Ref{String}("/tmp/jemach.sock")
@@ -168,6 +189,113 @@ function _add_entry!(
 end
 
 const _shared_workspace_table = Ref{WorkspaceTable}(WorkspaceTable())
+
+function Base.show(io::IO, t::WorkspaceTable)
+    top_count = count(==(0), t.depths)
+    print(io, "WorkspaceTable($top_count top-level items, $(length(t.names)) total nodes)")
+    return nothing
+end
+
+function Base.show(io::IO, ::MIME"text/plain", t::WorkspaceTable)
+    use_color = get(io, :color, true)
+    bold = use_color ? "\e[1m" : ""
+    cyan = use_color ? "\e[36m" : ""
+    green = use_color ? "\e[32m" : ""
+    yellow = use_color ? "\e[33m" : ""
+    magenta = use_color ? "\e[35m" : ""
+    dim = use_color ? "\e[2m" : ""
+    reset = use_color ? "\e[0m" : ""
+
+    n = length(t.names)
+    if n == 0
+        print(io, "$(dim)WorkspaceTable is empty (no user variables in Main).$(reset)")
+        return nothing
+    end
+
+    top_indices = [i for i in 1:n if t.depths[i] == 0]
+    println(io, bold * cyan * "┌─ jEMach Workspace (" * string(length(top_indices)) * " top-level items) " * ("─"^28) * reset)
+    println(io, bold * "│ " * rpad("NAME", 22) * " " * rpad("TYPE", 22) * " " * rpad("SIZE", 10) * " VALUE" * reset)
+    println(io, cyan * "├" * ("─"^76) * reset)
+
+    for i in top_indices
+        name = t.names[i]
+        kind = t.kinds[i]
+        tp = t.types[i]
+        val_str = t.values[i]
+        mod_str = t.modules[i]
+
+        sz_str = "-"
+        if mod_str == "Main" && kind == "variable"
+            sym = Symbol(name)
+            if isdefined(Main, sym)
+                try
+                    v = Base.invokelatest(getfield, Main, sym)
+                    sz_str = Base.format_bytes(Base.summarysize(v))
+                catch
+                end
+            end
+        end
+
+        name_disp = mod_str == "Main" ? name : (mod_str * "." * name)
+        name_short = length(name_disp) > 21 ? name_disp[1:20] * "…" : name_disp
+        tp_short = length(tp) > 21 ? tp[1:20] * "…" : tp
+        val_short = length(val_str) > 32 ? first(val_str, 31) * "…" : val_str
+
+        k_color = kind == "function" ? cyan : (kind == "type" ? magenta : green)
+        println(
+            io,
+            "│ " * k_color * bold * rpad(name_short, 22) * reset * " " *
+                yellow * rpad(tp_short, 22) * reset * " " *
+                dim * rpad(sz_str, 10) * reset * " " *
+                val_short
+        )
+    end
+    print(io, bold * cyan * "└" * ("─"^76) * reset)
+    return nothing
+end
+
+"""
+    workspace(query::AbstractString = "") -> WorkspaceTable
+
+Collect and display the current Julia workspace variables, functions, types,
+their memory footprint (`summarysize`), and value previews directly in the REPL.
+Optionally filter entries by `query`.
+"""
+function workspace(query::AbstractString = "")
+    t = _collect_state_dod!(_shared_workspace_table[])
+    q = lowercase(strip(query))
+    if isempty(q)
+        show(IOContext(stdout, :color => true), MIME("text/plain"), t)
+        println(stdout)
+        return nothing
+    end
+
+    filtered = WorkspaceTable()
+    for i in 1:length(t.names)
+        if t.depths[i] == 0 && (
+                occursin(q, lowercase(t.names[i])) ||
+                    occursin(q, lowercase(t.types[i])) ||
+                    occursin(q, lowercase(t.values[i])) ||
+                    occursin(q, lowercase(t.modules[i]))
+            )
+            _add_entry!(
+                filtered,
+                t.names[i],
+                t.kinds[i],
+                t.types[i],
+                t.values[i],
+                t.exprs[i],
+                t.modules[i],
+                Int(t.depths[i]),
+                Int(t.parent_indices[i]),
+                t.has_children[i]
+            )
+        end
+    end
+    show(IOContext(stdout, :color => true), MIME("text/plain"), filtered)
+    println(stdout)
+    return nothing
+end
 
 function _collect_children_dod!(
         t::WorkspaceTable,
@@ -356,11 +484,57 @@ mutable struct ProcedureInfo
     last_run_at::String
 end
 
+function Base.show(io::IO, p::ProcedureInfo)
+    print(io, "ProcedureInfo(:$(p.name), \"$(p.signature)\", status=:$(p.last_run_status))")
+    return nothing
+end
+
+function Base.show(io::IO, ::MIME"text/plain", p::ProcedureInfo)
+    use_color = get(io, :color, true)
+    bold = use_color ? "\e[1m" : ""
+    cyan = use_color ? "\e[36m" : ""
+    green = use_color ? "\e[32m" : ""
+    yellow = use_color ? "\e[33m" : ""
+    red = use_color ? "\e[31m" : ""
+    dim = use_color ? "\e[2m" : ""
+    reset = use_color ? "\e[0m" : ""
+
+    status_badge = p.last_run_status == :ok ? (green * "✓ OK" * reset) :
+        p.last_run_status == :error ? (red * "✗ ERROR" * reset) : (dim * "○ NEVER RUN" * reset)
+    metrics_str = p.last_run_status != :never ?
+        "$(p.last_run_time_ms) ms, $(Base.format_bytes(p.last_run_alloc_bytes)) (at $(p.last_run_at))" :
+        "-"
+
+    println(io, bold * cyan * "╭─ Procedure: " * string(p.name) * " " * ("─"^max(1, 50 - length(string(p.name)))) * "╮" * reset)
+    println(io, "│ " * bold * "Signature: " * reset * cyan * p.signature * reset)
+    println(io, "│ " * bold * "File:      " * reset * p.file)
+    println(io, "│ " * bold * "Status:    " * reset * status_badge * "  " * yellow * metrics_str * reset)
+    if !isempty(p.doc)
+        println(io, "│ " * bold * "Doc:       " * reset * dim * replace(p.doc, '\n' => " ") * reset)
+    end
+    if !isempty(strip(p.code))
+        println(io, cyan * "├─ Source " * ("─"^58) * "┤" * reset)
+        for (li, line) in enumerate(split(rstrip(p.code), '\n'))
+            println(io, "│ " * dim * lpad(string(li), 3) * " │ " * reset * line)
+        end
+    end
+    print(io, bold * cyan * "╰" * ("─"^67) * "╯" * reset)
+    return nothing
+end
+
 const _procedures = Dict{Symbol, ProcedureInfo}()
+const _loaded_proc_mtimes = Dict{String, Float64}()
 const _recording = Ref{Bool}(false)
 const _record_name = Ref{Symbol}(:proc)
 const _record_start_idx = Ref{Int}(0)
 const HIST_START_POS = Ref{Int}(0)
+const _orig_julia_prompt = Ref{Any}(nothing)
+const _orig_julia_prefix = Ref{Any}(nothing)
+
+const _JEMACH_API_PREFIXES = (
+    "@jemach", "@inspect", "record(", "record_stop(", "workspace(", "list_procedures(",
+    "find_procedures(", "search_procedures(", "autoload_procedures!(", "make_procedure(",
+)
 
 function _is_valid_user_cmd(cmd::AbstractString)::Bool
     s = strip(cmd)
@@ -368,6 +542,9 @@ function _is_valid_user_cmd(cmd::AbstractString)::Bool
     if occursin("jEMach.", s) || occursin("save_clean_session", s) ||
             occursin("inspect_var", s) || occursin("publish_state", s)
         return false
+    end
+    for pfx in _JEMACH_API_PREFIXES
+        startswith(s, pfx) && return false
     end
     return true
 end
@@ -397,23 +574,29 @@ function get_recent_commands(; limit::Int = 50, session_only::Bool = false)::Vec
 
     commands = String[]
     current_block = String[]
+    block_mode = "julia"
+
+    flush_block!() = begin
+        if !isempty(current_block)
+            cmd = String(rstrip(join(current_block, "\n")))
+            # Only Julia-mode entries are code (skip jemach>, shell>, pkg>, help?> ...)
+            block_mode == "julia" && _is_valid_user_cmd(cmd) && push!(commands, cmd)
+            empty!(current_block)
+        end
+    end
 
     for line in split(content, '\n')
         if startswith(line, "# time:")
-            if !isempty(current_block)
-                cmd = join(current_block, "\n")
-                _is_valid_user_cmd(cmd) && push!(commands, cmd)
-                empty!(current_block)
-            end
+            flush_block!()
+            block_mode = "julia"
+        elseif startswith(line, "# mode:")
+            block_mode = lowercase(strip(line[8:end]))
         elseif !startswith(line, "#")
             clean_line = startswith(line, '\t') ? line[2:end] : line
             push!(current_block, clean_line)
         end
     end
-    if !isempty(current_block)
-        cmd = join(current_block, "\n")
-        _is_valid_user_cmd(cmd) && push!(commands, cmd)
-    end
+    flush_block!()
 
     if length(commands) > limit
         return commands[(end - limit + 1):end]
@@ -426,7 +609,7 @@ function get_session_commands()::Vector{String}
     return get_recent_commands(session_only = true)
 end
 
-function _load_procedures!()
+function _load_procedures!(; eval_in_main::Bool = false)
     proc_dir = joinpath(_get_project_dir(), "procedures")
     !isdir(proc_dir) && return _procedures
 
@@ -537,6 +720,21 @@ function _load_procedures!()
                 p.code = content
                 p.file = rel_path
             end
+
+            if eval_in_main
+                file_mt = try
+                    mtime(filepath)
+                catch
+                    0.0
+                end
+                if get(_loaded_proc_mtimes, filepath, -1.0) != file_mt || !isdefined(Main, func_name)
+                    try
+                        Base.include(Main, filepath)
+                        _loaded_proc_mtimes[filepath] = file_mt
+                    catch
+                    end
+                end
+            end
         end
     end
 
@@ -548,6 +746,17 @@ function _load_procedures!()
     end
 
     return _procedures
+end
+
+"""
+    autoload_procedures!() -> Dict{Symbol, ProcedureInfo}
+
+Discover all `.jl` files in the project's `procedures/` folder and evaluate them
+into `Main` so that tab-completion, direct function calls, and `?procedure_name`
+docstrings work immediately in the Julia REPL.
+"""
+function autoload_procedures!()
+    return _load_procedures!(; eval_in_main = true)
 end
 
 function _is_global_or_type(sym::Symbol)::Bool
@@ -666,6 +875,12 @@ function _default_param_str(sym::Symbol)::Tuple{String, Bool}
     return (string(sym), false)
 end
 
+"""
+    make_procedure(name; last=0, indices=Int[], commands=String[], params=Symbol[], doc="", save=true)
+
+Extract REPL commands into a parameterized, documented Julia function saved under
+`procedures/<name>.jl` and automatically loaded into `Main`.
+"""
 function make_procedure(
         name::Union{Symbol, AbstractString};
         last::Int = 0,
@@ -820,6 +1035,11 @@ function make_procedure(
 
         try
             Base.include(Main, filepath)
+            _loaded_proc_mtimes[filepath] = try
+                mtime(filepath)
+            catch
+                0.0
+            end
         catch e
             @warn "Failed to evaluate generated procedure in Main" exception = e
         end
@@ -848,32 +1068,80 @@ function make_procedure(
     return code
 end
 
+function _update_repl_prompt!()
+    isdefined(Base, :active_repl) || return
+    repl = Base.active_repl
+    (hasproperty(repl, :interface) && !isnothing(repl.interface) && !isempty(repl.interface.modes)) || return
+    julia_mode = repl.interface.modes[1]
+    if isnothing(_orig_julia_prompt[])
+        _orig_julia_prompt[] = julia_mode.prompt
+        _orig_julia_prefix[] = julia_mode.prompt_prefix
+    end
+    if _recording[]
+        rec_name = _record_name[]
+        orig = _orig_julia_prompt[]
+        julia_mode.prompt = () -> "⏺ [rec: $(rec_name)] " * (orig isa Function ? string(orig()) : string(orig))
+        julia_mode.prompt_prefix = "\e[31m\e[1m"
+    else
+        if !isnothing(_orig_julia_prompt[])
+            julia_mode.prompt = _orig_julia_prompt[]
+        end
+        if !isnothing(_orig_julia_prefix[])
+            julia_mode.prompt_prefix = _orig_julia_prefix[]
+        end
+    end
+    # The prompt is re-rendered lazily on the next refresh; no explicit refresh here,
+    # because this may run while the REPL backend is still printing command output.
+    return nothing
+end
+
+"""
+    record(name::Union{Symbol, AbstractString} = :proc)
+
+Start recording subsequent REPL commands into a procedure named `name`.
+While recording, the REPL prompt changes to `⏺ [rec: <name>] julia> `.
+Call `record_stop()` (or press `Alt+r`) to finish and save the procedure.
+"""
 function record(name::Union{Symbol, AbstractString} = :proc)
     _recording[] = true
     _record_name[] = Symbol(name)
     all_cmds = get_recent_commands(limit = 1000)
     _record_start_idx[] = length(all_cmds) + 1
+    _update_repl_prompt!()
     cyan = "\e[36m"
     bold = "\e[1m"
     reset = "\e[0m"
     println(bold * cyan * "⏺ [jEMach] Recording procedure '$(_record_name[])'..." * reset)
-    println("  Execute your commands in the REPL. When done, call " * bold * "jEMach.record_stop()" * reset)
+    println("  Execute your commands in the REPL. When done, call " * bold * "record_stop()" * reset * " or press " * bold * "Alt+r" * reset)
     return nothing
 end
 
+"""
+    record_stop(; save::Bool = true)
+
+Stop the active procedure recording, restore the standard `julia> ` prompt,
+and generate `procedures/<name>.jl` with automatic AST parameterization.
+"""
 function record_stop(; save::Bool = true)
     if !_recording[]
         println("No procedure recording is in progress.")
         return nothing
     end
     _recording[] = false
+    _update_repl_prompt!()
     all_cmds = get_recent_commands(limit = 1000)
     start_i = min(_record_start_idx[], length(all_cmds))
     cmds = (start_i <= length(all_cmds)) ? all_cmds[start_i:end] : String[]
-    cmds = filter(c -> !occursin("record_stop", c), cmds)
+    cmds = filter(c -> !occursin("record_stop", c) && !occursin("@jemach stop", c), cmds)
     return make_procedure(_record_name[]; commands = cmds, save = save)
 end
 
+"""
+    run_procedure(name, args...; kwargs...)
+
+Reload and execute the procedure `name` with timing and memory allocation profiling,
+updating its metrics in the jEMach TUI.
+"""
 function run_procedure(name::Union{Symbol, AbstractString}, args...; kwargs...)
     sym = Symbol(name)
     _load_procedures!()
@@ -901,6 +1169,11 @@ function run_procedure(name::Union{Symbol, AbstractString}, args...; kwargs...)
     if isfile(proc_file)
         try
             Base.include(Main, proc_file)
+            _loaded_proc_mtimes[proc_file] = try
+                mtime(proc_file)
+            catch
+                0.0
+            end
         catch e
             @warn "Failed to reload $proc_file" exception = e
         end
@@ -958,6 +1231,11 @@ function run_procedure(name::Union{Symbol, AbstractString}, args...; kwargs...)
     end
 end
 
+"""
+    search_procedures(query::AbstractString = "") -> Vector{ProcedureInfo}
+
+Search and return discovered procedures matching `query` by name, signature, docstring, or source code.
+"""
 function search_procedures(query::AbstractString = "")::Vector{ProcedureInfo}
     _load_procedures!()
     q = lowercase(strip(query))
@@ -976,6 +1254,12 @@ end
 
 const find_procedures = search_procedures
 
+"""
+    list_procedures(query::AbstractString = "")
+
+Print a formatted table of available procedures (optionally filtered by `query`) with their
+signatures, docstrings, and latest benchmark metrics.
+"""
 function list_procedures(query::AbstractString = "")
     procs = search_procedures(query)
     bold = "\e[1m"
@@ -1262,6 +1546,13 @@ function _get_items(mod::Module, all::Bool)::Vector{Dict{String, Any}}
     return Dict{String, Any}[]
 end
 
+"""
+    inspect_var(mod::Module, expr_str::String)
+
+Print a detailed report about the value of `expr_str` evaluated in `mod`: type, size,
+methods with inferred return types, the REPL command that created it, and its docstring.
+See also `@inspect`.
+"""
 function inspect_var(mod::Module, expr_str::String)
     val = try
         expr = Meta.parse(expr_str)
@@ -1405,6 +1696,12 @@ function _collect_state()
     return _collect_state_dod!(_shared_workspace_table[])
 end
 
+"""
+    save_clean_session()
+
+Replay the current session's commands in a sandbox module and save only the ones that
+succeed to `jemach/repl_session_<timestamp>.jl`.
+"""
 function save_clean_session()
     cmds = get_session_commands()
     if isempty(cmds)
@@ -1718,8 +2015,17 @@ function _get_mistate()
     return nothing
 end
 
-function _append_repl_history(code::AbstractString)
-    !_is_valid_user_cmd(code) && return
+function _active_history_provider()
+    isdefined(Base, :active_repl) || return nothing
+    repl = Base.active_repl
+    (hasproperty(repl, :interface) && isdefined(repl, :interface) && !isempty(repl.interface.modes)) || return nothing
+    julia_mode = repl.interface.modes[1]
+    hasproperty(julia_mode, :hist) || return nothing
+    hp = julia_mode.hist
+    return hp isa REPL.REPLHistoryProvider ? hp : nothing
+end
+
+function _append_history_file(code::AbstractString)
     hist_path = joinpath(homedir(), ".julia", "logs", "repl_history.jl")
     !isdir(dirname(hist_path)) && return
     return try
@@ -1731,6 +2037,60 @@ function _append_repl_history(code::AbstractString)
             end
         end
     catch
+    end
+end
+
+"""
+Append `code` (executed from the TUI) to the REPL history, both on disk and in the
+in-memory history of the running REPL, so that it is reachable with the `↑` key.
+"""
+function _append_repl_history(code::AbstractString)
+    !_is_valid_user_cmd(code) && return
+    str = String(rstrip(code))
+    hp = _active_history_provider()
+    if isnothing(hp)
+        _append_history_file(str)
+        return
+    end
+    try
+        hist = hp.history
+        if isdefined(REPL, :History) && isdefined(REPL.History, :HistoryFile) && hist isa REPL.History.HistoryFile
+            # Julia ≥ 1.13: push! writes to the history file and updates the in-memory records
+            if !isempty(hist) && hist[end].content == str
+                return
+            end
+            entry = REPL.History.HistEntry(:julia, Dates.now(Dates.UTC), str, UInt32(0))
+            push!(hist, entry)
+            if !isopen(hist.file)
+                _append_history_file(str)
+            end
+        else
+            # Julia ≤ 1.12: Vector{String} history + parallel modes vector
+            _append_history_file(str)
+            if !isempty(hist) && hist[end] == str
+                return
+            end
+            push!(hist, str)
+            hasproperty(hp, :modes) && push!(hp.modes, :julia)
+        end
+        if hasproperty(hp, :cur_idx)
+            hp.last_idx = -1
+            hp.cur_idx = length(hp.history) + 1
+        end
+    catch
+        _append_history_file(str)
+    end
+    return nothing
+end
+
+function _clear_repl_input_area(s)
+    try
+        st = LineEdit.state(s)
+        Base.invokelatest(LineEdit.clear_input_area, st)
+        return true
+    catch
+        print(stdout, "\r\e[2K")
+        return false
     end
 end
 
@@ -1751,7 +2111,10 @@ function _repl_eval(code::AbstractString; silent::Bool = false)
 
     s = _get_mistate()
     if !isnothing(s)
-        print(stdout, "\r\e[2K\e[32m\e[1mjulia> \e[0m", clean_code, "\n")
+        # Wipe the (possibly multi-line) prompt + pending input; the LineEdit buffer itself
+        # is left untouched, so the user's half-typed command is redrawn afterwards.
+        _clear_repl_input_area(s)
+        print(stdout, "\e[32m\e[1mjulia> \e[0m", clean_code, "\n")
         flush(stdout)
     else
         println(stdout, "\njulia> ", clean_code)
@@ -2420,6 +2783,27 @@ function ui(; backend::Symbol = :auto, width::Int = 65)
     return start(; split = true, backend = backend, width = width, quiet = true)
 end
 
+"""
+    backend(b::Symbol = :auto; split::Bool = true, width::Int = 65)
+
+Switch the active jEMach terminal backend (e.g. `:ghostty`, `:kitty`, `:tmux`, `:zellij`, `:rex`)
+and open/refresh the TUI panel.
+"""
+function backend(b::Symbol = :auto; split::Bool = true, width::Int = 65)
+    if b != :auto
+        _backend_override[] = b
+    end
+    if _running[]
+        publish_state()
+        if split && !_is_tui_open()
+            _open_tui_pane(; backend = detect_backend(b), width = width)
+        end
+    else
+        start(; split = split, backend = b, width = width)
+    end
+    return detect_backend(b)
+end
+
 function _is_tui_open()::Bool
     for c in _socket_clients
         isopen(c) && return true
@@ -2464,13 +2848,350 @@ function toggle(; backend::Symbol = :auto, width::Int = 65)
     return nothing
 end
 
+# ---------------------------------------------------------------------------
+# REPL command layer (shared by the `jemach>` mode and the `@jemach` macro)
+# ---------------------------------------------------------------------------
+
+const _JEMACH_COMMANDS = [
+    "help", "ui", "toggle", "open", "close", "ws", "vars", "ls", "find", "show",
+    "run", "make", "rec", "stop", "inspect", "save", "reload", "status", "shutdown",
+]
+
+function _print_jemach_help(io::IO = stdout)
+    bold, cyan, dim, reset = "\e[1m", "\e[36m", "\e[2m", "\e[0m"
+    rows = [
+        ("ui | toggle", "Toggle the TUI split/window (also Alt+j)"),
+        ("open | close", "Open / close the TUI panel"),
+        ("ws [filter]", "Workspace table with memory sizes (also `workspace()`)"),
+        ("ls [query] | find <q>", "List / search saved procedures"),
+        ("show <name>", "Show a procedure card with its source"),
+        ("run <name> [args...]", "Run a procedure with profiling (`run f(1, x=2)` works too)"),
+        ("<name> [args...]", "Shortcut: run an existing procedure directly"),
+        ("make <name> [N]", "Create a procedure from the last N commands (default 5)"),
+        ("rec [name] | stop", "Start / stop recording a procedure (also Alt+r)"),
+        ("inspect <expr> | i <expr>", "Deep inspection of a variable/function"),
+        ("save", "Save a clean, replayable session script"),
+        ("reload", "Reload procedures/ into Main"),
+        ("status", "Watcher, socket and terminal diagnostics"),
+        ("shutdown", "Stop the watcher and close the TUI"),
+    ]
+    println(io, bold * cyan * "jEMach REPL mode" * reset * dim * "  (Backspace on empty line → julia>, Tab completes)" * reset)
+    for (c, d) in rows
+        println(io, "  " * cyan * rpad(c, 26) * reset * " " * d)
+    end
+    return nothing
+end
+
+function _next_proc_name()::Symbol
+    _load_procedures!()
+    i = length(_procedures) + 1
+    while haskey(_procedures, Symbol("proc_", i)) || isdefined(Main, Symbol("proc_", i))
+        i += 1
+    end
+    return Symbol("proc_", i)
+end
+
+_esc_arg(a) = (a isa Expr && a.head == :kw) ? Expr(:kw, a.args[1], esc(a.args[2])) : esc(a)
+
+function _split_call_args(args)
+    params = Any[]
+    positional = Any[]
+    for a in args
+        if a isa Expr && a.head == :parameters
+            append!(params, a.args)
+        else
+            push!(positional, a)
+        end
+    end
+    return params, positional
+end
+
+"""Build `run_procedure(:name, args...; kwargs...)` from a parsed call or symbol (unescaped)."""
+function _run_expr(target)
+    rp = GlobalRef(jEMach, :run_procedure)
+    if target isa Symbol
+        return Expr(:call, rp, QuoteNode(target))
+    elseif target isa Expr && target.head == :call && target.args[1] isa Symbol
+        params, positional = _split_call_args(target.args[2:end])
+        call = Expr(:call, rp)
+        isempty(params) || push!(call.args, Expr(:parameters, params...))
+        push!(call.args, QuoteNode(target.args[1]))
+        append!(call.args, positional)
+        return call
+    end
+    throw(ArgumentError("expected a procedure name or call, got: $(target)"))
+end
+
+function _run_from_string(rest::AbstractString)
+    s = strip(rest)
+    target = try
+        Meta.parse(s)
+    catch
+        nothing
+    end
+    if !(target isa Symbol || (target isa Expr && target.head == :call && target.args[1] isa Symbol))
+        # `name 1 2` or `name 1, x=2` → `name(1, 2)` / `name(1, x=2)`
+        m = match(r"^([A-Za-z_][A-Za-z0-9_!]*)\s+(.*)$"s, s)
+        isnothing(m) && throw(ArgumentError("usage: run <name> [args...]  or  run name(args...)"))
+        argstr = strip(m.captures[2])
+        occursin(',', argstr) || (argstr = join(split(argstr), ", "))
+        target = Meta.parse(m.captures[1] * "(" * argstr * ")")
+    end
+    return Base.invokelatest(Core.eval, Main, _run_expr(target))
+end
+
+"""
+    _exec_command(line::AbstractString)
+
+Execute one `jemach>` command line. Returns a value only when it is worth displaying
+(e.g. the result of `run`, or a `ProcedureInfo` for `show`).
+"""
+function _exec_command(line::AbstractString)
+    s = strip(line)
+    isempty(s) && return nothing
+    m = match(r"^(\S+)\s*(.*)$"s, s)
+    cmd = lowercase(m.captures[1])
+    rest = String(strip(m.captures[2]))
+
+    if cmd in ("help", "?", "h")
+        _print_jemach_help()
+    elseif cmd in ("ui", "toggle")
+        toggle()
+    elseif cmd == "open"
+        _is_tui_open() ? println("TUI is already open.") : ui()
+    elseif cmd == "close"
+        _is_tui_open() ? toggle() : println("TUI is not open.")
+    elseif cmd in ("ws", "vars", "workspace")
+        workspace(rest)
+    elseif cmd in ("ls", "list", "procs", "find", "search")
+        list_procedures(rest)
+    elseif cmd == "show"
+        isempty(rest) && throw(ArgumentError("usage: show <procedure>"))
+        _load_procedures!()
+        sym = Symbol(rest)
+        haskey(_procedures, sym) || throw(ArgumentError("no procedure named '$rest'"))
+        return _procedures[sym]
+    elseif cmd == "run"
+        isempty(rest) && throw(ArgumentError("usage: run <name> [args...]  or  run name(args...)"))
+        return _run_from_string(rest)
+    elseif cmd == "make"
+        parts = split(rest)
+        isempty(parts) && throw(ArgumentError("usage: make <name> [N]"))
+        n = length(parts) >= 2 ? something(tryparse(Int, parts[2]), 0) : 0
+        make_procedure(Symbol(parts[1]); last = n)
+    elseif cmd in ("rec", "record")
+        record(isempty(rest) ? _next_proc_name() : Symbol(rest))
+    elseif cmd in ("stop", "record_stop")
+        if _recording[]
+            record_stop()
+        else
+            println("No recording in progress (use `shutdown` to stop the jEMach watcher).")
+        end
+    elseif cmd in ("inspect", "i")
+        isempty(rest) && throw(ArgumentError("usage: inspect <expr>"))
+        inspect_var(Main, rest)
+    elseif cmd == "save"
+        save_clean_session()
+    elseif cmd in ("reload", "autoload")
+        autoload_procedures!()
+        publish_state()
+        println("✓ Loaded $(length(_procedures)) procedure(s) into Main")
+    elseif cmd in ("status", "info")
+        status()
+        info = terminal_info()
+        for k in (:term, :term_program, :tmux, :zellij, :kitty, :ghostty, :rex)
+            println("  ", rpad(string(k), 14), info[k])
+        end
+        println("  ", rpad("procedures", 14), length(_procedures), "   recording: ", _recording[] ? string(_record_name[]) : "no")
+        println("  ", rpad("tui open", 14), _is_tui_open())
+    elseif cmd in ("shutdown", "quit")
+        stop()
+    else
+        _load_procedures!()
+        if haskey(_procedures, Symbol(m.captures[1]))
+            return _run_from_string(s)
+        end
+        println("Unknown jemach command '$(m.captures[1])'. Type `help` for the list of commands.")
+    end
+    return nothing
+end
+
 """
     @jemach
+    @jemach <command> [args...]
 
-Toggle the interactive jEMach TUI panel directly from the Julia REPL.
+Without arguments, toggle the jEMach TUI panel. With arguments, run a `jemach>` command:
+
+```julia
+@jemach ls                 # list procedures
+@jemach ls matrix          # search procedures
+@jemach ws                 # workspace table
+@jemach inspect df.col     # deep inspection
+@jemach make myproc 4      # procedure from the last 4 commands
+@jemach run myproc(10, x)  # run a procedure (arguments are evaluated in the caller)
+@jemach rec myproc         # start recording …
+@jemach stop               # … and stop
+@jemach status
+```
 """
-macro jemach()
-    return :($jEMach.toggle())
+macro jemach(args...)
+    isempty(args) && return :($(GlobalRef(jEMach, :toggle))())
+    cmd = lowercase(string(args[1]))
+    rest = args[2:end]
+    if cmd == "run" && !isempty(rest)
+        target = rest[1]
+        if target isa Expr && target.head == :call && target.args[1] isa Symbol
+            params, positional = _split_call_args(target.args[2:end])
+            call = Expr(:call, GlobalRef(jEMach, :run_procedure))
+            isempty(params) || push!(call.args, Expr(:parameters, map(_esc_arg, params)...))
+            push!(call.args, QuoteNode(target.args[1]))
+            append!(call.args, map(_esc_arg, positional))
+            return call
+        else
+            return Expr(:call, GlobalRef(jEMach, :run_procedure), QuoteNode(Symbol(string(target))), map(_esc_arg, rest[2:end])...)
+        end
+    elseif cmd in ("inspect", "i") && !isempty(rest)
+        expr_str = join(map(string, rest), " ")
+        return :($(GlobalRef(jEMach, :inspect_var))($__module__, $expr_str))
+    end
+    line = join(vcat([cmd], [a isa AbstractString ? String(a) : string(a) for a in rest]), " ")
+    return :($(GlobalRef(jEMach, :_exec_command))($line))
+end
+
+"""
+    @inspect expr
+
+Deep-inspect `expr` (type, size, methods & return types, the REPL command that created it,
+and documentation). Shorthand for `inspect_var(@__MODULE__, "expr")`.
+"""
+macro inspect(ex)
+    return :($(GlobalRef(jEMach, :inspect_var))($__module__, $(string(ex))))
+end
+
+# ---------------------------------------------------------------------------
+# Dedicated `jemach>` REPL mode with Tab completion
+# ---------------------------------------------------------------------------
+
+struct JEMachCompletionProvider <: LineEdit.CompletionProvider end
+
+function _main_symbol_names()::Vector{String}
+    out = String[]
+    for sym in Base.invokelatest(names, Main; all = true, imported = true)
+        n = string(sym)
+        (_skip_name(n) || startswith(n, "#") || startswith(n, "_")) && continue
+        push!(out, n)
+    end
+    return out
+end
+
+function _jemach_completions(partial::AbstractString)
+    wm = match(r"(\S*)$", partial)
+    word = isnothing(wm) ? "" : String(wm.captures[1])
+    before = String(codeunits(partial)[1:(ncodeunits(partial) - ncodeunits(word))])
+    words_before = split(before)
+    proc_names = String[string(k) for k in keys(_procedures)]
+    cands = if isempty(words_before)
+        vcat(_JEMACH_COMMANDS, proc_names)
+    else
+        c = lowercase(words_before[1])
+        if c in ("run", "show", "ls", "find") && length(words_before) == 1
+            proc_names
+        elseif c in ("inspect", "i", "ws", "vars")
+            _main_symbol_names()
+        else
+            String[]
+        end
+    end
+    matches = sort!(unique!(filter(x -> startswith(x, word), cands)))
+    return matches, word
+end
+
+function LineEdit.complete_line(::JEMachCompletionProvider, s; hint::Bool = false)
+    buf = LineEdit.buffer(s)
+    partial = isdefined(REPL, :beforecursor) ? REPL.beforecursor(buf) : String(buf.data[1:position(buf)])
+    matches, word = _jemach_completions(partial)
+    return matches, word, !isempty(matches)
+end
+
+const _jemach_mode_ref = Ref{Any}(nothing)
+
+function _enter_jemach_mode(s)
+    mode = _jemach_mode_ref[]
+    isnothing(mode) && return nothing
+    buf = copy(LineEdit.buffer(s))
+    return LineEdit.transition(s, mode) do
+        LineEdit.state(s, mode).input_buffer = buf
+    end
+end
+
+function _toggle_recording_key(s)
+    _clear_repl_input_area(s)
+    try
+        _recording[] ? record_stop() : record(_next_proc_name())
+    catch e
+        @error "jEMach recording failed" exception = e
+    end
+    println(stdout)
+    LineEdit.refresh_line(s)
+    return :ok
+end
+
+function _install_jemach_mode!(repl)
+    (hasproperty(repl, :interface) && isdefined(repl, :interface)) || return nothing
+    iface = repl.interface
+    any(m -> m isa LineEdit.Prompt && m.complete isa JEMachCompletionProvider, iface.modes) && return nothing
+    main = iface.modes[1]
+    main isa LineEdit.Prompt || return nothing
+
+    jm = LineEdit.Prompt(
+        "jemach> ";
+        prompt_prefix = "\e[36m\e[1m",
+        prompt_suffix = main.prompt_suffix,
+        complete = JEMachCompletionProvider(),
+        sticky = true,
+    )
+    jm.repl = repl
+    hp = main.hist
+    if hp isa REPL.REPLHistoryProvider
+        hp.mode_mapping[:jemach] = jm
+    end
+    jm.hist = hp
+    # Commands are evaluated on the REPL backend (proper `ans`, error display, Ctrl-C)
+    jm.on_done = REPL.respond(line -> Expr(:call, GlobalRef(jEMach, :_exec_command), line), repl, main)
+
+    prefix_prompt, prefix_keymap = LineEdit.setup_prefix_keymap(hp, jm)
+    keymaps = Dict{Any, Any}[]
+    if !isdefined(REPL, :History)
+        push!(keymaps, last(LineEdit.setup_search_keymap(hp)))
+    end
+    push!(keymaps, Dict{Any, Any}("\er" => (s, o...) -> _toggle_recording_key(s)))
+    push!(keymaps, REPL.mode_keymap(main), prefix_keymap, LineEdit.history_keymap, LineEdit.default_keymap, LineEdit.escape_defaults)
+    jm.keymap_dict = LineEdit.keymap(keymaps)
+
+    push!(iface.modes, jm)
+    _jemach_mode_ref[] = jm
+
+    use_bracket = isdefined(LineEdit, :bracket_insert_keymap) &&
+        hasproperty(repl, :options) && hasproperty(repl.options, :auto_insert_closing_bracket) &&
+        repl.options.auto_insert_closing_bracket && haskey(LineEdit.bracket_insert_keymap, '}')
+
+    main_keymap = Dict{Any, Any}(
+        '}' => function (s, o...)
+            if isempty(s) || position(LineEdit.buffer(s)) == 0
+                return _enter_jemach_mode(s)
+            elseif use_bracket
+                return LineEdit.bracket_insert_keymap['}'](s, o...)
+            else
+                LineEdit.edit_insert(s, '}')
+                isdefined(LineEdit, :check_show_hint) && LineEdit.check_show_hint(s)
+                return nothing
+            end
+        end,
+        "\em" => (s, o...) -> _enter_jemach_mode(s),
+        "\er" => (s, o...) -> _toggle_recording_key(s),
+    )
+    main.keymap_dict = LineEdit.keymap_merge(main.keymap_dict, main_keymap)
+    return jm
 end
 
 # ---------------------------------------------------------------------------
@@ -2536,6 +3257,11 @@ function enable_hot_reload(proj_dir::String = _get_project_dir())
     return @info "Registered $watched_count files for instantaneous FFI Hot-Reload."
 end
 
+"""
+    status()
+
+Print whether the jEMach watcher is running, with the active backend, socket and state file.
+"""
 function status()
     b = detect_backend()
     return if _running[]
@@ -2584,6 +3310,13 @@ function _setup_repl_hooks(repl)
             end
         catch
         end
+
+        # Install the `jemach>` mode (`}` / Alt+m) and the Alt+r recording shortcut
+        try
+            Base.invokelatest(_install_jemach_mode!, repl)
+        catch e
+            @debug "jEMach: failed to install jemach> REPL mode" exception = e
+        end
     end
 end
 
@@ -2602,6 +3335,16 @@ function __init__()
     # Automatically clean up socket and close TUI pane when Julia exits
     atexit(() -> stop(quiet = true))
 
+    # Make saved procedures callable (and `?`-documented) in Main right away.
+    # Opt out with ENV["JEMACH_AUTOLOAD"] = "0".
+    if get(ENV, "JEMACH_AUTOLOAD", "1") != "0"
+        try
+            autoload_procedures!()
+        catch e
+            @debug "jEMach: autoload of procedures failed" exception = e
+        end
+    end
+
     # Hook interactive REPL (instant AST refresh + Alt+j toggle shortcut)
     if isinteractive()
         if isdefined(Base, :active_repl) && !isnothing(Base.active_repl)
@@ -2613,5 +3356,28 @@ function __init__()
 
     return start(split = false, quiet = true)
 end
+
+# ---------------------------------------------------------------------------
+# Precompilation of hot paths (reduces first-refresh latency after `using jEMach`)
+# ---------------------------------------------------------------------------
+precompile(_collect_state_dod!, (WorkspaceTable,))
+precompile(_serialize_dod, (WorkspaceTable, Vector{Dict{String, String}}))
+precompile(_parse_json_cmd, (String,))
+precompile(_handle_socket_message, (String,))
+precompile(_load_procedures!, ())
+precompile(get_recent_commands, ())
+precompile(detect_backend, ())
+precompile(detect_backend, (Symbol,))
+precompile(_value_preview, (Int,))
+precompile(_value_preview, (Float64,))
+precompile(_value_preview, (String,))
+precompile(_value_preview, (Vector{Float64},))
+precompile(_exec_command, (String,))
+precompile(_jemach_completions, (String,))
+precompile(workspace, (String,))
+precompile(inspect_var, (Module, String))
+precompile(Base.show, (Base.TTY, MIME"text/plain", WorkspaceTable))
+precompile(Base.show, (IOContext{Base.TTY}, MIME"text/plain", WorkspaceTable))
+precompile(Base.show, (IOContext{Base.TTY}, MIME"text/plain", ProcedureInfo))
 
 end  # module jEMach
