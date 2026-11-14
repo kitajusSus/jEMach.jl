@@ -37,6 +37,31 @@ const STATE_FILE = Ref{String}("/tmp/jl_tui_state.json")
 const SOCKET_PATH = Ref{String}("/tmp/jemach.sock")
 const UPDATE_INTERVAL = 0.5  # seconds between state refreshes
 
+_history_path()::String = get(ENV, "JULIA_HISTORY", joinpath(homedir(), ".julia", "logs", "repl_history.jl"))
+
+# Portable native Zig accelerator (built via deps/build.jl into zig/zig-out/lib)
+const _zig_lib_handle = Ref{Ptr{Nothing}}(C_NULL)
+const _zig_parse_history_ptr = Ref{Ptr{Nothing}}(C_NULL)
+const _zig_escape_json_ptr = Ref{Ptr{Nothing}}(C_NULL)
+
+function _load_zig_native!()::Bool
+    _zig_lib_handle[] != C_NULL && return true
+    lib_name = "libjemach_native." * Base.Libc.Libdl.dlext
+    lib_path = normpath(joinpath(@__DIR__, "..", "zig", "zig-out", "lib", lib_name))
+    !isfile(lib_path) && return false
+    return try
+        h = Base.Libc.Libdl.dlopen(lib_path)
+        p_hist = Base.Libc.Libdl.dlsym(h, :jemach_parse_history_buf; throw_error = false)
+        p_json = Base.Libc.Libdl.dlsym(h, :jemach_escape_json_str; throw_error = false)
+        _zig_lib_handle[] = h
+        _zig_parse_history_ptr[] = isnothing(p_hist) ? C_NULL : p_hist
+        _zig_escape_json_ptr[] = isnothing(p_json) ? C_NULL : p_json
+        true
+    catch
+        false
+    end
+end
+
 function _get_project_dir()::String
     proj_path = try
         Pkg.project().path
@@ -58,7 +83,22 @@ end
 # Minimal JSON serialiser (no external dependencies)
 # ---------------------------------------------------------------------------
 
-function _write_json_str(buf::IO, s::AbstractString)
+function _write_json_str_julia(buf::IO, s::AbstractString)
+    if s isa String
+        cu = codeunits(s)
+        clean = true
+        @inbounds for b in cu
+            if b < 0x20 || b == 0x22 || b == 0x5c
+                clean = false
+                break
+            end
+        end
+        if clean
+            write(buf, UInt8(0x22))
+            write(buf, cu)
+            return write(buf, UInt8(0x22))
+        end
+    end
     write(buf, '"')
     for c in s
         if c == '"'
@@ -84,40 +124,29 @@ function _write_json_str(buf::IO, s::AbstractString)
     return write(buf, '"')
 end
 
-function _json_str(s::AbstractString)::String
-    buf = IOBuffer()
-    _write_json_str(buf, s)
-    return String(take!(buf))
-end
-
-function _write_item_json(buf::IO, item::Dict{String, Any})
-    write(buf, "{\"name\":")
-    _write_json_str(buf, get(item, "name", ""))
-    write(buf, ",\"kind\":")
-    _write_json_str(buf, get(item, "kind", ""))
-    write(buf, ",\"type\":")
-    _write_json_str(buf, get(item, "type", ""))
-    write(buf, ",\"value\":")
-    _write_json_str(buf, get(item, "value", ""))
-    write(buf, ",\"expr\":")
-    _write_json_str(buf, get(item, "expr", ""))
-    if haskey(item, "children")
-        children = item["children"]::Vector{Dict{String, Any}}
-        write(buf, ",\"children\":[")
-        for (i, c) in enumerate(children)
-            _write_item_json(buf, c)
-            i < length(children) && write(buf, ',')
+function _write_json_str(buf::IOBuffer, s::String, dst_buf::Vector{UInt8})
+    isempty(s) && return write(buf, "\"\"")
+    fn = _zig_escape_json_ptr[]
+    if fn != C_NULL
+        nb = ncodeunits(s)
+        need = 6 * nb + 2
+        need > length(dst_buf) && resize!(dst_buf, need)
+        n = GC.@preserve s dst_buf ccall(
+            fn, Int64, (Ptr{UInt8}, Csize_t, Ptr{UInt8}, Csize_t),
+            pointer(s), nb, pointer(dst_buf), length(dst_buf)
+        )
+        if n > 0
+            return GC.@preserve dst_buf unsafe_write(buf, pointer(dst_buf), UInt(n))
         end
-        write(buf, ']')
     end
-    return write(buf, '}')
+    return _write_json_str_julia(buf, s)
 end
 
-function _item_to_json(item::Dict{String, Any})::String
-    buf = IOBuffer()
-    _write_item_json(buf, item)
-    return String(take!(buf))
+function _write_json_str(buf::IO, s::AbstractString, ::Vector{UInt8})
+    return _write_json_str_julia(buf, s)
 end
+
+_write_json_str(buf::IO, s::AbstractString) = _write_json_str_julia(buf, s)
 
 # ---------------------------------------------------------------------------
 # Data-Oriented Design (DoD) Columnar Workspace Representation
@@ -521,10 +550,11 @@ function Base.show(io::IO, ::MIME"text/plain", p::ProcedureInfo)
 end
 
 const _procedures = Dict{Symbol, ProcedureInfo}()
+const _parsed_proc_mtimes = Dict{String, Float64}()
+const _parsed_proc_names = Dict{String, Symbol}()
 const _loaded_proc_mtimes = Dict{String, Float64}()
 const _recording = Ref{Bool}(false)
 const _record_name = Ref{Symbol}(:proc)
-const _record_start_idx = Ref{Int}(0)
 const _record_start_pos = Ref{Int64}(0)
 const _record_hist_idx = Ref{Int}(0)
 const HIST_START_POS = Ref{Int}(0)
@@ -556,7 +586,25 @@ function _is_valid_user_cmd(cmd::AbstractString)::Bool
     return true
 end
 
-function _parse_history_blocks(content::AbstractString)::Vector{String}
+const _HIST_READ_CAP = 131072
+const _hist_io_buf = UInt8[]
+const _hist_out_buf = UInt8[]
+const _hist_offsets = UInt32[]
+const _hist_lens = UInt32[]
+const _hist_cache_lock = ReentrantLock()
+const _hist_cache_path = Ref{String}("")
+const _hist_cache_mtime = Ref{Float64}(-1.0)
+const _hist_cache_size = Ref{Int64}(-1)
+const _hist_cache_pos = Ref{Int64}(-1)
+const _hist_cache_limit = Ref{Int}(-1)
+const _hist_cache_cmds = String[]
+
+function _invalidate_hist_cache!()
+    _hist_cache_size[] = -1
+    return nothing
+end
+
+function _parse_history_blocks_julia(content::AbstractString)::Vector{String}
     commands = String[]
     current_block = String[]
     block_mode = "julia"
@@ -585,34 +633,96 @@ function _parse_history_blocks(content::AbstractString)::Vector{String}
     return commands
 end
 
-function get_recent_commands(; limit::Int = 50, session_only::Bool = false)::Vector{String}
-    hist_path = joinpath(homedir(), ".julia", "logs", "repl_history.jl")
-    !isfile(hist_path) && return String[]
-
-    sz = filesize(hist_path)
-    pos = 0
-    if session_only && HIST_START_POS[] > 0
-        pos = min(HIST_START_POS[], sz)
-    else
-        read_len = min(sz, 131072)
-        pos = sz - read_len
+function _parse_history_bytes(raw::Vector{UInt8}, skip_partial_first::Bool, limit::Int)::Vector{String}
+    isempty(raw) && return String[]
+    limit <= 0 && return String[]
+    fn = _zig_parse_history_ptr[]
+    if fn != C_NULL
+        cap = min(limit, 4096)
+        length(_hist_out_buf) < length(raw) && resize!(_hist_out_buf, length(raw))
+        length(_hist_offsets) < cap && resize!(_hist_offsets, cap)
+        length(_hist_lens) < cap && resize!(_hist_lens, cap)
+        n = GC.@preserve raw _hist_out_buf _hist_offsets _hist_lens ccall(
+            fn, Int64,
+            (Ptr{UInt8}, Csize_t, UInt8, Csize_t, Ptr{UInt8}, Csize_t, Ptr{UInt32}, Ptr{UInt32}),
+            pointer(raw), length(raw), skip_partial_first ? UInt8(1) : UInt8(0),
+            Csize_t(cap), pointer(_hist_out_buf), length(_hist_out_buf),
+            pointer(_hist_offsets), pointer(_hist_lens)
+        )
+        if n >= 0
+            cmds = Vector{String}(undef, Int(n))
+            @inbounds for k in 1:Int(n)
+                off = Int(_hist_offsets[k]) + 1
+                ln = Int(_hist_lens[k])
+                cmds[k] = String(view(_hist_out_buf, off:(off + ln - 1)))
+            end
+            return cmds
+        end
     end
 
-    content = try
-        open(hist_path, "r") do f
-            seek(f, pos)
-            pos > 0 && readline(f)
-            read(f, String)
-        end
+    # Pure-Julia fallback
+    s = String(copy(raw))
+    if skip_partial_first
+        nl = findfirst('\n', s)
+        s = isnothing(nl) ? "" : SubString(s, nextind(s, nl))
+    end
+    cmds = _parse_history_blocks_julia(s)
+    return length(cmds) > limit ? cmds[(end - limit + 1):end] : cmds
+end
+
+function _parse_history_blocks(content::AbstractString)::Vector{String}
+    return _parse_history_blocks_julia(content)
+end
+
+function get_recent_commands(; limit::Int = 50, session_only::Bool = false)::Vector{String}
+    hist_path = _history_path()
+    st = try
+        stat(hist_path)
     catch
         return String[]
     end
+    !isfile(st) && return String[]
 
-    commands = _parse_history_blocks(content)
-    if length(commands) > limit
-        return commands[(end - limit + 1):end]
+    sz = Int64(st.size)
+    sz == 0 && return String[]
+    pos = if session_only && HIST_START_POS[] > 0
+        min(Int64(HIST_START_POS[]), sz)
     else
-        return commands
+        max(Int64(0), sz - Int64(_HIST_READ_CAP))
+    end
+    to_read = Int(sz - pos)
+    to_read <= 0 && return String[]
+
+    return lock(_hist_cache_lock) do
+        if _hist_cache_path[] == hist_path &&
+                _hist_cache_mtime[] == st.mtime &&
+                _hist_cache_size[] == sz &&
+                _hist_cache_pos[] == pos &&
+                _hist_cache_limit[] == limit
+            return copy(_hist_cache_cmds)
+        end
+
+        resize!(_hist_io_buf, to_read)
+        ok = try
+            open(hist_path, "r") do f
+                pos > 0 && seek(f, pos)
+                read!(f, _hist_io_buf)
+            end
+            true
+        catch
+            false
+        end
+        !ok && return String[]
+
+        cmds = _parse_history_bytes(_hist_io_buf, pos > 0, limit)
+        _hist_cache_path[] = hist_path
+        _hist_cache_mtime[] = st.mtime
+        _hist_cache_size[] = sz
+        _hist_cache_pos[] = pos
+        _hist_cache_limit[] = limit
+        empty!(_hist_cache_cmds)
+        append!(_hist_cache_cmds, cmds)
+        return copy(cmds)
     end
 end
 
@@ -620,139 +730,145 @@ function get_session_commands()::Vector{String}
     return get_recent_commands(session_only = true)
 end
 
+function _extract_sig_and_name(fexpr::Expr, default_name::Symbol)::Tuple{String, Symbol}
+    while fexpr.head == :macrocall && length(fexpr.args) >= 3 && fexpr.args[end] isa Expr
+        fexpr = fexpr.args[end]
+    end
+    sig = ""
+    fname = default_name
+    if fexpr.head == :function && !isempty(fexpr.args)
+        fsym = fexpr.args[1]
+        sig = string(fsym)
+        if fsym isa Expr && fsym.head == :call && !isempty(fsym.args)
+            fname = Symbol(fsym.args[1])
+        end
+    elseif fexpr.head == :(=) && length(fexpr.args) >= 2 && fexpr.args[1] isa Expr && fexpr.args[1].head == :call
+        fsym = fexpr.args[1]
+        sig = string(fsym)
+        if !isempty(fsym.args)
+            fname = Symbol(fsym.args[1])
+        end
+    end
+    return (sig, fname)
+end
+
 function _load_procedures!(; eval_in_main::Bool = false)
-    proc_dir = joinpath(_get_project_dir(), "procedures")
+    proj_dir = _get_project_dir()
+    proc_dir = joinpath(proj_dir, "procedures")
     !isdir(proc_dir) && return _procedures
 
     found_names = Set{Symbol}()
+    seen_files = Set{String}()
     for (root, _, files) in walkdir(proc_dir)
         for file in files
             !endswith(file, ".jl") && continue
             filepath = joinpath(root, file)
-            content = try
-                read(filepath, String)
+            push!(seen_files, filepath)
+            file_mt = try
+                mtime(filepath)
             catch
-                continue
+                0.0
             end
 
-            parsed = try
-                Meta.parse("begin\n" * content * "\nend")
-            catch
-                continue
-            end
-            doc_str = ""
-            sig_str = ""
-            func_name = Symbol(splitext(file)[1])
+            cached_name = get(_parsed_proc_names, filepath, nothing)
+            func_name = if !isnothing(cached_name) &&
+                    get(_parsed_proc_mtimes, filepath, -1.0) == file_mt &&
+                    haskey(_procedures, cached_name)
+                cached_name
+            else
+                content = try
+                    read(filepath, String)
+                catch
+                    continue
+                end
+                parsed = try
+                    Meta.parse("begin\n" * content * "\nend")
+                catch
+                    continue
+                end
+                doc_str = ""
+                sig_str = ""
+                parsed_name = Symbol(splitext(file)[1])
 
-            for a in parsed.args
-                if a isa Expr && a.head == :macrocall && length(a.args) >= 3
-                    mac_name = a.args[1]
-                    is_doc_mac = (
-                        mac_name == Symbol("@doc") ||
-                            mac_name == GlobalRef(Core, Symbol("@doc")) ||
-                            (mac_name isa GlobalRef && mac_name.name == Symbol("@doc"))
-                    )
-                    if is_doc_mac && length(a.args) >= 4
-                        doc_str = string(a.args[3])
-                        target_fexpr = a.args[4]
-                        while target_fexpr isa Expr && target_fexpr.head == :macrocall && length(target_fexpr.args) >= 3
-                            target_fexpr = target_fexpr.args[end]
-                        end
-                        if target_fexpr isa Expr
-                            if target_fexpr.head == :function && !isempty(target_fexpr.args)
-                                sig_str = string(target_fexpr.args[1])
-                                fsym = target_fexpr.args[1]
-                                if fsym isa Expr && fsym.head == :call && !isempty(fsym.args)
-                                    func_name = Symbol(fsym.args[1])
-                                end
-                            elseif target_fexpr.head == :(=) && length(target_fexpr.args) >= 2 && target_fexpr.args[1] isa Expr && target_fexpr.args[1].head == :call
-                                sig_str = string(target_fexpr.args[1])
-                                fsym = target_fexpr.args[1]
-                                if !isempty(fsym.args)
-                                    func_name = Symbol(fsym.args[1])
-                                end
+                for a in parsed.args
+                    !(a isa Expr) && continue
+                    if a.head == :macrocall && length(a.args) >= 4
+                        mac_name = a.args[1]
+                        is_doc_mac = (
+                            mac_name == Symbol("@doc") ||
+                                mac_name == GlobalRef(Core, Symbol("@doc")) ||
+                                (mac_name isa GlobalRef && mac_name.name == Symbol("@doc"))
+                        )
+                        if is_doc_mac
+                            doc_str = string(a.args[3])
+                            if a.args[4] isa Expr
+                                s, fn = _extract_sig_and_name(a.args[4], parsed_name)
+                                !isempty(s) && (sig_str = s)
+                                parsed_name = fn
                             end
                         end
-                    end
-                elseif a isa Expr && a.head == :function && !isempty(a.args)
-                    sig_str = string(a.args[1])
-                    fsym = a.args[1]
-                    if fsym isa Expr && fsym.head == :call && !isempty(fsym.args)
-                        func_name = Symbol(fsym.args[1])
-                    end
-                elseif a isa Expr && a.head == :(=) && length(a.args) >= 2 && a.args[1] isa Expr && a.args[1].head == :call
-                    sig_str = string(a.args[1])
-                    fsym = a.args[1]
-                    if !isempty(fsym.args)
-                        func_name = Symbol(fsym.args[1])
+                    elseif a.head == :function || a.head == :(=)
+                        s, fn = _extract_sig_and_name(a, parsed_name)
+                        !isempty(s) && (sig_str = s)
+                        parsed_name = fn
                     end
                 end
-            end
 
-            # Fallback docstring from top-of-file comments
-            if isempty(strip(doc_str))
-                comment_lines = String[]
-                for l in split(content, '\n')
-                    sl = strip(l)
-                    if startswith(sl, "#") && !occursin("Generated by jEMach", sl)
-                        push!(comment_lines, strip(lstrip(sl, ['#', ' '])))
-                    elseif !isempty(sl)
-                        break
+                # Fallback docstring from top-of-file comments
+                if isempty(strip(doc_str))
+                    comment_lines = String[]
+                    for l in split(content, '\n')
+                        sl = strip(l)
+                        if startswith(sl, "#") && !occursin("Generated by jEMach", sl)
+                            push!(comment_lines, strip(lstrip(sl, ['#', ' '])))
+                        elseif !isempty(sl)
+                            break
+                        end
                     end
+                    !isempty(comment_lines) && (doc_str = join(comment_lines, " "))
                 end
-                if !isempty(comment_lines)
-                    doc_str = join(comment_lines, " ")
+
+                isempty(sig_str) && (sig_str = string(parsed_name) * "()")
+                rel_path = relpath(filepath, proj_dir)
+
+                if !haskey(_procedures, parsed_name)
+                    _procedures[parsed_name] = ProcedureInfo(
+                        parsed_name, sig_str, rel_path, strip(doc_str), content,
+                        0.0, 0, :never, "-"
+                    )
+                else
+                    p = _procedures[parsed_name]
+                    p.signature = sig_str
+                    p.doc = strip(doc_str)
+                    p.code = content
+                    p.file = rel_path
                 end
+                _parsed_proc_mtimes[filepath] = file_mt
+                _parsed_proc_names[filepath] = parsed_name
+                parsed_name
             end
 
-            if isempty(sig_str)
-                sig_str = string(func_name) * "()"
-            end
-
-            rel_path = relpath(filepath, _get_project_dir())
             push!(found_names, func_name)
 
-            if !haskey(_procedures, func_name)
-                _procedures[func_name] = ProcedureInfo(
-                    func_name,
-                    sig_str,
-                    rel_path,
-                    strip(doc_str),
-                    content,
-                    0.0,
-                    0,
-                    :never,
-                    "-"
-                )
-            else
-                p = _procedures[func_name]
-                p.signature = sig_str
-                p.doc = strip(doc_str)
-                p.code = content
-                p.file = rel_path
-            end
-
-            if eval_in_main
-                file_mt = try
-                    mtime(filepath)
+            if eval_in_main && (get(_loaded_proc_mtimes, filepath, -1.0) != file_mt || !isdefined(Main, func_name))
+                try
+                    Base.include(Main, filepath)
+                    _loaded_proc_mtimes[filepath] = file_mt
                 catch
-                    0.0
-                end
-                if get(_loaded_proc_mtimes, filepath, -1.0) != file_mt || !isdefined(Main, func_name)
-                    try
-                        Base.include(Main, filepath)
-                        _loaded_proc_mtimes[filepath] = file_mt
-                    catch
-                    end
                 end
             end
         end
     end
 
-    # Clean up deleted procedures
+    # Clean up deleted procedures & stale mtime caches
     for k in collect(keys(_procedures))
-        if !(k in found_names)
-            delete!(_procedures, k)
+        !(k in found_names) && delete!(_procedures, k)
+    end
+    for fp in collect(keys(_parsed_proc_mtimes))
+        if !(fp in seen_files)
+            delete!(_parsed_proc_mtimes, fp)
+            delete!(_parsed_proc_names, fp)
+            delete!(_loaded_proc_mtimes, fp)
         end
     end
 
@@ -1227,11 +1343,10 @@ Call `record_stop()` (or press `Alt+r`) to finish and save the procedure.
 function record(name::Union{Symbol, AbstractString} = :proc)
     _recording[] = true
     _record_name[] = Symbol(name)
-    hist_path = joinpath(homedir(), ".julia", "logs", "repl_history.jl")
+    hist_path = _history_path()
     _record_start_pos[] = isfile(hist_path) ? Int64(filesize(hist_path)) : Int64(0)
     hp = _active_history_provider()
     _record_hist_idx[] = isnothing(hp) ? 0 : length(hp.history)
-    _record_start_idx[] = _record_hist_idx[] + 1
     _update_repl_prompt!()
     cyan = "\e[36m"
     bold = "\e[1m"
@@ -1261,19 +1376,23 @@ function _recorded_commands_since_start()::Vector{String}
         !isempty(cmds) && return cmds
     end
 
-    hist_path = joinpath(homedir(), ".julia", "logs", "repl_history.jl")
+    hist_path = _history_path()
     !isfile(hist_path) && return String[]
     sz = filesize(hist_path)
     pos = clamp(_record_start_pos[], Int64(0), Int64(sz))
-    content = try
+    nbytes = Int(sz - pos)
+    nbytes <= 0 && return String[]
+    raw = try
         open(hist_path, "r") do f
             seek(f, pos)
-            read(f, String)
+            buf = Vector{UInt8}(undef, nbytes)
+            read!(f, buf)
+            buf
         end
     catch
         return String[]
     end
-    return _parse_history_blocks(content)
+    return _parse_history_bytes(raw, false, 4096)
 end
 
 """
@@ -1455,115 +1574,100 @@ function list_procedures(query::AbstractString = "")
     return nothing
 end
 
-function _serialize_dod(t::WorkspaceTable, packages_data::Vector)::String
+function _write_json_str_col(buf::IOBuffer, vals::Vector{String}, dst_buf::Vector{UInt8})
+    write(buf, '[')
+    @inbounds for i in eachindex(vals)
+        i > 1 && write(buf, ',')
+        _write_json_str(buf, vals[i], dst_buf)
+    end
+    return write(buf, ']')
+end
+
+function _write_json_int_col(buf::IOBuffer, vals::Vector{Int32})
+    write(buf, '[')
+    @inbounds for i in eachindex(vals)
+        i > 1 && write(buf, ',')
+        print(buf, vals[i])
+    end
+    return write(buf, ']')
+end
+
+function _serialize_dod_body(t::WorkspaceTable, packages_data::Vector)::String
     buf = IOBuffer()
-    write(buf, "{\"timestamp\":")
-    write(buf, string(round(Int, time())))
-    write(buf, ",\"backend\":")
-    _write_json_str(buf, string(detect_backend()))
-    write(buf, ",\"columns\":{")
+    dst_buf = Vector{UInt8}(undef, 4096)
 
-    write(buf, "\"names\":[")
-    for (i, n) in enumerate(t.names)
-        _write_json_str(buf, n)
-        i < length(t.names) && write(buf, ',')
-    end
+    write(buf, "\"backend\":")
+    _write_json_str(buf, string(detect_backend()), dst_buf)
+    write(buf, ",\"columns\":{\"names\":")
+    _write_json_str_col(buf, t.names, dst_buf)
+    write(buf, ",\"kinds\":")
+    _write_json_str_col(buf, t.kinds, dst_buf)
+    write(buf, ",\"types\":")
+    _write_json_str_col(buf, t.types, dst_buf)
+    write(buf, ",\"values\":")
+    _write_json_str_col(buf, t.values, dst_buf)
+    write(buf, ",\"exprs\":")
+    _write_json_str_col(buf, t.exprs, dst_buf)
+    write(buf, ",\"modules\":")
+    _write_json_str_col(buf, t.modules, dst_buf)
+    write(buf, ",\"depths\":")
+    _write_json_int_col(buf, t.depths)
+    write(buf, ",\"parent_indices\":")
+    _write_json_int_col(buf, t.parent_indices)
 
-    write(buf, "],\"kinds\":[")
-    for (i, k) in enumerate(t.kinds)
-        _write_json_str(buf, k)
-        i < length(t.kinds) && write(buf, ',')
-    end
-
-    write(buf, "],\"types\":[")
-    for (i, tp) in enumerate(t.types)
-        _write_json_str(buf, tp)
-        i < length(t.types) && write(buf, ',')
-    end
-
-    write(buf, "],\"values\":[")
-    for (i, v) in enumerate(t.values)
-        _write_json_str(buf, v)
-        i < length(t.values) && write(buf, ',')
-    end
-
-    write(buf, "],\"exprs\":[")
-    for (i, e) in enumerate(t.exprs)
-        _write_json_str(buf, e)
-        i < length(t.exprs) && write(buf, ',')
-    end
-
-    write(buf, "],\"modules\":[")
-    for (i, m) in enumerate(t.modules)
-        _write_json_str(buf, m)
-        i < length(t.modules) && write(buf, ',')
-    end
-
-    write(buf, "],\"depths\":[")
-    for (i, d) in enumerate(t.depths)
-        write(buf, string(d))
-        i < length(t.depths) && write(buf, ',')
-    end
-
-    write(buf, "],\"parent_indices\":[")
-    for (i, p) in enumerate(t.parent_indices)
-        write(buf, string(p))
-        i < length(t.parent_indices) && write(buf, ',')
-    end
-
-    write(buf, "],\"has_children\":[")
-    for (i, hc) in enumerate(t.has_children)
-        write(buf, hc ? "true" : "false")
-        i < length(t.has_children) && write(buf, ',')
+    write(buf, ",\"has_children\":[")
+    @inbounds for i in eachindex(t.has_children)
+        i > 1 && write(buf, ',')
+        write(buf, t.has_children[i] ? "true" : "false")
     end
 
     write(buf, "]},\"packages\":[")
     for (i, pkg) in enumerate(packages_data)
+        i > 1 && write(buf, ',')
         write(buf, "{\"name\":")
-        _write_json_str(buf, get(pkg, "name", ""))
+        _write_json_str(buf, get(pkg, "name", ""), dst_buf)
         write(buf, ",\"version\":")
-        _write_json_str(buf, get(pkg, "version", ""))
+        _write_json_str(buf, get(pkg, "version", ""), dst_buf)
         write(buf, '}')
-        i < length(packages_data) && write(buf, ',')
     end
 
     write(buf, "],\"procedures\":[")
     proc_list = sort(collect(values(_procedures)), by = p -> string(p.name))
     for (i, p) in enumerate(proc_list)
+        i > 1 && write(buf, ',')
         write(buf, "{\"name\":")
-        _write_json_str(buf, string(p.name))
+        _write_json_str(buf, string(p.name), dst_buf)
         write(buf, ",\"signature\":")
-        _write_json_str(buf, p.signature)
+        _write_json_str(buf, p.signature, dst_buf)
         write(buf, ",\"file\":")
-        _write_json_str(buf, p.file)
+        _write_json_str(buf, p.file, dst_buf)
         write(buf, ",\"doc\":")
-        _write_json_str(buf, p.doc)
+        _write_json_str(buf, p.doc, dst_buf)
         write(buf, ",\"code\":")
-        _write_json_str(buf, p.code)
+        _write_json_str(buf, p.code, dst_buf)
         write(buf, ",\"time_ms\":")
-        write(buf, string(p.last_run_time_ms))
+        print(buf, p.last_run_time_ms)
         write(buf, ",\"alloc_bytes\":")
-        write(buf, string(p.last_run_alloc_bytes))
+        print(buf, p.last_run_alloc_bytes)
         write(buf, ",\"status\":")
-        _write_json_str(buf, string(p.last_run_status))
+        _write_json_str(buf, string(p.last_run_status), dst_buf)
         write(buf, ",\"last_run\":")
-        _write_json_str(buf, p.last_run_at)
+        _write_json_str(buf, p.last_run_at, dst_buf)
         write(buf, '}')
-        i < length(proc_list) && write(buf, ',')
     end
 
     write(buf, "],\"history\":[")
     recent_cmds = get_recent_commands(limit = HISTORY_LIMIT)
     for (i, cmd) in enumerate(recent_cmds)
-        _write_json_str(buf, cmd)
-        i < length(recent_cmds) && write(buf, ',')
+        i > 1 && write(buf, ',')
+        _write_json_str(buf, cmd, dst_buf)
     end
     write(buf, "]}")
     return String(take!(buf))
 end
 
-function _serialize(modules_data::Vector, packages_data::Vector)::String
-    return _serialize_dod(_shared_workspace_table[], packages_data)
+function _serialize_dod(t::WorkspaceTable, packages_data::Vector)::String
+    return "{\"timestamp\":" * string(round(Int, time())) * "," * _serialize_dod_body(t, packages_data)
 end
 
 const _cached_pkgs = Ref{Vector{Dict{String, String}}}(Dict{String, String}[])
@@ -1639,13 +1743,14 @@ function _value_preview(val)::String
 end
 
 function _collect_module_items_dod!(t::WorkspaceTable, mod::Module, mod_name::String, all::Bool)
-    syms = Base.invokelatest(names, mod; all = all, imported = false)
+    syms = names(mod; all = all, imported = false)
     candidates = Tuple{Symbol, String, Any, String}[]
     for sym in syms
         name = string(sym)
         _skip_name(name) && continue
+        isdefined(mod, sym) || continue
         val = try
-            Base.invokelatest(getfield, mod, sym)
+            getfield(mod, sym)
         catch
             continue
         end
@@ -1698,10 +1803,6 @@ function _collect_module_items_dod!(t::WorkspaceTable, mod::Module, mod_name::St
         end
     end
     return
-end
-
-function _get_items(mod::Module, all::Bool)::Vector{Dict{String, Any}}
-    return Dict{String, Any}[]
 end
 
 """
@@ -1766,41 +1867,23 @@ function inspect_var(mod::Module, expr_str::String)
     base_var_str = isnothing(base_m) ? expr_str : base_m.match
     sym = Symbol(base_var_str)
 
-    hist_path = joinpath(homedir(), ".julia", "logs", "repl_history.jl")
-    if isfile(hist_path)
-        try
-            sz = filesize(hist_path)
-            read_len = min(sz, 65536)
-            lines = open(hist_path, "r") do f
-                seek(f, sz - read_len)
-                read_len < sz && readline(f) # discard partial line
-                readlines(f)
+    try
+        var_regex = Regex("\\b" * base_var_str * "\\b")
+        found_cmd = ""
+        for cmd in Iterators.reverse(get_recent_commands(limit = 100))
+            if occursin(var_regex, cmd) && occursin(r"=|function|macro|struct", cmd) &&
+                    !occursin("println", cmd) && !occursin("typeof", cmd) && !occursin("dump", cmd)
+                found_cmd = cmd
+                break
             end
-            var_regex = Regex("\\b" * base_var_str * "\\b")
-            found_cmd = ""
-            current_block = String[]
-            for line in reverse(lines)
-                if startswith(line, "# time:")
-                    block_str = join(reverse(current_block), "\n")
-                    if occursin(var_regex, block_str) && occursin(r"=|function|macro|struct", block_str)
-                        if !occursin("inspect_var", block_str) && !occursin("println", block_str) && !occursin("typeof", block_str) && !occursin("dump", block_str)
-                            found_cmd = block_str
-                            break
-                        end
-                    end
-                    empty!(current_block)
-                elseif !startswith(line, "#")
-                    push!(current_block, line)
-                end
-            end
-            if !isempty(found_cmd)
-                println(bold * "Created/Modified by:" * reset)
-                code_md = Base.Docs.Markdown.parse("```julia\n" * found_cmd * "\n```")
-                show(IOContext(stdout, :color => true), MIME("text/plain"), code_md)
-                println()
-            end
-        catch
         end
+        if !isempty(found_cmd)
+            println(bold * "Created/Modified by:" * reset)
+            code_md = Base.Docs.Markdown.parse("```julia\n" * found_cmd * "\n```")
+            show(IOContext(stdout, :color => true), MIME("text/plain"), code_md)
+            println()
+        end
+    catch
     end
 
     # Documentation
@@ -1818,40 +1901,34 @@ function inspect_var(mod::Module, expr_str::String)
     return nothing
 end
 
+const _IGNORED_LOADED_MODULES = Set(["Main", "Base", "Core", "jEMach", "OhMyREPL", "Revise", "Pkg", "InteractiveUtils", "VSCodeServer"])
+
 function _collect_state_dod!(t::WorkspaceTable)::WorkspaceTable
     empty!(t)
 
     # 1. Main module — always first
     _collect_module_items_dod!(t, Main, "Main", true)
 
-    # 2. Collect modules explicitly loaded/imported in Main
-    user_loaded_modules = Set{Module}()
-    for sym in Base.invokelatest(names, Main; all = true, imported = true)
-        try
-            val = Base.invokelatest(getfield, Main, sym)
-            if isa(val, Module)
-                push!(user_loaded_modules, val)
-            end
-        catch
-        end
-    end
-
-    # 3. Other loaded packages (from Base.loaded_modules)
-    seen = Set(["Main", "Base", "Core", "jEMach", "OhMyREPL", "Revise", "Pkg", "InteractiveUtils", "VSCodeServer"])
+    # 2. Loaded packages explicitly visible in Main (avoids full imported names(Main) scan)
+    seen = copy(_IGNORED_LOADED_MODULES)
     for (_, mod) in Base.loaded_modules
         name = string(mod)
         name in seen && continue
-        if mod in user_loaded_modules
-            push!(seen, name)
-            _collect_module_items_dod!(t, mod, name, false)
+        mod_sym = nameof(mod)
+        if isdefined(Main, mod_sym)
+            bound = try
+                getfield(Main, mod_sym)
+            catch
+                nothing
+            end
+            if bound === mod
+                push!(seen, name)
+                _collect_module_items_dod!(t, mod, name, false)
+            end
         end
     end
 
     return t
-end
-
-function _collect_state()
-    return _collect_state_dod!(_shared_workspace_table[])
 end
 
 """
@@ -1932,62 +2009,6 @@ function save_clean_session()
     println(" File: $filepath")
     println(" " * "✓"^60)
     return nothing
-end
-
-function compile_sysimage(extra_pkgs::Vector{Symbol} = Symbol[])
-    println("Starting jEMach system image compilation...")
-
-    # 1. Ensure PackageCompiler is installed in the global environment
-    current_project = Pkg.project().path
-
-    println("Ensuring PackageCompiler.jl is available in global environment...")
-    try
-        Pkg.activate() # activate global environment
-        Pkg.add("PackageCompiler")
-    catch e
-        println("Failed to install PackageCompiler: ", e)
-        return
-    end
-
-    # Load PackageCompiler dynamically while global environment is active
-    PackageCompiler = try
-        Base.require(Base.PkgId(Base.UUID("9b87118b-4619-50d2-8e1e-99f35a4d4d9d"), "PackageCompiler"))
-    catch e
-        println("Could not load PackageCompiler.jl: ", e)
-        Pkg.activate(current_project)
-        return
-    end
-
-    # Reactivate original project
-    Pkg.activate(current_project)
-
-    # 2. Define the output path
-    sysimage_dir = joinpath(homedir(), ".julia", "sysimages")
-    if !isdir(sysimage_dir)
-        mkpath(sysimage_dir)
-    end
-    sysimage_path = joinpath(sysimage_dir, "jemach_sysimage.so")
-
-    pkgs_to_compile = unique(vcat([:jEMach, :Dates], extra_pkgs))
-    println("Compiling sysimage for packages: ", pkgs_to_compile)
-    println("Output path: ", sysimage_path)
-    println("This process may take 2-5 minutes. Please be patient...")
-
-    return try
-        Base.invokelatest(
-            PackageCompiler.create_sysimage,
-            pkgs_to_compile,
-            sysimage_path = sysimage_path,
-            project = dirname(current_project)
-        )
-        println("\n" * "✓"^60)
-        println(" System image compiled successfully!")
-        println(" File: $sysimage_path")
-        println(" To use it, run Julia with: julia -J $sysimage_path")
-        println(" " * "✓"^60)
-    catch e
-        println("Error during sysimage compilation: ", e)
-    end
 end
 
 # ---------------------------------------------------------------------------
@@ -2184,8 +2205,9 @@ function _active_history_provider()
 end
 
 function _append_history_file(code::AbstractString)
-    hist_path = joinpath(homedir(), ".julia", "logs", "repl_history.jl")
+    hist_path = _history_path()
     !isdir(dirname(hist_path)) && return
+    _invalidate_hist_cache!()
     return try
         ts = Dates.format(Dates.now(), "yyyy-mm-dd HH:MM:SS")
         open(hist_path, "a") do f
@@ -2205,6 +2227,7 @@ in-memory history of the running REPL, so that it is reachable with the `↑` ke
 function _append_repl_history(code::AbstractString)
     !_is_valid_user_cmd(code) && return
     str = String(rstrip(code))
+    _invalidate_hist_cache!()
     hp = _active_history_provider()
     if isnothing(hp)
         _append_history_file(str)
@@ -2374,6 +2397,7 @@ const _running = Ref{Bool}(false)
 const _socket_clients = Set{Sockets.PipeEndpoint}()
 const _server_ref = Ref{Union{Sockets.PipeServer, Nothing}}(nothing)
 const _last_serialized_json = Ref{String}("")
+const _last_serialized_body = Ref{String}("")
 const _tui_pane_ref = Ref{String}("")
 const _tui_backend_ref = Ref{Symbol}(:none)
 const _tui_proc_ref = Ref{Union{Base.Process, Nothing}}(nothing)
@@ -2855,12 +2879,14 @@ function publish_state()
         end
         state = _collect_state_dod!(_shared_workspace_table[])
         pkgs = _get_packages()
-        json = _serialize_dod(state, pkgs)
+        body = _serialize_dod_body(state, pkgs)
 
-        # Avoid redundant disk writes and network flooding if state has not changed
-        if json == _last_serialized_json[]
+        # Avoid redundant disk writes and network flooding when nothing except wall-clock time changed
+        if body == _last_serialized_body[]
             return
         end
+        _last_serialized_body[] = body
+        json = "{\"timestamp\":" * string(round(Int, time())) * "," * body
         _last_serialized_json[] = json
 
         # Write to file (fallback / legacy) atomically
@@ -3353,66 +3379,6 @@ function _install_jemach_mode!(repl)
     return jm
 end
 
-# ---------------------------------------------------------------------------
-
-function _hot_reload_callback(file_path::String, source::String)
-    @info "[jEMach Hot-Reload] File changed: $file_path"
-    return try
-        expr = Meta.parse("begin\n" * source * "\nend")
-        Base.invokelatest(Core.eval, Main, expr)
-        @info "[jEMach Hot-Reload] Successfully reloaded into Main."
-    catch e
-        @error "[jEMach Hot-Reload] Error evaluating $file_path" exception = (e, catch_backtrace())
-    end
-end
-
-function enable_hot_reload(proj_dir::String = _get_project_dir())
-    # Try to load JuliaZigCompiler
-    CompilerModule = try
-        # Try to find it in the current environment
-        Base.require(Base.PkgId(Base.UUID("918df9c8-d8bb-4a5e-b2d9-183498845fc8"), "JuliaZigCompiler"))
-    catch
-        try
-            # Fallback to direct include if running locally from the user's workspace
-            compiler_path = joinpath(homedir(), "code", "julia-zig-jit", "julia_package", "JuliaZigCompiler", "src", "JuliaZigCompiler.jl")
-            if isfile(compiler_path)
-                include(compiler_path)
-                Main.JuliaZigCompiler
-            else
-                nothing
-            end
-        catch
-            nothing
-        end
-    end
-
-    if isnothing(CompilerModule)
-        @error "JuliaZigCompiler is not available. Cannot enable Zero-Overhead FFI Hot-Reloading."
-        return
-    end
-
-    @info "Starting jEMach Zero-Overhead FFI Hot-Reloading for project: $proj_dir"
-
-    # Recursively find all .jl files in the src/ directory of the project
-    src_dir = joinpath(proj_dir, "src")
-    if !isdir(src_dir)
-        src_dir = proj_dir
-    end
-
-    watched_count = 0
-    for (root, _, files) in walkdir(src_dir)
-        for file in files
-            if endswith(file, ".jl")
-                path = joinpath(root, file)
-                Base.invokelatest(CompilerModule.watch_file, path, _hot_reload_callback)
-                watched_count += 1
-            end
-        end
-    end
-
-    return @info "Registered $watched_count files for instantaneous FFI Hot-Reload."
-end
-
 """
     status()
 
@@ -3477,7 +3443,8 @@ function _setup_repl_hooks(repl)
 end
 
 function __init__()
-    hist_path = joinpath(homedir(), ".julia", "logs", "repl_history.jl")
+    _load_zig_native!()
+    hist_path = _history_path()
     if isfile(hist_path)
         HIST_START_POS[] = filesize(hist_path)
     else
@@ -3517,11 +3484,19 @@ end
 # Precompilation of hot paths (reduces first-refresh latency after `using jEMach`)
 # ---------------------------------------------------------------------------
 precompile(_collect_state_dod!, (WorkspaceTable,))
+precompile(_collect_module_items_dod!, (WorkspaceTable, Module, String, Bool))
+precompile(_collect_children_dod!, (WorkspaceTable, Any, String, String, Int, Int))
+precompile(_get_packages, ())
+precompile(_serialize_dod_body, (WorkspaceTable, Vector{Dict{String, String}}))
 precompile(_serialize_dod, (WorkspaceTable, Vector{Dict{String, String}}))
+precompile(publish_state, ())
 precompile(_parse_json_cmd, (String,))
 precompile(_handle_socket_message, (String,))
 precompile(_load_procedures!, ())
 precompile(get_recent_commands, ())
+precompile(_parse_history_bytes, (Vector{UInt8}, Bool, Int))
+precompile(_write_json_str, (IOBuffer, String, Vector{UInt8}))
+precompile(_write_json_str_julia, (IOBuffer, String))
 precompile(detect_backend, ())
 precompile(detect_backend, (Symbol,))
 precompile(_value_preview, (Int,))

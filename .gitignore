@@ -1,5 +1,6 @@
 # Log and cache files
 *.log
+deps/build.log
 
 
 # Julia workspace persistence files (user-specific)

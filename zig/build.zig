@@ -90,6 +90,18 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    const native_mod = b.createModule(.{
+        .root_source_file = b.path("src/native.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const native_lib = b.addLibrary(.{
+        .name = "jemach_native",
+        .linkage = .dynamic,
+        .root_module = native_mod,
+    });
+    b.installArtifact(native_lib);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.
@@ -134,12 +146,18 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    const native_tests = b.addTest(.{
+        .root_module = native_mod,
+    });
+    const run_native_tests = b.addRunArtifact(native_tests);
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_native_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

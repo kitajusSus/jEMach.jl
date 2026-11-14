@@ -243,14 +243,18 @@ jEMach.find_procedures("sample")
 
 ---
 
-## Native Zig Broker (`zig/`)
+## Native Zig Accelerator & Broker (`zig/`)
 
-`jEMach` comes with a native IPC broker written in Zig for fan-out PUB/SUB communication:
+`jEMach` includes a native Zig shared library (`libjemach_native`) with SIMD JSON string escaping and single-pass `repl_history.jl` block parsing (with automatic pure-Julia fallback if `zig` is not installed), as well as a standalone IPC broker (`jemach-broker`):
 
 ```bash
+# Built automatically when Zig is installed via Julia:
+julia -e 'using Pkg; Pkg.build("jEMach")'
+
+# Or directly in zig/:
 cd zig
-zig build test   # Runs Data-Oriented Design MultiArrayList unit tests
-zig build        # Builds zig-out/bin/jemach-broker
+zig build test                       # Runs Zig DoD & native accelerator unit tests
+zig build -Doptimize=ReleaseFast     # Builds libjemach_native + jemach-broker
 ```
 
 ---

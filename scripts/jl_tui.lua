@@ -449,7 +449,6 @@ local SET_TITLE = ESC .. "]2;jEMach — Julia Workspace\7"
 local BOLD = ESC .. "[1m"
 local DIM = ESC .. "[2m"
 local ITALIC = ESC .. "[3m"
-local UNDERLINE = ESC .. "[4m"
 local RESET = ESC .. "[0m"
 local REV = ESC .. "[7m" -- reverse video (selection highlight)
 
@@ -461,16 +460,13 @@ local FG_GREEN = ESC .. "[38;5;84m"
 local FG_YELLOW = ESC .. "[38;5;221m"
 local FG_ORANGE = ESC .. "[38;5;215m"
 local FG_PURPLE = ESC .. "[38;5;141m"
-local FG_MAGENTA = ESC .. "[38;5;207m"
 local FG_RED = ESC .. "[38;5;203m"
 local FG_WHITE = ESC .. "[38;5;255m"
 local FG_LIGHT_GRAY = ESC .. "[38;5;250m"
 local FG_GRAY = ESC .. "[38;5;244m"
 local FG_DARK_GRAY = ESC .. "[38;5;238m"
 
-local BG_SEL = ESC .. "[48;5;236m"
 local BG_TAB_ACT = ESC .. "[48;5;24m"
-local BG_HEADER = ESC .. "[48;5;235m"
 
 local function strip_ansi(s)
 	return tostring(s or ""):gsub("\27%[[%d;]*[a-zA-Z]", "")
@@ -811,7 +807,6 @@ local initialized_modules = { ["Main"] = true }
 local active_tab = 1 -- 1: Workspace, 2: History, 3: Procedures, 4: Packages
 local TAB_NAMES = { "Workspace", "History", "Procedures", "Packages" }
 local tab_cursors = { 1, 1, 1, 1 }
-local proc_view_code = false
 
 -- Search & Filter state
 local search_mode = false
