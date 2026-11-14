@@ -484,9 +484,6 @@ local FG_DARK_GRAY = ESC .. "[38;5;238m"
 local BG_TAB_ACT = ESC .. "[48;5;24m"
 local BG_ERR_LINE = ESC .. "[48;5;52m"
 local BG_PANEL = ESC .. "[48;5;235m"
-local BG_SEL = ESC .. "[48;5;237m"
-local BG_SEL_ERR = ESC .. "[48;5;52m"
-local BG_SEL_MOD = ESC .. "[48;5;58m"
 local MOUSE_ON = ESC .. "[?1000h" .. ESC .. "[?1006h"
 local MOUSE_OFF = ESC .. "[?1000l" .. ESC .. "[?1006l"
 
@@ -2380,7 +2377,6 @@ local function render(term_rows, term_cols)
 			elseif dr.kind == "procedure" then
 				local glyph, gclr, gwide = origin_glyph_and_color(dr.origin, dr.status)
 				local sel_bar = sel and (FG_CYAN .. BOLD .. "▸" .. RESET) or " "
-				local row_bg = sel and ((dr.status == "error") and BG_SEL_ERR or (dr.origin == "modified") and BG_SEL_MOD or BG_SEL) or ""
 				local icon = sel_bar .. gclr .. glyph .. (gwide and "" or " ") .. RESET
 
 				local avail = math.max(10, term_cols - 3)
@@ -2429,13 +2425,13 @@ local function render(term_rows, term_cols)
 					or (dr.origin == "live") and FG_CYAN
 					or FG_WHITE
 
-				local row_txt = icon .. (sel and BOLD or "") .. name_color .. sig_col .. RESET .. " " .. met_color .. met_col .. RESET .. file_col
 				if sel then
-					local body = row_txt:gsub("\27%[0m", RESET .. row_bg)
-					local pad = math.max(0, term_cols - visible_len(row_txt) - (gwide and 1 or 0))
-					table.insert(out_buf, row_bg .. body .. string.rep(" ", pad) .. RESET)
+					local sel_bg = (dr.status == "error") and FG_RED
+						or (dr.origin == "modified") and FG_YELLOW
+						or FG_CYAN
+					table.insert(out_buf, icon .. REV .. BOLD .. sel_bg .. sig_col .. RESET .. " " .. met_color .. met_col .. RESET .. file_col)
 				else
-					table.insert(out_buf, row_txt)
+					table.insert(out_buf, icon .. BOLD .. name_color .. sig_col .. RESET .. " " .. met_color .. met_col .. RESET .. file_col)
 				end
 			elseif dr.kind == "failed_cmd" then
 				local sel_bar = sel and (FG_RED .. BOLD .. "▸" .. RESET) or " "
@@ -2448,11 +2444,8 @@ local function render(term_rows, term_cols)
 
 				local cmd_col = pad_right(truncate_visible(cmd_one, cmd_w), cmd_w)
 				local err_col = pad_right(truncate_visible(err_short, err_w), err_w)
-				local row_txt = icon .. (sel and BOLD or "") .. FG_WHITE .. cmd_col .. RESET .. " " .. FG_ORANGE .. err_col .. RESET
 				if sel then
-					local body = row_txt:gsub("\27%[0m", RESET .. BG_SEL_ERR)
-					local pad = math.max(0, term_cols - visible_len(row_txt))
-					table.insert(out_buf, BG_SEL_ERR .. body .. string.rep(" ", pad) .. RESET)
+					table.insert(out_buf, icon .. REV .. BOLD .. FG_RED .. cmd_col .. RESET .. " " .. FG_ORANGE .. err_col .. RESET)
 				else
 					table.insert(out_buf, icon .. FG_WHITE .. cmd_col .. RESET .. " " .. FG_RED .. err_col .. RESET)
 				end
@@ -2614,13 +2607,13 @@ local function render(term_rows, term_cols)
 				if sel then
 					local out_str
 					if col_cursor == 1 then
-						out_str = BG_SEL .. BOLD .. kc .. name_col .. RESET .. BG_SEL .. "  " .. kc .. type_col .. "  " .. FG_WHITE .. val_col .. RESET
+						out_str = REV .. name_col .. RESET .. "  " .. kc .. type_col .. "  " .. FG_WHITE .. val_col
 					elseif col_cursor == 2 then
-						out_str = BG_SEL .. kc .. name_col .. "  " .. BOLD .. FG_YELLOW .. type_col .. RESET .. BG_SEL .. "  " .. FG_WHITE .. val_col .. RESET
+						out_str = name_col .. "  " .. REV .. kc .. type_col .. RESET .. "  " .. FG_WHITE .. val_col
 					else
-						out_str = BG_SEL .. kc .. name_col .. "  " .. kc .. type_col .. "  " .. BOLD .. FG_WHITE .. val_col .. RESET
+						out_str = name_col .. "  " .. kc .. type_col .. "  " .. REV .. FG_WHITE .. val_col .. RESET
 					end
-					table.insert(out_buf, out_str)
+					table.insert(out_buf, kc .. out_str .. RESET)
 				else
 					table.insert(out_buf, kc .. name_col .. "  " .. FG_GRAY .. type_col .. "  " .. FG_WHITE .. val_col .. RESET)
 				end
