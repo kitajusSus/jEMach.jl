@@ -176,7 +176,7 @@ function _load_procedures!(; eval_in_main::Bool = false)
 
             push!(found_names, func_name)
 
-            if eval_in_main && (get(_loaded_proc_mtimes, filepath, -1.0) != file_mt || !isdefined(Main, func_name))
+            if eval_in_main && (get(_loaded_proc_mtimes, filepath, -1.0) != file_mt || !Base.invokelatest(isdefined, Main, func_name))
                 try
                     Base.include(Main, filepath)
                     _loaded_proc_mtimes[filepath] = file_mt
@@ -214,9 +214,9 @@ autoload_procedures!() = _load_procedures!(; eval_in_main = true)
 
 function _is_global_or_type(sym::Symbol)::Bool
     for m in (Main, Base, Core)
-        if isdefined(m, sym)
+        if Base.invokelatest(isdefined, m, sym)
             try
-                v = getfield(m, sym)
+                v = Base.invokelatest(getfield, m, sym)
                 (v isa Function || v isa DataType || v isa UnionAll || v isa Module) && return true
             catch
             end
@@ -396,15 +396,15 @@ function _is_literal_expr(ex)::Bool
 end
 
 function _default_param_str(sym::Symbol)::Tuple{String, Bool}
-    if isdefined(Main, sym)
+    if Base.invokelatest(isdefined, Main, sym)
         val = try
-            getfield(Main, sym)
+            Base.invokelatest(getfield, Main, sym)
         catch
             nothing
         end
         if !isnothing(val)
             try
-                rep = repr(val)
+                rep = Base.invokelatest(repr, val)
                 if length(rep) <= 80 && !occursin('\n', rep)
                     return ("$(sym) = $(rep)", true)
                 end

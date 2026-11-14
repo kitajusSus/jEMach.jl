@@ -95,9 +95,9 @@ function Base.show(io::IO, ::MIME"text/plain", t::WorkspaceTable)
         sz_str = "-"
         if mod_str == "Main" && kind == "variable"
             sym = Symbol(name)
-            if isdefined(Main, sym)
+            if Base.invokelatest(isdefined, Main, sym)
                 try
-                    v = getfield(Main, sym)
+                    v = Base.invokelatest(getfield, Main, sym)
                     sz_str = Base.format_bytes(Base.summarysize(v))
                 catch
                 end
@@ -105,8 +105,8 @@ function Base.show(io::IO, ::MIME"text/plain", t::WorkspaceTable)
         end
 
         name_disp = mod_str == "Main" ? name : (mod_str * "." * name)
-        name_short = length(name_disp) > 21 ? name_disp[1:20] * "…" : name_disp
-        tp_short = length(tp) > 21 ? tp[1:20] * "…" : tp
+        name_short = length(name_disp) > 21 ? first(name_disp, 20) * "…" : name_disp
+        tp_short = length(tp) > 21 ? first(tp, 20) * "…" : tp
         val_short = length(val_str) > 32 ? first(val_str, 31) * "…" : val_str
 
         k_color = kind == "function" ? cyan : (kind == "type" ? magenta : green)
@@ -130,10 +130,10 @@ their memory footprint (`summarysize`), and value previews directly in the REPL.
 Optionally filter entries by `query`.
 """
 function workspace(query::AbstractString = "")
-    t = _collect_state_dod!(_shared_workspace_table[])
+    t = Base.invokelatest(_collect_state_dod!, _shared_workspace_table[])
     q = lowercase(strip(query))
     if isempty(q)
-        show(IOContext(stdout, :color => true), MIME("text/plain"), t)
+        Base.invokelatest(show, IOContext(stdout, :color => true), MIME("text/plain"), t)
         println(stdout)
         return nothing
     end
@@ -152,7 +152,7 @@ function workspace(query::AbstractString = "")
             )
         end
     end
-    show(IOContext(stdout, :color => true), MIME("text/plain"), filtered)
+    Base.invokelatest(show, IOContext(stdout, :color => true), MIME("text/plain"), filtered)
     println(stdout)
     return nothing
 end
@@ -163,13 +163,14 @@ end
 
 const _cached_pkgs = Ref{Vector{Dict{String, String}}}(Dict{String, String}[])
 const _last_pkg_mtime = Ref{Float64}(0.0)
+const _last_pkg_file = Ref{String}("")
 
 function _get_packages()::Vector{Dict{String, String}}
     proj_dir = _get_project_dir()
     proj_file = joinpath(proj_dir, "Project.toml")
     mtime_proj = isfile(proj_file) ? mtime(proj_file) : 0.0
 
-    if !isempty(_cached_pkgs[]) && mtime_proj == _last_pkg_mtime[]
+    if !isempty(_cached_pkgs[]) && proj_file == _last_pkg_file[] && mtime_proj == _last_pkg_mtime[]
         return _cached_pkgs[]
     end
 
@@ -186,6 +187,7 @@ function _get_packages()::Vector{Dict{String, String}}
         end
         sort!(pkgs; by = x -> x["name"])
         _cached_pkgs[] = pkgs
+        _last_pkg_file[] = proj_file
         _last_pkg_mtime[] = mtime_proj
     catch
     end
@@ -211,12 +213,12 @@ end
 function _value_preview(val)::String
     (val isa Number || val isa Bool || val isa Symbol) && return string(val)
     if val isa AbstractString
-        return length(val) > 60 ? repr(val[1:min(end, 57)]) * "…" : repr(val)
+        return length(val) > 60 ? repr(first(val, 57)) * "…" : repr(val)
     end
     return try
         s = sprint((io, x) -> Base.invokelatest(show, io, x), val; context = IOContext(devnull, :limit => true, :compact => true))
         s = replace(s, '\n' => ' ')
-        length(s) > 60 ? s[1:60] * "…" : s
+        length(s) > 60 ? first(s, 60) * "…" : s
     catch
         "<?>"
     end
@@ -353,12 +355,36 @@ end
 
 const _IGNORED_LOADED_MODULES = Set(["Main", "Base", "Core", "jEMach", "OhMyREPL", "Revise", "Pkg", "InteractiveUtils", "VSCodeServer"])
 
+const _last_loaded_modules = Ref{Vector{Module}}(Module[])
+
+function _snapshot_loaded_modules()::Vector{Module}
+    if isdefined(Base, :require_lock) && Base.require_lock isa ReentrantLock
+        if trylock(Base.require_lock)
+            try
+                mods = collect(values(Base.loaded_modules))
+                _last_loaded_modules[] = mods
+                return mods
+            finally
+                unlock(Base.require_lock)
+            end
+        end
+        return _last_loaded_modules[]
+    end
+    return try
+        mods = collect(values(Base.loaded_modules))
+        _last_loaded_modules[] = mods
+        mods
+    catch
+        _last_loaded_modules[]
+    end
+end
+
 function _collect_state_dod!(t::WorkspaceTable)::WorkspaceTable
     empty!(t)
     _collect_module_items_dod!(t, Main, "Main", true)
 
     seen = copy(_IGNORED_LOADED_MODULES)
-    for (_, mod) in Base.loaded_modules
+    for mod in _snapshot_loaded_modules()
         name = string(mod)
         name in seen && continue
         mod_sym = nameof(mod)
@@ -374,27 +400,30 @@ function _collect_state_dod!(t::WorkspaceTable)::WorkspaceTable
             end
         end
     end
+
+    # Collect non-ignored submodules bound directly in Main (e.g., local `module Foo ... end`)
+    for sym in names(Main; all = true, imported = false)
+        name = string(sym)
+        (_skip_name(name) || name in seen) && continue
+        isdefined(Main, sym) || continue
+        val = try
+            getfield(Main, sym)
+        catch
+            continue
+        end
+        val isa Module || continue
+        (val === Main || val === Base || val === Core) && continue
+        full_name = string(val)
+        full_name in seen && continue
+        push!(seen, name)
+        push!(seen, full_name)
+        _collect_module_items_dod!(t, val, name, parentmodule(val) === Main)
+    end
     return t
 end
 
-"""
-    inspect_var(mod::Module, expr_str::String)
-
-Print a detailed report about the value of `expr_str` evaluated in `mod`: type, size,
-methods with inferred return types, the REPL command that created it, and its docstring.
-See also `@inspect`.
-"""
-function inspect_var(mod::Module, expr_str::String)
-    val = try
-        Base.invokelatest(Core.eval, mod, Meta.parse(expr_str))
-    catch
-        println("Could not evaluate expression $expr_str in module $mod.")
-        return nothing
-    end
-
-    bold, green, reset = "\e[1m", "\e[32m", "\e[0m"
-    println("\n" * green * bold * "━"^60 * reset)
-    println(bold * "Variable:      " * reset * "$mod.$expr_str")
+function _inspect_var_details(val)
+    bold, reset = "\e[1m", "\e[0m"
     println(bold * "Type:          " * reset * "$(typeof(val))")
     if hasmethod(size, Tuple{typeof(val)})
         try
@@ -430,6 +459,28 @@ function inspect_var(mod::Module, expr_str::String)
         catch
         end
     end
+    return nothing
+end
+
+"""
+    inspect_var(mod::Module, expr_str::String)
+
+Print a detailed report about the value of `expr_str` evaluated in `mod`: type, size,
+methods with inferred return types, the REPL command that created it, and its docstring.
+See also `@inspect`.
+"""
+function inspect_var(mod::Module, expr_str::String)
+    val = try
+        Base.invokelatest(Core.eval, mod, Meta.parse(expr_str))
+    catch
+        println("Could not evaluate expression $expr_str in module $mod.")
+        return nothing
+    end
+
+    bold, green, reset = "\e[1m", "\e[32m", "\e[0m"
+    println("\n" * green * bold * "━"^60 * reset)
+    println(bold * "Variable:      " * reset * "$mod.$expr_str")
+    Base.invokelatest(_inspect_var_details, val)
 
     base_m = match(r"^[a-zA-Z_][a-zA-Z0-9_]*", expr_str)
     base_var_str = isnothing(base_m) ? expr_str : base_m.match
@@ -455,11 +506,11 @@ function inspect_var(mod::Module, expr_str::String)
     end
 
     try
-        doc = Base.Docs.doc(Base.Docs.Binding(mod, sym))
+        doc = Base.invokelatest(Base.Docs.doc, Base.Docs.Binding(mod, sym))
         doc_str = string(doc)
         if !occursin("No documentation found", doc_str)
             println(bold * "Documentation:" * reset)
-            show(IOContext(stdout, :color => true), MIME("text/plain"), doc)
+            Base.invokelatest(show, IOContext(stdout, :color => true), MIME("text/plain"), doc)
             println()
         end
     catch

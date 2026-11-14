@@ -139,7 +139,7 @@ function _repl_eval(code::AbstractString; silent::Bool = false, record_history::
         catch e
             @warn "jEMach background eval failed" exception = e
         end
-        return publish_state()
+        return Base.invokelatest(publish_state)
     end
 
     s = _get_mistate()
@@ -182,7 +182,7 @@ function _repl_eval(code::AbstractString; silent::Bool = false, record_history::
         catch
         end
     end
-    return publish_state()
+    return Base.invokelatest(publish_state)
 end
 
 function _repl_insert(text::AbstractString, move_left::Int = 0)
@@ -329,8 +329,9 @@ function publish_state()
         if _running[] && (isnothing(_server_ref[]) || !isopen(_server_ref[]) || !ispath(SOCKET_PATH[]))
             _start_socket_server()
         end
-        state = _collect_state_dod!(_shared_workspace_table[])
-        pkgs = _get_packages()
+        # Enter latest world age so background tasks see bindings/methods defined after __init__
+        state = Base.invokelatest(_collect_state_dod!, _shared_workspace_table[])
+        pkgs = Base.invokelatest(_get_packages)
         body = _serialize_dod_body(state, pkgs)
 
         body == _last_serialized_body[] && return

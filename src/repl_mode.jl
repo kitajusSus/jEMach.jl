@@ -33,7 +33,7 @@ end
 function _next_proc_name()::Symbol
     _load_procedures!()
     i = length(_procedures) + 1
-    while haskey(_procedures, Symbol("proc_", i)) || isdefined(Main, Symbol("proc_", i))
+    while haskey(_procedures, Symbol("proc_", i)) || Base.invokelatest(isdefined, Main, Symbol("proc_", i))
         i += 1
     end
     return Symbol("proc_", i)
@@ -203,7 +203,7 @@ struct JEMachCompletionProvider <: LineEdit.CompletionProvider end
 
 function _main_symbol_names()::Vector{String}
     out = String[]
-    for sym in names(Main; all = true, imported = true)
+    for sym in Base.invokelatest(names, Main; all = true, imported = true)
         n = string(sym)
         (_skip_name(n) || startswith(n, "#") || startswith(n, "_")) && continue
         push!(out, n)
@@ -330,7 +330,7 @@ function _setup_repl_hooks(repl)
                 push!(
                     Base.active_repl_backend.ast_transforms,
                     function (ast)
-                        @async (sleep(0.02); publish_state())
+                        @async (sleep(0.02); Base.invokelatest(publish_state))
                         return ast
                     end
                 )
