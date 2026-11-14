@@ -125,8 +125,33 @@ Turn your experimental REPL commands into parameterized, reproducible procedures
 
 ### 2. Directly in Julia REPL
 
+`jEMach` also works natively inside the Julia REPL — even without the TUI sidecar:
+
+#### `jemach>` REPL Mode & Shortcuts
+
+- Type **`}`** on an empty prompt (or press **`Alt+m`**) to enter the **`jemach>`** REPL mode (with full **Tab completion** for subcommands, procedure names, and workspace variables; `Backspace` or `Ctrl+C` exits).
+- **`Alt+j`**: Insert/browse a procedure call straight into the current `julia>` prompt.
+- **`Alt+r`**: Start or stop procedure recording (prompt dynamically switches to `⏺ [rec: name] julia> ` while recording).
+- **`↑` / `↓` history sync**: Commands executed from the TUI sidecar (`Enter` in History/Procedures) are appended to Julia's live in-memory `REPLHistoryProvider`, so pressing `↑` recalls them right away.
+- **Auto-loaded procedures**: Existing `procedures/*.jl` files are automatically loaded into `Main` on `using jEMach` (disable with `ENV["JEMACH_AUTOLOAD"] = "0"`).
+
 ```julia
 using jEMach
+
+# Inside jemach> mode (press '}' on empty prompt or Alt+m):
+# jemach> ls                                  # List procedures
+# jemach> ws [query]                          # Workspace summary table
+# jemach> inspect my_var                      # Variable type, size, fields, methods
+# jemach> show check_sample                   # Source code, signature & timings
+# jemach> run check_sample(10)                # Run procedure with args
+# jemach> make my_proc 4                      # Package last 4 commands
+# jemach> rec my_flow                         # Start/stop recording (or Alt+r)
+
+# Or via macros / functions anywhere in julia>:
+@jemach ls
+@jemach run check_sample(x)
+@inspect my_var
+workspace("matrix")
 
 # Option A: Extract last N commands into a parameterized procedure
 jEMach.make_procedure(:check_sample, last=4)
@@ -139,8 +164,8 @@ e = eigen(A)
 all(e.values .> -1e-5)
 jEMach.record_stop()
 
-# Run procedure with profiling (time & memory metrics tracked in TUI)
-jEMach.run_procedure(:check_sample)
+# Reload/sync procedures/*.jl manually
+jEMach.autoload_procedures!()
 
 # List all discovered procedures (with optional search query)
 jEMach.list_procedures()

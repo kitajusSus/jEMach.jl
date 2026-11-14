@@ -166,6 +166,58 @@ local dirty = true
 local state = nil -- last parsed JSON state
 local last_mtime = 0
 local last_state_ts = 0
+local history_selected = {}
+
+local function realign_history_selection(old_hist, new_hist)
+	if not next(history_selected) then
+		return
+	end
+	if type(old_hist) ~= "table" or type(new_hist) ~= "table" or #old_hist == 0 or #new_hist == 0 then
+		history_selected = {}
+		return
+	end
+	local n_old = #old_hist
+	local n_new = #new_hist
+	local matched_s = nil
+	for s = 0, n_old - 1 do
+		local overlap = math.min(n_old - s, n_new)
+		if overlap >= 1 then
+			local ok = true
+			for k = 1, overlap do
+				if old_hist[s + k] ~= new_hist[k] then
+					ok = false
+					break
+				end
+			end
+			if ok then
+				matched_s = s
+				break
+			end
+		end
+	end
+	if matched_s == nil then
+		history_selected = {}
+	elseif matched_s > 0 then
+		local shifted = {}
+		for idx, val in pairs(history_selected) do
+			if val and type(idx) == "number" then
+				local new_idx = idx - matched_s
+				if new_idx >= 1 and new_idx <= n_new then
+					shifted[new_idx] = true
+				end
+			end
+		end
+		history_selected = shifted
+	end
+end
+
+local function apply_new_state(parsed)
+	local old_hist = state and state.history or nil
+	realign_history_selection(old_hist, parsed and parsed.history or nil)
+	state = parsed
+	last_state_ts = os.time()
+	dirty = true
+end
 
 local function try_connect_socket()
 	if socket_fd >= 0 then
@@ -249,9 +301,7 @@ local function handle_socket_read()
 			if parsed.action == "close" or parsed.event == "stop" then
 				should_quit = true
 			else
-				state = parsed
-				last_state_ts = os.time()
-				dirty = true
+				apply_new_state(parsed)
 			end
 		end
 	end
@@ -761,7 +811,6 @@ local initialized_modules = { ["Main"] = true }
 local active_tab = 1 -- 1: Workspace, 2: History, 3: Procedures, 4: Packages
 local TAB_NAMES = { "Workspace", "History", "Procedures", "Packages" }
 local tab_cursors = { 1, 1, 1, 1 }
-local history_selected = {}
 local proc_view_code = false
 
 -- Search & Filter state
@@ -833,9 +882,7 @@ local function load_state()
 
 	local ok, parsed = pcall(json_parse, content)
 	if ok and parsed then
-		state = parsed
-		last_state_ts = os.time()
-		dirty = true
+		apply_new_state(parsed)
 		return true
 	end
 	return false
@@ -1238,9 +1285,21 @@ local function fallback_mux_send(code, enter)
 	end
 end
 
-local function repl_eval(code, silent)
+local function julia_quote_str(s)
+	s = tostring(s or "")
+	s = s:gsub("\\", "\\\\")
+	     :gsub('"', '\\"')
+	     :gsub("%$", "\\$")
+	     :gsub("\n", "\\n")
+	     :gsub("\r", "\\r")
+	     :gsub("\t", "\\t")
+	return '"' .. s .. '"'
+end
+
+local function repl_eval(code, silent, record_history)
 	local cmd_type = silent and "eval_silent" or "eval"
-	local msg = string.format('{"cmd":"%s","code":"%s"}', cmd_type, json_escape(code))
+	local hist_field = (record_history == false) and ',"history":false' or ""
+	local msg = string.format('{"cmd":"%s","code":"%s"%s}', cmd_type, json_escape(code), hist_field)
 	if not send_socket_json(msg) then
 		fallback_mux_send(code, true)
 	end
@@ -1802,7 +1861,7 @@ local function handle_key(key, term_rows, term_cols)
 						else
 							code = "dump(" .. dr.expr .. ")"
 						end
-						tmux_send(code)
+						repl_eval(code, false, false)
 					end
 				end
 			end
@@ -1811,13 +1870,13 @@ local function handle_key(key, term_rows, term_cols)
 			if dr and dr.kind == "item" then
 				if dr.expr:match("^[%a_][%w_!%.%[%]%s%\"%:%']*$") then
 					local code = string.format("jEMach.inspect_var(%s, %q)", dr.module_name, dr.expr)
-					tmux_send(code)
+					repl_eval(code, false, false)
 				end
 			end
 		elseif key == "c" then
 			repl_clear()
 		elseif key == "s" then
-			tmux_send("jEMach.save_clean_session()")
+			repl_eval("jEMach.save_clean_session()", false, false)
 		elseif key == "e" then
 			local dr = display_rows[cursor]
 			if dr and dr.kind == "item" then
@@ -1886,18 +1945,26 @@ local function handle_key(key, term_rows, term_cols)
 			modal_callback = function(name)
 				name = name:gsub("%s+", "")
 				if name == "" then return end
-				local sel_indices = {}
+				local sel_cmds = {}
 				local hist = state and state.history or {}
 				for i = 1, #hist do
 					if history_selected[i] then
-						table.insert(sel_indices, tostring(i))
+						table.insert(sel_cmds, julia_quote_str(hist[i]))
 					end
 				end
-				if #sel_indices == 0 and display_rows[cursor] and display_rows[cursor].idx then
-					table.insert(sel_indices, tostring(display_rows[cursor].idx))
+				if #sel_cmds == 0 and display_rows[cursor] and display_rows[cursor].idx then
+					local cmd_str = hist[display_rows[cursor].idx] or display_rows[cursor].cmd
+					if cmd_str and cmd_str ~= "" then
+						table.insert(sel_cmds, julia_quote_str(cmd_str))
+					end
 				end
-				local cmd = string.format("jEMach.make_procedure(:%s; indices=[%s])", name, table.concat(sel_indices, ","))
-				tmux_send(cmd)
+				if #sel_cmds == 0 then
+					set_toast("No history commands selected!")
+					return
+				end
+				local cmd = string.format("jEMach.make_procedure(:%s; commands=String[%s])", name, table.concat(sel_cmds, ", "))
+				repl_eval(cmd, false, false)
+				history_selected = {}
 				set_toast("✓ Generated procedure '" .. name .. "'!")
 				switch_tab(3)
 			end

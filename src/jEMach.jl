@@ -525,18 +525,27 @@ const _loaded_proc_mtimes = Dict{String, Float64}()
 const _recording = Ref{Bool}(false)
 const _record_name = Ref{Symbol}(:proc)
 const _record_start_idx = Ref{Int}(0)
+const _record_start_pos = Ref{Int64}(0)
+const _record_hist_idx = Ref{Int}(0)
 const HIST_START_POS = Ref{Int}(0)
+const HISTORY_LIMIT = 60
 const _orig_julia_prompt = Ref{Any}(nothing)
 const _orig_julia_prefix = Ref{Any}(nothing)
 
 const _JEMACH_API_PREFIXES = (
     "@jemach", "@inspect", "record(", "record_stop(", "workspace(", "list_procedures(",
     "find_procedures(", "search_procedures(", "autoload_procedures!(", "make_procedure(",
+    "using jEMach", "import jEMach",
 )
+
+const _JEMACH_SKIP_EXACT = Set([
+    "jEMach", "exit()", "quit()", "clear()", "ans",
+])
 
 function _is_valid_user_cmd(cmd::AbstractString)::Bool
     s = strip(cmd)
     isempty(s) && return false
+    s in _JEMACH_SKIP_EXACT && return false
     if occursin("jEMach.", s) || occursin("save_clean_session", s) ||
             occursin("inspect_var", s) || occursin("publish_state", s)
         return false
@@ -547,29 +556,7 @@ function _is_valid_user_cmd(cmd::AbstractString)::Bool
     return true
 end
 
-function get_recent_commands(; limit::Int = 50, session_only::Bool = false)::Vector{String}
-    hist_path = joinpath(homedir(), ".julia", "logs", "repl_history.jl")
-    !isfile(hist_path) && return String[]
-
-    sz = filesize(hist_path)
-    pos = 0
-    if session_only && HIST_START_POS[] > 0
-        pos = min(HIST_START_POS[], sz)
-    else
-        read_len = min(sz, 131072)
-        pos = sz - read_len
-    end
-
-    content = try
-        open(hist_path, "r") do f
-            seek(f, pos)
-            pos > 0 && readline(f)
-            read(f, String)
-        end
-    catch
-        return String[]
-    end
-
+function _parse_history_blocks(content::AbstractString)::Vector{String}
     commands = String[]
     current_block = String[]
     block_mode = "julia"
@@ -595,7 +582,33 @@ function get_recent_commands(; limit::Int = 50, session_only::Bool = false)::Vec
         end
     end
     flush_block!()
+    return commands
+end
 
+function get_recent_commands(; limit::Int = 50, session_only::Bool = false)::Vector{String}
+    hist_path = joinpath(homedir(), ".julia", "logs", "repl_history.jl")
+    !isfile(hist_path) && return String[]
+
+    sz = filesize(hist_path)
+    pos = 0
+    if session_only && HIST_START_POS[] > 0
+        pos = min(HIST_START_POS[], sz)
+    else
+        read_len = min(sz, 131072)
+        pos = sz - read_len
+    end
+
+    content = try
+        open(hist_path, "r") do f
+            seek(f, pos)
+            pos > 0 && readline(f)
+            read(f, String)
+        end
+    catch
+        return String[]
+    end
+
+    commands = _parse_history_blocks(content)
     if length(commands) > limit
         return commands[(end - limit + 1):end]
     else
@@ -772,82 +785,191 @@ function _is_global_or_type(sym::Symbol)::Bool
     return false
 end
 
+function _bind_ast_lhs!(lhs, target_set::Set{Symbol})
+    if lhs isa Symbol
+        push!(target_set, lhs)
+    elseif lhs isa Expr
+        if lhs.head == :tuple || lhs.head == :parameters
+            for a in lhs.args
+                _bind_ast_lhs!(a, target_set)
+            end
+        elseif lhs.head == :(::) && !isempty(lhs.args)
+            _bind_ast_lhs!(lhs.args[1], target_set)
+        elseif lhs.head == :(=) && !isempty(lhs.args)
+            _bind_ast_lhs!(lhs.args[1], target_set)
+        elseif lhs.head == :... && !isempty(lhs.args)
+            _bind_ast_lhs!(lhs.args[1], target_set)
+        end
+    end
+    return target_set
+end
+
+function _collect_for_bindings!(spec, assigned::Set{Symbol}, referenced::Set{Symbol}, outer_scope::Set{Symbol}, loop_scope::Set{Symbol})
+    if spec isa Expr && spec.head == :(=) && length(spec.args) >= 2
+        _collect_ast_symbols!(spec.args[2], assigned, referenced, outer_scope)
+        _bind_ast_lhs!(spec.args[1], loop_scope)
+    elseif spec isa Expr && spec.head == :block
+        for item in spec.args
+            item isa LineNumberNode && continue
+            _collect_for_bindings!(item, assigned, referenced, outer_scope, loop_scope)
+        end
+    end
+    return loop_scope
+end
+
 function _collect_ast_symbols!(ex, assigned::Set{Symbol}, referenced::Set{Symbol}, local_scope::Set{Symbol} = Set{Symbol}())
-    return if ex isa Symbol
+    if ex isa QuoteNode || ex isa LineNumberNode
+        return nothing
+    elseif ex isa Symbol
         if !(ex in local_scope) && !(ex in assigned)
             push!(referenced, ex)
         end
-    elseif ex isa Expr
-        if ex.head == :(=)
-            lhs = ex.args[1]
-            if lhs isa Symbol
-                push!(assigned, lhs)
-            elseif lhs isa Expr && lhs.head == :tuple
-                for a in lhs.args
-                    a isa Symbol && push!(assigned, a)
-                end
-            end
-            if length(ex.args) >= 2
-                _collect_ast_symbols!(ex.args[2], assigned, referenced, local_scope)
-            end
-        elseif ex.head == :(->)
-            new_scope = copy(local_scope)
-            params = ex.args[1]
-            if params isa Symbol
-                push!(new_scope, params)
-            elseif params isa Expr && params.head == :tuple
-                for a in params.args
-                    if a isa Symbol
-                        push!(new_scope, a)
-                    elseif a isa Expr && a.head == :(::) && a.args[1] isa Symbol
-                        push!(new_scope, a.args[1])
-                    end
-                end
-            end
-            if length(ex.args) >= 2
-                _collect_ast_symbols!(ex.args[2], assigned, referenced, new_scope)
-            end
-        elseif ex.head in (:generator, :comprehension)
-            new_scope = copy(local_scope)
-            for i in 2:length(ex.args)
-                iter_spec = ex.args[i]
-                if iter_spec isa Expr && iter_spec.head == :(=)
-                    var = iter_spec.args[1]
-                    if var isa Symbol
-                        push!(new_scope, var)
-                    end
-                    _collect_ast_symbols!(iter_spec.args[2], assigned, referenced, local_scope)
-                end
-            end
-            _collect_ast_symbols!(ex.args[1], assigned, referenced, new_scope)
-        elseif ex.head in (:for, :while)
-            new_scope = copy(local_scope)
-            if ex.head == :for && length(ex.args) >= 1 && ex.args[1] isa Expr && ex.args[1].head == :(=)
-                loop_var = ex.args[1].args[1]
-                if loop_var isa Symbol
-                    push!(new_scope, loop_var)
-                end
-                _collect_ast_symbols!(ex.args[1].args[2], assigned, referenced, local_scope)
-            end
-            for i in 2:length(ex.args)
-                _collect_ast_symbols!(ex.args[i], assigned, referenced, new_scope)
-            end
-        elseif ex.head == :call
-            for a in ex.args
-                _collect_ast_symbols!(a, assigned, referenced, local_scope)
-            end
-        elseif ex.head == :macrocall
-            for i in 2:length(ex.args)
-                _collect_ast_symbols!(ex.args[i], assigned, referenced, local_scope)
-            end
-        elseif ex.head == :.
-            _collect_ast_symbols!(ex.args[1], assigned, referenced, local_scope)
+        return nothing
+    elseif !(ex isa Expr)
+        return nothing
+    end
+
+    h = ex.head
+    if h == :quote || h == :inert || h == :using || h == :import || h == :export || h == :meta
+        return nothing
+    elseif h == :(=)
+        lhs = ex.args[1]
+        if length(ex.args) >= 2
+            _collect_ast_symbols!(ex.args[2], assigned, referenced, local_scope)
+        end
+        if lhs isa Symbol || (lhs isa Expr && lhs.head in (:tuple, :(::)))
+            _bind_ast_lhs!(lhs, assigned)
         else
-            for a in ex.args
+            # e.g. `arr[i] = val` or `obj.field = val`: `arr`/`i`/`obj` are referenced, not assigned
+            _collect_ast_symbols!(lhs, assigned, referenced, local_scope)
+        end
+    elseif h == :kw
+        # Keyword argument `name = val`: only `val` is an expression in caller scope
+        length(ex.args) >= 2 && _collect_ast_symbols!(ex.args[2], assigned, referenced, local_scope)
+    elseif h == :parameters
+        for a in ex.args
+            if a isa Expr && a.head == :kw
+                length(a.args) >= 2 && _collect_ast_symbols!(a.args[2], assigned, referenced, local_scope)
+            else
                 _collect_ast_symbols!(a, assigned, referenced, local_scope)
             end
         end
+    elseif h == :(->)
+        new_scope = copy(local_scope)
+        length(ex.args) >= 1 && _bind_ast_lhs!(ex.args[1], new_scope)
+        length(ex.args) >= 2 && _collect_ast_symbols!(ex.args[2], assigned, referenced, new_scope)
+    elseif h == :function
+        new_scope = copy(local_scope)
+        if !isempty(ex.args)
+            sig = ex.args[1]
+            if sig isa Symbol
+                push!(assigned, sig)
+            elseif sig isa Expr && sig.head == :call && !isempty(sig.args)
+                sig.args[1] isa Symbol && push!(assigned, sig.args[1])
+                for a in sig.args[2:end]
+                    _bind_ast_lhs!(a, new_scope)
+                end
+            elseif sig isa Expr && sig.head == :tuple
+                _bind_ast_lhs!(sig, new_scope)
+            end
+        end
+        for i in 2:length(ex.args)
+            _collect_ast_symbols!(ex.args[i], assigned, referenced, new_scope)
+        end
+    elseif h == :do
+        length(ex.args) >= 1 && _collect_ast_symbols!(ex.args[1], assigned, referenced, local_scope)
+        length(ex.args) >= 2 && _collect_ast_symbols!(ex.args[2], assigned, referenced, local_scope)
+    elseif h == :generator || h == :comprehension
+        new_scope = copy(local_scope)
+        if h == :comprehension && length(ex.args) == 1 && ex.args[1] isa Expr && ex.args[1].head in (:generator, :flatten)
+            _collect_ast_symbols!(ex.args[1], assigned, referenced, local_scope)
+        else
+            for i in 2:length(ex.args)
+                iter_spec = ex.args[i]
+                if iter_spec isa Expr && iter_spec.head == :filter
+                    for j in 2:length(iter_spec.args)
+                        _collect_for_bindings!(iter_spec.args[j], assigned, referenced, local_scope, new_scope)
+                    end
+                    !isempty(iter_spec.args) && _collect_ast_symbols!(iter_spec.args[1], assigned, referenced, new_scope)
+                else
+                    _collect_for_bindings!(iter_spec, assigned, referenced, local_scope, new_scope)
+                end
+            end
+            !isempty(ex.args) && _collect_ast_symbols!(ex.args[1], assigned, referenced, new_scope)
+        end
+    elseif h == :flatten
+        for a in ex.args
+            _collect_ast_symbols!(a, assigned, referenced, local_scope)
+        end
+    elseif h == :for
+        new_scope = copy(local_scope)
+        length(ex.args) >= 1 && _collect_for_bindings!(ex.args[1], assigned, referenced, local_scope, new_scope)
+        for i in 2:length(ex.args)
+            _collect_ast_symbols!(ex.args[i], assigned, referenced, new_scope)
+        end
+    elseif h == :while
+        new_scope = copy(local_scope)
+        for a in ex.args
+            _collect_ast_symbols!(a, assigned, referenced, new_scope)
+        end
+    elseif h == :let
+        new_scope = copy(local_scope)
+        if length(ex.args) >= 1
+            binds = ex.args[1]
+            bind_list = (binds isa Expr && binds.head == :block) ? binds.args : Any[binds]
+            for b in bind_list
+                b isa LineNumberNode && continue
+                if b isa Expr && b.head == :(=)
+                    length(b.args) >= 2 && _collect_ast_symbols!(b.args[2], assigned, referenced, new_scope)
+                    _bind_ast_lhs!(b.args[1], new_scope)
+                elseif b isa Symbol
+                    push!(new_scope, b)
+                end
+            end
+        end
+        for i in 2:length(ex.args)
+            _collect_ast_symbols!(ex.args[i], assigned, referenced, new_scope)
+        end
+    elseif h == :local
+        for a in ex.args
+            if a isa Expr && a.head == :(=)
+                length(a.args) >= 2 && _collect_ast_symbols!(a.args[2], assigned, referenced, local_scope)
+                _bind_ast_lhs!(a.args[1], local_scope)
+            elseif a isa Symbol
+                push!(local_scope, a)
+            end
+        end
+    elseif h == :macrocall
+        for i in 2:length(ex.args)
+            _collect_ast_symbols!(ex.args[i], assigned, referenced, local_scope)
+        end
+    elseif h == :.
+        !isempty(ex.args) && _collect_ast_symbols!(ex.args[1], assigned, referenced, local_scope)
+    else
+        for a in ex.args
+            _collect_ast_symbols!(a, assigned, referenced, local_scope)
+        end
     end
+    return nothing
+end
+
+const _LITERAL_CALL_OPS = Set([:(:), :+, :-, :*, :/, :^, :vect, :vcat, :hcat, :tuple, :(=>)])
+
+function _is_literal_expr(ex)::Bool
+    if ex isa Number || ex isa AbstractString || ex isa Char || ex isa Bool || ex isa QuoteNode
+        return true
+    elseif ex isa Symbol
+        return ex in (:nothing, :missing, :true, :false, :pi, :ℯ, :im)
+    elseif ex isa Expr
+        if ex.head in (:vect, :vcat, :hcat, :row, :tuple, :braces)
+            return all(_is_literal_expr, ex.args)
+        elseif ex.head == :call && !isempty(ex.args) && ex.args[1] in _LITERAL_CALL_OPS
+            return all(_is_literal_expr, ex.args[2:end])
+        elseif ex.head == :... && length(ex.args) == 1
+            return _is_literal_expr(ex.args[1])
+        end
+    end
+    return false
 end
 
 function _default_param_str(sym::Symbol)::Tuple{String, Bool}
@@ -889,7 +1011,7 @@ function make_procedure(
         save::Bool = true
     )
     proc_name = Symbol(name)
-    all_cmds = get_recent_commands(limit = 100)
+    all_cmds = get_recent_commands(limit = HISTORY_LIMIT)
 
     cmds = String[]
     if !isempty(commands)
@@ -932,16 +1054,18 @@ function make_procedure(
         sub = filter(a -> !(a isa LineNumberNode), ex.args)
         isempty(sub) && continue
         stmt = sub[1]
-        if stmt isa Expr && stmt.head == :(=) && stmt.args[1] isa Symbol
+        if length(sub) == 1 && stmt isa Expr && stmt.head == :(=) && stmt.args[1] isa Symbol
             lhs = stmt.args[1]
             rhs = stmt.args[2]
-            rhs_refs = Set{Symbol}()
-            _collect_ast_symbols!(rhs, Set{Symbol}(), rhs_refs)
-            if isempty(intersect(rhs_refs, promoted_syms)) && !any(occursin(string(a), string(rhs)) for a in promoted_syms)
-                push!(promoted_syms, lhs)
-                push!(promoted_params, strip(cmd))
-                computation_start_idx = i + 1
-                continue
+            if _is_literal_expr(rhs)
+                rhs_refs = Set{Symbol}()
+                _collect_ast_symbols!(rhs, Set{Symbol}(), rhs_refs)
+                if isempty(intersect(rhs_refs, promoted_syms))
+                    push!(promoted_syms, lhs)
+                    push!(promoted_params, strip(cmd))
+                    computation_start_idx = i + 1
+                    continue
+                end
             end
         end
         break
@@ -1103,8 +1227,11 @@ Call `record_stop()` (or press `Alt+r`) to finish and save the procedure.
 function record(name::Union{Symbol, AbstractString} = :proc)
     _recording[] = true
     _record_name[] = Symbol(name)
-    all_cmds = get_recent_commands(limit = 1000)
-    _record_start_idx[] = length(all_cmds) + 1
+    hist_path = joinpath(homedir(), ".julia", "logs", "repl_history.jl")
+    _record_start_pos[] = isfile(hist_path) ? Int64(filesize(hist_path)) : Int64(0)
+    hp = _active_history_provider()
+    _record_hist_idx[] = isnothing(hp) ? 0 : length(hp.history)
+    _record_start_idx[] = _record_hist_idx[] + 1
     _update_repl_prompt!()
     cyan = "\e[36m"
     bold = "\e[1m"
@@ -1112,6 +1239,41 @@ function record(name::Union{Symbol, AbstractString} = :proc)
     println(bold * cyan * "⏺ [jEMach] Recording procedure '$(_record_name[])'..." * reset)
     println("  Execute your commands in the REPL. When done, call " * bold * "record_stop()" * reset * " or press " * bold * "Alt+r" * reset)
     return nothing
+end
+
+function _recorded_commands_since_start()::Vector{String}
+    hp = _active_history_provider()
+    if !isnothing(hp) && _record_hist_idx[] >= 0 && length(hp.history) >= _record_hist_idx[]
+        cmds = String[]
+        for idx in (_record_hist_idx[] + 1):length(hp.history)
+            entry = hp.history[idx]
+            mode_sym, content = if isdefined(REPL, :History) && isdefined(REPL.History, :HistEntry) && entry isa REPL.History.HistEntry
+                (entry.mode, entry.content)
+            else
+                m = (hasproperty(hp, :modes) && idx <= length(hp.modes)) ? hp.modes[idx] : :julia
+                (m, String(entry))
+            end
+            cmd = String(rstrip(content))
+            if mode_sym == :julia && _is_valid_user_cmd(cmd)
+                push!(cmds, cmd)
+            end
+        end
+        !isempty(cmds) && return cmds
+    end
+
+    hist_path = joinpath(homedir(), ".julia", "logs", "repl_history.jl")
+    !isfile(hist_path) && return String[]
+    sz = filesize(hist_path)
+    pos = clamp(_record_start_pos[], Int64(0), Int64(sz))
+    content = try
+        open(hist_path, "r") do f
+            seek(f, pos)
+            read(f, String)
+        end
+    catch
+        return String[]
+    end
+    return _parse_history_blocks(content)
 end
 
 """
@@ -1127,9 +1289,7 @@ function record_stop(; save::Bool = true)
     end
     _recording[] = false
     _update_repl_prompt!()
-    all_cmds = get_recent_commands(limit = 1000)
-    start_i = min(_record_start_idx[], length(all_cmds))
-    cmds = (start_i <= length(all_cmds)) ? all_cmds[start_i:end] : String[]
+    cmds = _recorded_commands_since_start()
     cmds = filter(c -> !occursin("record_stop", c) && !occursin("@jemach stop", c), cmds)
     return make_procedure(_record_name[]; commands = cmds, save = save)
 end
@@ -1393,7 +1553,7 @@ function _serialize_dod(t::WorkspaceTable, packages_data::Vector)::String
     end
 
     write(buf, "],\"history\":[")
-    recent_cmds = get_recent_commands(limit = 60)
+    recent_cmds = get_recent_commands(limit = HISTORY_LIMIT)
     for (i, cmd) in enumerate(recent_cmds)
         _write_json_str(buf, cmd)
         i < length(recent_cmds) && write(buf, ',')
@@ -2092,7 +2252,7 @@ function _clear_repl_input_area(s)
     end
 end
 
-function _repl_eval(code::AbstractString; silent::Bool = false)
+function _repl_eval(code::AbstractString; silent::Bool = false, record_history::Bool = true)
     clean_code = strip(String(code))
     isempty(clean_code) && return
 
@@ -2118,7 +2278,7 @@ function _repl_eval(code::AbstractString; silent::Bool = false)
         println(stdout, "\njulia> ", clean_code)
     end
 
-    _append_repl_history(clean_code)
+    record_history && _append_repl_history(clean_code)
 
     try
         ex = Meta.parseall(clean_code)
@@ -2191,7 +2351,8 @@ function _handle_socket_message(line::AbstractString)
     cmd = get(msg, "cmd", get(msg, "action", ""))
     return if cmd == "eval"
         code = string(get(msg, "code", ""))
-        @async _repl_eval(code; silent = false)
+        rec_hist = Bool(get(msg, "history", true))
+        @async _repl_eval(code; silent = false, record_history = rec_hist)
     elseif cmd == "eval_silent"
         code = string(get(msg, "code", ""))
         @async _repl_eval(code; silent = true)
