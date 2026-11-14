@@ -40,11 +40,6 @@ const _hist_cache_pos = Ref{Int64}(-1)
 const _hist_cache_limit = Ref{Int}(-1)
 const _hist_cache_cmds = String[]
 
-function _invalidate_hist_cache!()
-    _hist_cache_size[] = -1
-    return nothing
-end
-
 function _parse_history_blocks_julia(content::AbstractString)::Vector{String}
     commands = String[]
     current_block = String[]
@@ -111,7 +106,155 @@ end
 
 _parse_history_blocks(content::AbstractString)::Vector{String} = _parse_history_blocks_julia(content)
 
+const _split_cache_hp_len = Ref{Int}(-1)
+const _split_cache_hp_start = Ref{Int}(-1)
+const _split_cache_mtime = Ref{Float64}(-1.0)
+const _split_cache_sz = Ref{Int64}(-1)
+const _split_cache_limit = Ref{Int}(-1)
+const _split_cache_cmds = String[]
+const _split_cache_prev_count = Ref{Int}(0)
+
+function _invalidate_hist_cache!()
+    _hist_cache_size[] = -1
+    _split_cache_sz[] = -1
+    _split_cache_hp_len[] = -1
+    return nothing
+end
+
+function _extract_provider_entry(hp, idx::Int)::Tuple{Symbol, String}
+    hist = hp.history
+    if isdefined(REPL, :History) && isdefined(REPL.History, :HistoryFile) && hist isa REPL.History.HistoryFile
+        e = hist[idx]
+        return (e.mode, String(rstrip(String(e.content))))
+    else
+        m = (hasproperty(hp, :modes) && idx <= length(hp.modes)) ? hp.modes[idx] : :julia
+        return (m, String(rstrip(String(hist[idx]))))
+    end
+end
+
+function _collect_provider_range(hp, lo::Int, hi::Int, max_n::Int)::Vector{String}
+    (max_n <= 0 || hi < lo) && return String[]
+    collected = String[]
+    for idx in hi:-1:lo
+        mode, cmd = try
+            _extract_provider_entry(hp, idx)
+        catch
+            continue
+        end
+        if mode == :julia && _is_valid_user_cmd(cmd)
+            push!(collected, cmd)
+            length(collected) >= max_n && break
+        end
+    end
+    reverse!(collected)
+    return collected
+end
+
+function _read_history_slice(hist_path::AbstractString, pos::Int64, len::Int, skip_partial::Bool, limit::Int)::Vector{String}
+    (len <= 0 || limit <= 0) && return String[]
+    buf = Vector{UInt8}(undef, len)
+    ok = try
+        open(hist_path, "r") do f
+            pos > 0 && seek(f, pos)
+            read!(f, buf)
+        end
+        true
+    catch
+        false
+    end
+    !ok && return String[]
+    return _parse_history_bytes(buf, skip_partial, limit)
+end
+
+"""
+    get_split_history(; limit = HISTORY_LIMIT) -> (; commands::Vector{String}, prev_count::Int)
+
+Return recent Julia REPL commands split into previous-session commands (`1:prev_count`)
+and current-session commands (`(prev_count + 1):end`). Uses the live `REPLHistoryProvider`
+session boundary (`start_idx`) when available, falling back to `HIST_START_POS[]`.
+"""
+function get_split_history(; limit::Int = HISTORY_LIMIT)
+    limit <= 0 && return (commands = String[], prev_count = 0)
+
+    hp = _active_history_provider()
+    if !isnothing(hp) && hasproperty(hp, :start_idx)
+        n_hist = try
+            length(hp.history)
+        catch
+            0
+        end
+        if n_hist > 0
+            split_idx = clamp(Int(hp.start_idx), 0, n_hist)
+            return lock(_hist_cache_lock) do
+                if _split_cache_hp_len[] == n_hist &&
+                        _split_cache_hp_start[] == split_idx &&
+                        _split_cache_limit[] == limit &&
+                        _split_cache_mtime[] == -2.0
+                    return (commands = copy(_split_cache_cmds), prev_count = _split_cache_prev_count[])
+                end
+                curr_cmds = _collect_provider_range(hp, split_idx + 1, n_hist, limit)
+                rem_cap = max(0, limit - length(curr_cmds))
+                prev_cmds = _collect_provider_range(hp, 1, split_idx, rem_cap)
+                all_cmds = vcat(prev_cmds, curr_cmds)
+                prev_n = length(prev_cmds)
+                _split_cache_hp_len[] = n_hist
+                _split_cache_hp_start[] = split_idx
+                _split_cache_limit[] = limit
+                _split_cache_mtime[] = -2.0
+                empty!(_split_cache_cmds)
+                append!(_split_cache_cmds, all_cmds)
+                _split_cache_prev_count[] = prev_n
+                return (commands = copy(all_cmds), prev_count = prev_n)
+            end
+        end
+    end
+
+    hist_path = _history_path()
+    st = try
+        stat(hist_path)
+    catch
+        return (commands = String[], prev_count = 0)
+    end
+    !isfile(st) && return (commands = String[], prev_count = 0)
+    sz = Int64(st.size)
+    sz == 0 && return (commands = String[], prev_count = 0)
+    start_pos = clamp(Int64(HIST_START_POS[]), Int64(0), sz)
+
+    return lock(_hist_cache_lock) do
+        if _split_cache_hp_len[] == -1 &&
+                _split_cache_mtime[] == st.mtime &&
+                _split_cache_sz[] == sz &&
+                _split_cache_hp_start[] == Int(start_pos) &&
+                _split_cache_limit[] == limit
+            return (commands = copy(_split_cache_cmds), prev_count = _split_cache_prev_count[])
+        end
+
+        curr_cmds = _read_history_slice(hist_path, start_pos, Int(sz - start_pos), false, limit)
+        rem_cap = max(0, limit - length(curr_cmds))
+        prev_from = max(Int64(0), start_pos - Int64(_HIST_READ_CAP))
+        prev_cmds = (rem_cap > 0 && start_pos > 0) ?
+            _read_history_slice(hist_path, prev_from, Int(start_pos - prev_from), prev_from > 0, rem_cap) :
+            String[]
+
+        all_cmds = vcat(prev_cmds, curr_cmds)
+        prev_n = length(prev_cmds)
+        _split_cache_hp_len[] = -1
+        _split_cache_mtime[] = st.mtime
+        _split_cache_sz[] = sz
+        _split_cache_hp_start[] = Int(start_pos)
+        _split_cache_limit[] = limit
+        empty!(_split_cache_cmds)
+        append!(_split_cache_cmds, all_cmds)
+        _split_cache_prev_count[] = prev_n
+        return (commands = copy(all_cmds), prev_count = prev_n)
+    end
+end
+
 function get_recent_commands(; limit::Int = 50, session_only::Bool = false)::Vector{String}
+    if session_only
+        sp = get_split_history(; limit = limit)
+        return sp.prev_count < length(sp.commands) ? sp.commands[(sp.prev_count + 1):end] : String[]
+    end
     hist_path = _history_path()
     st = try
         stat(hist_path)

@@ -105,9 +105,10 @@ See [docs/src/startup.md](docs/src/startup.md) for advanced configuration.
 The TUI provides 4 dedicated panels accessible via `1`, `2`, `3`, `4` or `Tab`:
 
 - **`[1] Workspace`**: Real-time Data-Oriented tree view of variables, matrices, dataframes, structs, and modules.
-- **`[2] History`**: REPL session command log with multi-select checkboxes (`Space`) to package commands into reusable procedures (`p`).
-- **`[3] Procedures`**: Library of saved procedures with live split-view source code preview, run execution benchmarks (`Enter`), and REPL parameter editing (`e`).
+- **`[2] History`**: REPL session command log separating **Previous Sessions** (folded by default with `h`/`l`/`H`) from the **Current Session**, with pass/fail markers (`✓`/`✗`), multi-select (`Space`), full preview (`v`), and procedure creation (`p`).
+- **`[3] Procedures`**: Saved procedures and recent failed REPL commands (`✗ ERR` / failed command log), with scrollable wrapped code + error/traceback preview (`J`/`K`, `v`), argument-prompting or one-key execution (`Enter`), and REPL editing (`e`).
 - **`[4] Packages`**: Interactive project package manager (`a` add, `d` remove, `u` update).
+- **`[?] Guide`**: Built-in English quick-reference tab (toggled with `?`) covering global Julia REPL shortcuts/modes, `jemach>` commands, macros/API functions, and TUI shortcuts.
 
 ---
 
@@ -142,7 +143,8 @@ using jEMach
 # jemach> ls                                  # List procedures
 # jemach> ws [query]                          # Workspace summary table
 # jemach> inspect my_var                      # Variable type, size, fields, methods
-# jemach> show check_sample                   # Source code, signature & timings
+# jemach> show check_sample                   # Source code, signature, errors & timings
+# jemach> errors                              # Show errored procedures & recent failed commands
 # jemach> run check_sample(10)                # Run procedure with args
 # jemach> make my_proc 4                      # Package last 4 commands
 # jemach> rec my_flow                         # Start/stop recording (or Alt+r)
@@ -177,31 +179,37 @@ jEMach.find_procedures("sample")
 
 ## TUI Keybindings
 
-| Key                      | Context    | Action                                                                        |
-| :----------------------- | :--------- | :---------------------------------------------------------------------------- |
-| `/`                      | Global     | **Search & Live Filter** (procedures, workspace variables, history, packages) |
-| `Esc` / `x`              | Global     | Clear search filter and restore full list                                     |
-| `1` / `2` / `3` / `4`    | Global     | Jump directly to Workspace / History / Procedures / Packages                  |
-| `Tab` / `]` / `[`        | Global     | Cycle to next / previous tab                                                  |
-| `j` / `k` (or `↓` / `↑`) | Global     | Move cursor down / up                                                         |
-| `Space`                  | History    | Toggle selection `[x]` / `[ ]` on command                                     |
-| `a`                      | History    | Toggle select all / clear all                                                 |
-| `p`                      | History    | **Make Procedure** from selected commands (opens modal prompt)                |
-| `↵` (Enter)              | History    | Send highlighted command to REPL                                              |
-| `↵` (Enter)              | Procedures | Run highlighted procedure with benchmark profiling                            |
-| `e`                      | Procedures | Paste `<proc_name>()` into REPL line to customize parameters                  |
-| `d`                      | Procedures | Delete procedure file from disk (with in-TUI confirmation)                    |
-| `r`                      | Procedures | Reload procedure definitions from disk                                        |
-| `l` / `↵` (Enter)        | Workspace  | Expand node **or** evaluate `println(var)` in REPL                            |
-| `h` (or `←`)             | Workspace  | Collapse node / jump to parent                                                |
-| `i`                      | Workspace  | Inspect variable details, methods, and creation history                       |
-| `e`                      | Workspace  | Insert variable expression directly into REPL command line                    |
-| `d`                      | Workspace  | Hide item from view                                                           |
-| `D`                      | Workspace  | Restore all hidden items                                                      |
-| `s`                      | Workspace  | Save clean reproducible session script                                        |
-| `a` / `d` / `u`          | Packages   | Add / Remove / Update package (in-TUI dialogs)                                |
-| `c`                      | Global     | Clear REPL screen (`Ctrl-L`)                                                  |
-| `q` / `Ctrl-C`           | Global     | Quit assistant                                                                |
+| Key                      | Context            | Action                                                                        |
+| :----------------------- | :----------------- | :---------------------------------------------------------------------------- |
+| `/`                      | Global             | **Search & Live Filter** (procedures, errors, workspace, history, guide)      |
+| `Esc` / `x`              | Global             | Clear search filter (`Esc` on empty Guide closes the Guide tab)               |
+| `?`                      | Global             | Open / toggle **`[?] Guide`** reference tab (REPL & TUI commands)             |
+| `1` / `2` / `3` / `4`    | Global             | Jump directly to Workspace / History / Procedures / Packages                  |
+| `Tab` / `]` / `[`        | Global             | Cycle to next / previous tab                                                  |
+| `j` / `k` (or `↓` / `↑`) | Global             | Move cursor down / up (`g`/`G` top/bottom, `PgUp`/`PgDn` page)                |
+| `Space`                  | History            | Toggle Previous Sessions fold (on header) or command selection `[✓]`          |
+| `h` / `l` / `H`          | History            | Collapse / expand Previous Sessions history block                             |
+| `a`                      | History            | Toggle select all / clear all                                                 |
+| `p`                      | History            | **Make Procedure** from selected commands (opens modal prompt)                |
+| `v`                      | History/Procedures | Open **Full Detail Viewer** (complete entered command + error/stacktrace)     |
+| `e`                      | History            | Paste highlighted command into REPL for editing                               |
+| `↵` (Enter)              | History            | Send highlighted command to REPL (or toggle fold on header)                   |
+| `↵` (Enter)              | Procedures         | Run highlighted procedure (prompts if args required) or re-run failed command |
+| `J` / `K`                | Procedures         | Scroll split preview pane down / up                                           |
+| `e`                      | Procedures         | Paste `<proc_name>()` or failed command into REPL to edit                     |
+| `d`                      | Procedures         | Delete procedure file from disk **or** dismiss selected failed command        |
+| `D`                      | Procedures         | Clear all captured failed commands                                            |
+| `r`                      | Procedures         | Reload procedure definitions from disk                                        |
+| `l` / `↵` (Enter)        | Workspace          | Expand node **or** evaluate `println(var)` in REPL                            |
+| `h` (or `←`)             | Workspace          | Collapse node / jump to parent                                                |
+| `i`                      | Workspace          | Inspect variable details, methods, and creation history                       |
+| `e`                      | Workspace          | Insert variable expression directly into REPL command line                    |
+| `d`                      | Workspace          | Hide item from view                                                           |
+| `D`                      | Workspace          | Restore all hidden items                                                      |
+| `s`                      | Workspace          | Save clean reproducible session script                                        |
+| `a` / `d` / `u`          | Packages           | Add / Remove / Update package (in-TUI dialogs)                                |
+| `c`                      | Global             | Clear REPL screen (`Ctrl-L`)                                                  |
+| `q` / `Ctrl-C`           | Global             | Quit assistant                                                                |
 
 ---
 

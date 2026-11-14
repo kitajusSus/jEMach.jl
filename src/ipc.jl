@@ -89,14 +89,73 @@ function _serialize_dod_body(t::WorkspaceTable, packages_data::Vector)::String
         _write_json_str(buf, string(p.last_run_status), dst_buf)
         write(buf, ",\"last_run\":")
         _write_json_str(buf, p.last_run_at, dst_buf)
+        write(buf, ",\"last_run_cmd\":")
+        _write_json_str(buf, p.last_run_cmd, dst_buf)
+        write(buf, ",\"last_error\":")
+        _write_json_str(buf, p.last_error, dst_buf)
+        write(buf, ",\"last_error_detail\":")
+        _write_json_str(buf, p.last_error_detail, dst_buf)
+        write(buf, ",\"last_error_line\":")
+        print(buf, p.last_error_line)
+        write(buf, ",\"last_error_cmd\":")
+        _write_json_str(buf, p.last_error_cmd, dst_buf)
+        needs_args = false
+        if Base.invokelatest(isdefined, Main, p.name)
+            fn_obj = try Base.invokelatest(getfield, Main, p.name) catch; nothing end
+            if fn_obj isa Function
+                needs_args = !Base.invokelatest(hasmethod, fn_obj, Tuple{})
+            end
+        else
+            m_sig = match(r"^[^(]+\((.*)\)$"s, strip(p.signature))
+            if !isnothing(m_sig)
+                inner_sig = strip(m_sig.captures[1])
+                !isempty(inner_sig) && !startswith(inner_sig, ";") && !occursin("=", inner_sig) && (needs_args = true)
+            end
+        end
+        write(buf, ",\"needs_args\":")
+        write(buf, needs_args ? "true" : "false")
         write(buf, '}')
     end
 
+    write(buf, "],\"failed_commands\":[")
+    for (i, fc) in enumerate(_failed_commands)
+        i > 1 && write(buf, ',')
+        write(buf, "{\"id\":")
+        print(buf, fc.id)
+        write(buf, ",\"cmd\":")
+        _write_json_str(buf, fc.cmd, dst_buf)
+        write(buf, ",\"source\":")
+        _write_json_str(buf, fc.source, dst_buf)
+        write(buf, ",\"proc_name\":")
+        _write_json_str(buf, fc.proc_name, dst_buf)
+        write(buf, ",\"error\":")
+        _write_json_str(buf, fc.error_msg, dst_buf)
+        write(buf, ",\"error_detail\":")
+        _write_json_str(buf, fc.error_detail, dst_buf)
+        write(buf, ",\"error_line\":")
+        print(buf, fc.error_line)
+        write(buf, ",\"failed_stmt\":")
+        _write_json_str(buf, fc.failed_stmt, dst_buf)
+        write(buf, ",\"timestamp\":")
+        _write_json_str(buf, fc.timestamp, dst_buf)
+        write(buf, '}')
+    end
+
+    split_hist = get_split_history(limit = HISTORY_LIMIT)
+    recent_cmds = split_hist.commands
     write(buf, "],\"history\":[")
-    recent_cmds = get_recent_commands(limit = HISTORY_LIMIT)
     for (i, cmd) in enumerate(recent_cmds)
         i > 1 && write(buf, ',')
         _write_json_str(buf, cmd, dst_buf)
+    end
+    write(buf, "],\"history_prev_count\":")
+    print(buf, split_hist.prev_count)
+    write(buf, ",\"history_statuses\":[")
+    for (i, cmd) in enumerate(recent_cmds)
+        i > 1 && write(buf, ',')
+        st_sym = get(_cmd_outcomes, String(strip(cmd)), :unknown)
+        st_str = st_sym == :ok ? "ok" : st_sym == :error ? "error" : ""
+        _write_json_str(buf, st_str, dst_buf)
     end
     write(buf, "]}")
     return String(take!(buf))
@@ -152,12 +211,20 @@ function _repl_eval(code::AbstractString; silent::Bool = false, record_history::
     end
 
     record_history && _append_repl_history(clean_code)
+    is_proc_runner = startswith(clean_code, "jEMach.run_procedure(")
+    is_internal = startswith(clean_code, "jEMach.inspect_var(") ||
+        startswith(clean_code, "jEMach.save_clean_session(")
 
     try
-        val = Base.invokelatest(Core.eval, Main, Meta.parseall(clean_code))
+        parsed_ast = Meta.parseall(clean_code; filename = "REPL[TUI]")
+        val = Base.invokelatest(Core.eval, Main, parsed_ast)
         try
             Core.eval(Main, Expr(:(=), :ans, QuoteNode(val)))
         catch
+        end
+
+        if !is_proc_runner && !is_internal
+            _record_command_outcome!(clean_code, true; source = "tui")
         end
 
         is_self_printing = startswith(clean_code, "println(") ||
@@ -169,8 +236,12 @@ function _repl_eval(code::AbstractString; silent::Bool = false, record_history::
             println(stdout)
         end
     catch e
-        Base.invokelatest(Base.showerror, stdout, e, catch_backtrace())
+        bt = catch_backtrace()
+        Base.invokelatest(Base.showerror, stdout, e, bt)
         println(stdout)
+        if !(is_proc_runner && !(e isa Base.Meta.ParseError))
+            _record_command_outcome!(clean_code, false, e, bt; source = "tui")
+        end
     end
 
     println(stdout)

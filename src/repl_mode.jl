@@ -1,20 +1,21 @@
 # Shared REPL command dispatcher, `@jemach` & `@inspect` macros, and `jemach>` mode.
 
 const _JEMACH_COMMANDS = [
-    "help", "ui", "toggle", "open", "close", "ws", "vars", "ls", "find", "show",
-    "run", "make", "rec", "stop", "inspect", "save", "reload", "status", "shutdown",
+    "help", "ui", "toggle", "open", "close", "clear", "ws", "vars", "ls", "find", "show",
+    "run", "make", "rec", "stop", "inspect", "errors", "save", "reload", "status", "shutdown",
 ]
 
 function _print_jemach_help(io::IO = stdout)
     bold, cyan, dim, reset = "\e[1m", "\e[36m", "\e[2m", "\e[0m"
     rows = [
         ("ui | toggle", "Toggle the TUI split/window (also Alt+j)"),
-        ("open | close", "Open / close the TUI panel"),
+        ("open | close | clear", "Open / close TUI, or clear REPL screen (clear())"),
         ("ws [filter]", "Workspace table with memory sizes (also `workspace()`)"),
         ("ls [query] | find <q>", "List / search saved procedures"),
-        ("show <name>", "Show a procedure card with its source"),
-        ("run <name> [args...]", "Run a procedure with profiling (`run f(1, x=2)` works too)"),
-        ("<name> [args...]", "Shortcut: run an existing procedure directly"),
+        ("show <name>", "Show a procedure card with status, errors & source"),
+        ("errors", "Show recent failed commands and errored procedures"),
+        ("run <name>(args...)", "Run a procedure with profiling (args space- or comma-sep)"),
+        ("<name>(args...)", "Shortcut: run an existing procedure directly"),
         ("make <name> [N]", "Create a procedure from the last N commands (default 5)"),
         ("rec [name] | stop", "Start / stop recording a procedure (also Alt+r)"),
         ("inspect <expr> | i <expr>", "Deep inspection of a variable/function"),
@@ -26,6 +27,32 @@ function _print_jemach_help(io::IO = stdout)
     println(io, bold * cyan * "jEMach REPL mode" * reset * dim * "  (Backspace on empty line → julia>, Tab completes)" * reset)
     for (c, d) in rows
         println(io, "  " * cyan * rpad(c, 26) * reset * " " * d)
+    end
+    return nothing
+end
+
+function _print_errors_summary(io::IO = stdout)
+    bold, red, cyan, yellow, dim, reset = "\e[1m", "\e[31m", "\e[36m", "\e[33m", "\e[2m", "\e[0m"
+    err_procs = [p for p in sort(collect(values(_procedures)), by = x -> string(x.name)) if p.last_run_status == :error]
+    if isempty(err_procs) && isempty(_failed_commands)
+        println(io, dim * "No failed procedures or failed REPL commands recorded in this session." * reset)
+        return nothing
+    end
+    if !isempty(err_procs)
+        println(io, bold * red * "Errored Procedures ($(length(err_procs))):" * reset)
+        for p in err_procs
+            loc = p.last_error_line > 0 ? " [L$(p.last_error_line)]" : ""
+            println(io, "  " * red * "✗ " * cyan * string(p.name) * reset * yellow * loc * reset * " — " * red * p.last_error * reset)
+            !isempty(p.last_run_cmd) && println(io, "    " * dim * "call: " * reset * p.last_run_cmd)
+        end
+    end
+    if !isempty(_failed_commands)
+        println(io, bold * red * "Failed REPL Commands ($(length(_failed_commands))):" * reset)
+        for fc in _failed_commands
+            first_line = _truncate_chars(replace(fc.cmd, '\n' => " ⏎ "), 70)
+            println(io, "  " * red * "✗ " * reset * bold * first_line * reset * dim * " ($(fc.timestamp))" * reset)
+            println(io, "    " * red * fc.error_msg * reset)
+        end
     end
     return nothing
 end
@@ -70,7 +97,7 @@ function _run_expr(target)
 end
 
 function _run_from_string(rest::AbstractString)
-    s = strip(rest)
+    s = replace(strip(rest), r"^([A-Za-z_][A-Za-z0-9_!]*)\s+\(" => s"\1(")
     target = try
         Meta.parse(s)
     catch
@@ -95,50 +122,62 @@ Execute one `jemach>` command line. Returns a value only when it is worth displa
 function _exec_command(line::AbstractString)
     s = strip(line)
     isempty(s) && return nothing
-    m = match(r"^(\S+)\s*(.*)$"s, s)
-    cmd = lowercase(m.captures[1])
-    rest = String(strip(m.captures[2]))
 
-    if cmd in ("help", "?", "h")
+    m_call = match(r"^([A-Za-z_][A-Za-z0-9_!]*)\s*\((.*)\)\s*$"s, s)
+    m_ws = match(r"^(\S+)\s*(.*)$"s, s)
+    raw_head = !isnothing(m_call) ? String(m_call.captures[1]) : String(m_ws.captures[1])
+    cmd = lowercase(raw_head)
+    rest = if !isnothing(m_call)
+        String(strip(m_call.captures[2]))
+    else
+        String(strip(m_ws.captures[2]))
+    end
+    is_proc_call = !isnothing(m_call) && !isempty(rest)
+
+    if !is_proc_call && cmd in ("help", "?", "h")
         _print_jemach_help()
-    elseif cmd in ("ui", "toggle")
+    elseif !is_proc_call && cmd in ("ui", "toggle")
         toggle()
-    elseif cmd == "open"
+    elseif !is_proc_call && cmd == "open"
         _is_tui_open() ? println("TUI is already open.") : ui()
-    elseif cmd == "close"
+    elseif !is_proc_call && cmd == "close"
         _is_tui_open() ? toggle() : println("TUI is not open.")
-    elseif cmd in ("ws", "vars", "workspace")
+    elseif !is_proc_call && cmd in ("clear", "cls")
+        _repl_clear()
+    elseif cmd in ("ws", "vars", "workspace") && isnothing(m_call)
         workspace(rest)
-    elseif cmd in ("ls", "list", "procs", "find", "search")
+    elseif cmd in ("ls", "list", "procs", "find", "search") && isnothing(m_call)
         list_procedures(rest)
-    elseif cmd == "show"
+    elseif cmd == "show" && isnothing(m_call)
         isempty(rest) && throw(ArgumentError("usage: show <procedure>"))
         _load_procedures!()
         sym = Symbol(rest)
         haskey(_procedures, sym) || throw(ArgumentError("no procedure named '$rest'"))
         return _procedures[sym]
-    elseif cmd == "run"
+    elseif cmd == "run" && isnothing(m_call)
         isempty(rest) && throw(ArgumentError("usage: run <name> [args...]  or  run name(args...)"))
         return _run_from_string(rest)
-    elseif cmd == "make"
+    elseif cmd == "make" && isnothing(m_call)
         parts = split(rest)
         isempty(parts) && throw(ArgumentError("usage: make <name> [N]"))
         n = length(parts) >= 2 ? something(tryparse(Int, parts[2]), 0) : 0
         make_procedure(Symbol(parts[1]); last = n)
-    elseif cmd in ("rec", "record")
+    elseif cmd in ("rec", "record") && isnothing(m_call)
         record(isempty(rest) ? _next_proc_name() : Symbol(rest))
-    elseif cmd in ("stop", "record_stop")
+    elseif !is_proc_call && cmd in ("stop", "record_stop")
         _recording[] ? record_stop() : println("No recording in progress (use `shutdown` to stop the jEMach watcher).")
-    elseif cmd in ("inspect", "i")
+    elseif cmd in ("inspect", "i") && isnothing(m_call)
         isempty(rest) && throw(ArgumentError("usage: inspect <expr>"))
         inspect_var(Main, rest)
-    elseif cmd == "save"
+    elseif !is_proc_call && cmd in ("errors", "errs", "failed")
+        _print_errors_summary()
+    elseif !is_proc_call && cmd == "save"
         save_clean_session()
-    elseif cmd in ("reload", "autoload")
+    elseif !is_proc_call && cmd in ("reload", "autoload")
         autoload_procedures!()
         publish_state()
         println("✓ Loaded $(length(_procedures)) procedure(s) into Main")
-    elseif cmd in ("status", "info")
+    elseif !is_proc_call && cmd in ("status", "info")
         status()
         info = terminal_info()
         for k in (:term, :term_program, :tmux, :zellij, :kitty, :ghostty, :rex)
@@ -146,12 +185,13 @@ function _exec_command(line::AbstractString)
         end
         println("  ", rpad("procedures", 14), length(_procedures), "   recording: ", _recording[] ? string(_record_name[]) : "no")
         println("  ", rpad("tui open", 14), _is_tui_open())
-    elseif cmd in ("shutdown", "quit")
+    elseif !is_proc_call && cmd in ("shutdown", "quit")
         stop()
     else
         _load_procedures!()
-        haskey(_procedures, Symbol(m.captures[1])) && return _run_from_string(s)
-        println("Unknown jemach command '$(m.captures[1])'. Type `help` for the list of commands.")
+        proc_sym = Symbol(raw_head)
+        haskey(_procedures, proc_sym) && return _run_from_string(s)
+        println("Unknown jemach command '$(m_ws.captures[1])'. Type `help` for the list of commands.")
     end
     return nothing
 end
@@ -212,12 +252,14 @@ function _main_symbol_names()::Vector{String}
 end
 
 function _jemach_completions(partial::AbstractString)
-    wm = match(r"(\S*)$", partial)
+    wm = match(r"([A-Za-z0-9_!@]*)$", partial)
     word = isnothing(wm) ? "" : String(wm.captures[1])
     before = String(codeunits(partial)[1:(ncodeunits(partial) - ncodeunits(word))])
     words_before = split(before)
     proc_names = String[string(k) for k in keys(_procedures)]
-    cands = if isempty(words_before)
+    cands = if occursin('(', before)
+        _main_symbol_names()
+    elseif isempty(words_before)
         vcat(_JEMACH_COMMANDS, proc_names)
     else
         c = lowercase(words_before[1])
@@ -262,12 +304,66 @@ function _toggle_recording_key(s)
     return :ok
 end
 
+const _hooked_repl_prompts = WeakKeyDict{Any, Bool}()
+
+function _install_repl_error_hook!(repl, main::LineEdit.Prompt)
+    get(_hooked_repl_prompts, main, false) && return nothing
+    orig_on_done = main.on_done
+    _hooked_repl_prompts[main] = true
+
+    main.on_done = function (s, buf, ok)
+        line = ""
+        if ok && buf isa IOBuffer
+            try
+                b_copy = copy(buf)
+                seekstart(b_copy)
+                line = read(b_copy, String)
+            catch
+                line = ""
+            end
+        end
+        prev_err = isdefined(Base.MainInclude, :err) ? getfield(Base.MainInclude, :err) : nothing
+        has_waserr = hasproperty(repl, :waserror)
+        if has_waserr
+            try
+                repl.waserror = false
+            catch
+            end
+        end
+
+        res = orig_on_done(s, buf, ok)
+
+        if ok && !isempty(strip(line))
+            try
+                was_err = has_waserr ? Bool(repl.waserror) : false
+                new_err = isdefined(Base.MainInclude, :err) ? getfield(Base.MainInclude, :err) : nothing
+                is_proc_runner = startswith(strip(line), "jEMach.run_procedure(")
+                if was_err
+                    err_stack = (new_err !== prev_err && !isnothing(new_err)) ? new_err : nothing
+                    is_stack = !isnothing(err_stack) && err_stack isa Base.ExceptionStack
+                    if !(is_proc_runner && !isnothing(err_stack))
+                        Base.invokelatest(_record_command_outcome!, line, false, err_stack, nothing; source = "repl", is_stack = is_stack)
+                    end
+                elseif !is_proc_runner
+                    Base.invokelatest(_record_command_outcome!, line, true; source = "repl")
+                end
+                @async (sleep(0.02); Base.invokelatest(publish_state))
+            catch
+            end
+        end
+        return res
+    end
+    return nothing
+end
+
 function _install_jemach_mode!(repl)
     (hasproperty(repl, :interface) && isdefined(repl, :interface)) || return nothing
     iface = repl.interface
     any(m -> m isa LineEdit.Prompt && m.complete isa JEMachCompletionProvider, iface.modes) && return nothing
     main = iface.modes[1]
     main isa LineEdit.Prompt || return nothing
+
+    _install_repl_error_hook!(repl, main)
 
     jm = LineEdit.Prompt(
         "jemach> ";
