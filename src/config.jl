@@ -24,6 +24,16 @@ _history_path()::String = get(ENV, "JULIA_HISTORY", joinpath(homedir(), ".julia"
 const _zig_lib_handle = Ref{Ptr{Nothing}}(C_NULL)
 const _zig_parse_history_ptr = Ref{Ptr{Nothing}}(C_NULL)
 const _zig_escape_json_ptr = Ref{Ptr{Nothing}}(C_NULL)
+const _zig_proc_scan_ptr = Ref{Ptr{Nothing}}(C_NULL)
+
+struct _ZigProcScanResult
+    content_hash::UInt64
+    body_start::UInt32
+    body_end::UInt32
+    func_line::UInt32
+    has_doc::UInt8
+    has_imports::UInt8
+end
 
 function _load_zig_native!()::Bool
     _zig_lib_handle[] != C_NULL && return true
@@ -34,9 +44,11 @@ function _load_zig_native!()::Bool
         h = Base.Libc.Libdl.dlopen(lib_path)
         p_hist = Base.Libc.Libdl.dlsym(h, :jemach_parse_history_buf; throw_error = false)
         p_json = Base.Libc.Libdl.dlsym(h, :jemach_escape_json_str; throw_error = false)
+        p_scan = Base.Libc.Libdl.dlsym(h, :jemach_proc_scan_source; throw_error = false)
         _zig_lib_handle[] = h
         _zig_parse_history_ptr[] = isnothing(p_hist) ? C_NULL : p_hist
         _zig_escape_json_ptr[] = isnothing(p_json) ? C_NULL : p_json
+        _zig_proc_scan_ptr[] = isnothing(p_scan) ? C_NULL : p_scan
         true
     catch
         false

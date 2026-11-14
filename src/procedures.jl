@@ -15,6 +15,16 @@ mutable struct ProcedureInfo
     last_error_detail::String
     last_error_line::Int
     last_error_cmd::String
+    origin::Symbol # :disk, :modified, :live, :unloaded
+    disk_code::String
+    live_code::String
+    edit_code::String
+    imports_block::String
+    disk_hash::UInt64
+    live_hash::UInt64
+    generation::Int
+    last_args_str::String
+    func_start_line::Int
 end
 
 function ProcedureInfo(
@@ -26,12 +36,24 @@ function ProcedureInfo(
         last_run_time_ms::Real,
         last_run_alloc_bytes::Integer,
         last_run_status::Symbol,
-        last_run_at::AbstractString,
+        last_run_at::AbstractString;
+        origin::Symbol = isempty(file) ? :live : :disk,
+        disk_code::AbstractString = isempty(file) ? "" : code,
+        live_code::AbstractString = code,
+        edit_code::AbstractString = code,
+        imports_block::AbstractString = "",
+        disk_hash::UInt64 = UInt64(0),
+        live_hash::UInt64 = UInt64(0),
+        generation::Int = 1,
+        last_args_str::AbstractString = "",
+        func_start_line::Int = 1,
     )
     return ProcedureInfo(
         name, String(signature), String(file), String(doc), String(code),
         Float64(last_run_time_ms), Int(last_run_alloc_bytes), last_run_status, String(last_run_at),
-        "", "", "", 0, ""
+        "", "", "", 0, "",
+        origin, String(disk_code), String(live_code), String(edit_code), String(imports_block),
+        disk_hash, live_hash, generation, String(last_args_str), func_start_line
     )
 end
 
@@ -48,7 +70,7 @@ struct FailedCommandInfo
 end
 
 function Base.show(io::IO, p::ProcedureInfo)
-    print(io, "ProcedureInfo(:$(p.name), \"$(p.signature)\", status=:$(p.last_run_status))")
+    print(io, "ProcedureInfo(:$(p.name), \"$(p.signature)\", origin=:$(p.origin), status=:$(p.last_run_status))")
     return nothing
 end
 
@@ -62,15 +84,26 @@ function Base.show(io::IO, ::MIME"text/plain", p::ProcedureInfo)
     dim = use_color ? "\e[2m" : ""
     reset = use_color ? "\e[0m" : ""
 
+    origin_badge = if p.origin == :modified
+        yellow * bold * "⚡ MODIFIED (v$(p.generation))" * reset
+    elseif p.origin == :live
+        cyan * bold * "◆ LIVE (in memory)" * reset
+    elseif p.origin == :unloaded
+        dim * "○ UNLOADED" * reset
+    else
+        green * "● DISK" * reset
+    end
+
     status_badge = p.last_run_status == :ok ? (green * "✓ OK" * reset) :
         p.last_run_status == :error ? (red * "✗ ERROR" * reset) : (dim * "○ NEVER RUN" * reset)
     metrics_str = p.last_run_status != :never ?
         "$(p.last_run_time_ms) ms, $(Base.format_bytes(p.last_run_alloc_bytes)) (at $(p.last_run_at))" :
         "-"
+    file_disp = isempty(p.file) ? "(memory only)" : p.file
 
     println(io, bold * cyan * "╭─ Procedure: " * string(p.name) * " " * ("─"^max(1, 50 - length(string(p.name)))) * "╮" * reset)
-    println(io, "│ " * bold * "Signature: " * reset * cyan * p.signature * reset)
-    println(io, "│ " * bold * "File:      " * reset * p.file)
+    println(io, "│ " * bold * "Signature: " * reset * cyan * p.signature * reset * "  " * origin_badge)
+    println(io, "│ " * bold * "File:      " * reset * file_disp)
     println(io, "│ " * bold * "Status:    " * reset * status_badge * "  " * yellow * metrics_str * reset)
     !isempty(p.last_run_cmd) && println(io, "│ " * bold * "Last Call: " * reset * cyan * p.last_run_cmd * reset)
     if p.last_run_status == :error && !isempty(p.last_error)
@@ -102,6 +135,7 @@ function Base.show(io::IO, ::MIME"text/plain", p::ProcedureInfo)
 end
 
 const _procedures = Dict{Symbol, ProcedureInfo}()
+const _proc_registry_epoch = Ref{UInt64}(1)
 const _parsed_proc_mtimes = Dict{String, Float64}()
 const _parsed_proc_names = Dict{String, Symbol}()
 const _loaded_proc_mtimes = Dict{String, Float64}()
@@ -194,7 +228,7 @@ function _extract_error_line(e, st::Vector{Base.StackTraces.StackFrame}, target_
             end
         else
             sf = String(fr.file)
-            if startswith(sf, "REPL[")
+            if startswith(sf, "REPL[") || startswith(sf, "jEMach:")
                 return Int(fr.line)
             end
         end
@@ -350,6 +384,75 @@ function _find_proc_from_call(cmd::AbstractString, err = nothing, bt = nothing; 
     return nothing
 end
 
+function _extract_call_args_str(cmd::AbstractString, sym::Symbol)::String
+    s = String(strip(rstrip(String(cmd), ';')))
+    isempty(s) && return ""
+    name_str = string(sym)
+    idx = firstindex(s)
+    n_end = lastindex(s)
+    open_paren = 0
+
+    while idx <= n_end
+        rng = findnext(name_str, s, idx)
+        isnothing(rng) && break
+        before_ok = (first(rng) == firstindex(s)) || begin
+            pc = s[prevind(s, first(rng))]
+            !(isletter(pc) || isdigit(pc) || pc == '_' || pc == '!')
+        end
+        if before_ok
+            after = nextind(s, last(rng))
+            while after <= n_end && (s[after] == ' ' || s[after] == '\t')
+                after = nextind(s, after)
+            end
+            if after <= n_end && s[after] == '('
+                open_paren = after
+                break
+            end
+        end
+        idx = nextind(s, first(rng))
+    end
+
+    open_paren == 0 && return ""
+    i = nextind(s, open_paren)
+    depth = 1
+    in_dq = false
+    in_sq = false
+    escaped = false
+    close_paren = 0
+
+    while i <= n_end
+        c = s[i]
+        if escaped
+            escaped = false
+        elseif (in_dq || in_sq) && c == '\\'
+            escaped = true
+        elseif in_dq
+            c == '"' && (in_dq = false)
+        elseif in_sq
+            c == '\'' && (in_sq = false)
+        elseif c == '"'
+            in_dq = true
+        elseif c == '\''
+            in_sq = true
+        elseif c == '(' || c == '[' || c == '{'
+            depth += 1
+        elseif c == ')' || c == ']' || c == '}'
+            depth -= 1
+            if depth == 0 && c == ')'
+                close_paren = i
+                break
+            end
+        end
+        i = nextind(s, i)
+    end
+
+    close_paren == 0 && return ""
+    inner_start = nextind(s, open_paren)
+    inner_end = prevind(s, close_paren)
+    inner_start > inner_end && return ""
+    return String(strip(SubString(s, inner_start, inner_end)))
+end
+
 function _record_command_outcome!(
         cmd::AbstractString,
         ok::Bool,
@@ -368,6 +471,10 @@ function _record_command_outcome!(
     if !isnothing(matched_proc)
         matched_proc.last_run_at = now_str
         matched_proc.last_run_cmd = _truncate_chars(clean_cmd, 300)
+        args_s = _extract_call_args_str(clean_cmd, matched_proc.name)
+        if !isempty(args_s) || !(err isa MethodError)
+            matched_proc.last_args_str = _truncate_chars(args_s, 200)
+        end
         if ok
             matched_proc.last_run_status = :ok
             matched_proc.last_error = ""
@@ -375,7 +482,7 @@ function _record_command_outcome!(
             matched_proc.last_error_line = 0
             matched_proc.last_error_cmd = ""
         else
-            full_p = isempty(matched_proc.file) ? "" : joinpath(_get_project_dir(), matched_proc.file)
+            full_p = (matched_proc.origin in (:modified, :live) || isempty(matched_proc.file)) ? "" : joinpath(_get_project_dir(), matched_proc.file)
             summary, detail, err_line, err_stmt = if is_stack && !isnothing(err)
                 _format_exception_stack(err; target_file = full_p, source_code = matched_proc.code)
             elseif !isnothing(err)
@@ -437,173 +544,358 @@ function _clear_failed_commands!()
     return nothing
 end
 
-function _extract_sig_and_name(fexpr::Expr, default_name::Symbol)::Tuple{String, Symbol}
+function _extract_sig_and_name(fexpr::Expr, default_name::Symbol; allow_qualified::Bool = true)::Tuple{String, Symbol}
     while fexpr.head == :macrocall && length(fexpr.args) >= 3 && fexpr.args[end] isa Expr
         fexpr = fexpr.args[end]
     end
     sig = ""
     fname = default_name
-    if fexpr.head == :function && !isempty(fexpr.args)
-        fsym = fexpr.args[1]
-        sig = string(fsym)
-        if fsym isa Expr && fsym.head == :call && !isempty(fsym.args)
-            fname = Symbol(fsym.args[1])
+    head_lhs = if fexpr.head == :function && !isempty(fexpr.args)
+        fexpr.args[1]
+    elseif fexpr.head == :(=) && length(fexpr.args) >= 2 && _is_func_sig_lhs(fexpr.args[1]) && !(fexpr.args[1] isa Expr && fexpr.args[1].head == :tuple)
+        fexpr.args[1]
+    else
+        nothing
+    end
+    if !isnothing(head_lhs)
+        sig = string(head_lhs)
+        call_lhs = head_lhs
+        while call_lhs isa Expr && call_lhs.head in (:where, :(::)) && !isempty(call_lhs.args)
+            call_lhs = call_lhs.args[1]
         end
-    elseif fexpr.head == :(=) && length(fexpr.args) >= 2 && fexpr.args[1] isa Expr && fexpr.args[1].head == :call
-        fsym = fexpr.args[1]
-        sig = string(fsym)
-        !isempty(fsym.args) && (fname = Symbol(fsym.args[1]))
+        if call_lhs isa Expr && call_lhs.head == :call && !isempty(call_lhs.args)
+            callee = call_lhs.args[1]
+            if callee isa Symbol
+                fname = callee
+            elseif allow_qualified && callee isa Expr && callee.head == :. && length(callee.args) == 2 &&
+                    callee.args[2] isa QuoteNode && callee.args[2].value isa Symbol
+                fname = callee.args[2].value
+            end
+        end
     end
     return (sig, fname)
 end
 
-function _load_procedures!(; eval_in_main::Bool = false)
+function _fnv1a64_normalized_lines(s::AbstractString)::UInt64
+    h = UInt64(0xcbf29ce484222325)
+    prime = UInt64(0x100000001b3)
+    lines = split(s, '\n')
+    for (idx, raw_line) in enumerate(lines)
+        clean = rstrip(raw_line, (' ', '\t', '\r'))
+        for b in codeunits(clean)
+            h ⊻= UInt64(b)
+            h *= prime
+        end
+        if idx < length(lines)
+            h ⊻= UInt64(0x0a)
+            h *= prime
+        end
+    end
+    return h
+end
+
+function _extract_imports_from_prefix(prefix::AbstractString)::String
+    isempty(prefix) && return ""
+    imps = String[]
+    for raw_line in split(prefix, '\n')
+        t = strip(rstrip(raw_line, '\r'))
+        if startswith(t, "using ") || startswith(t, "using\t") || startswith(t, "import ") || startswith(t, "import\t")
+            push!(imps, String(t))
+        end
+    end
+    return join(imps, "\n")
+end
+
+function _scan_proc_source_julia(s::String)
+    cu = codeunits(s)
+    n = length(cu)
+    i = 1
+    line_no = 1
+    in_doc = false
+    found_body = false
+    body_start = 0
+    func_line = 1
+    has_doc = false
+    has_imports = false
+
+    while i <= n
+        nl = findnext(==(UInt8('\n')), cu, i)
+        line_end = isnothing(nl) ? n : (nl - 1)
+        raw_end = (line_end >= i && cu[line_end] == UInt8('\r')) ? (line_end - 1) : line_end
+        line_str = raw_end >= i ? String(cu[i:raw_end]) : ""
+        trimmed = strip(line_str)
+
+        if in_doc
+            occursin("\"\"\"", trimmed) && (in_doc = false)
+        elseif isempty(trimmed)
+            # skip blank lines before function
+        elseif startswith(trimmed, "# Generated by jEMach")
+            # skip auto-generated banner
+        elseif startswith(trimmed, "using ") || startswith(trimmed, "using\t") ||
+                startswith(trimmed, "import ") || startswith(trimmed, "import\t")
+            has_imports = true
+        elseif startswith(trimmed, "\"\"\"")
+            has_doc = true
+            rest = length(trimmed) >= 6 ? SubString(trimmed, nextind(trimmed, 1, 3)) : ""
+            !occursin("\"\"\"", rest) && (in_doc = true)
+        else
+            found_body = true
+            body_start = i - 1
+            func_line = line_no
+            break
+        end
+
+        isnothing(nl) && break
+        i = nl + 1
+        line_no += 1
+    end
+
+    if !found_body
+        body_start = 0
+        func_line = 1
+        body_end = n
+        while body_end > 0 && cu[body_end] in (UInt8(' '), UInt8('\t'), UInt8('\r'), UInt8('\n'))
+            body_end -= 1
+        end
+    else
+        body_end = n
+        while body_end > body_start && cu[body_end] in (UInt8(' '), UInt8('\t'), UInt8('\r'), UInt8('\n'))
+            body_end -= 1
+        end
+    end
+
+    edit_code = body_end > body_start ? String(cu[(body_start + 1):body_end]) : ""
+    prefix = body_start > 0 ? String(cu[1:body_start]) : ""
+    return (
+        content_hash = _fnv1a64_normalized_lines(edit_code),
+        edit_code = edit_code,
+        imports_block = _extract_imports_from_prefix(prefix),
+        func_line = func_line,
+        has_doc = has_doc,
+        has_imports = has_imports,
+    )
+end
+
+function _scan_proc_source(src::AbstractString)
+    s = String(src)
+    fn = _zig_proc_scan_ptr[]
+    if fn != C_NULL
+        res_ref = Ref(_ZigProcScanResult(0, 0, 0, 1, 0, 0))
+        rc = GC.@preserve s res_ref ccall(
+            fn, Int32,
+            (Ptr{UInt8}, Csize_t, Ptr{_ZigProcScanResult}),
+            pointer(s), ncodeunits(s), res_ref
+        )
+        if rc == 0
+            r = res_ref[]
+            cu = codeunits(s)
+            bs = Int(r.body_start)
+            be = Int(r.body_end)
+            edit_code = (be > bs && be <= length(cu)) ? String(cu[(bs + 1):be]) : ""
+            prefix = bs > 0 && bs <= length(cu) ? String(cu[1:bs]) : ""
+            return (
+                content_hash = r.content_hash,
+                edit_code = edit_code,
+                imports_block = _extract_imports_from_prefix(prefix),
+                func_line = Int(r.func_line),
+                has_doc = r.has_doc != 0,
+                has_imports = r.has_imports != 0,
+            )
+        end
+    end
+    return _scan_proc_source_julia(s)
+end
+
+function _load_procedures!(; eval_in_main::Bool = false, force::Bool = false)
     proj_dir = _get_project_dir()
     proc_dir = joinpath(proj_dir, "procedures")
-    !isdir(proc_dir) && return _procedures
-
     found_names = Set{Symbol}()
     seen_files = Set{String}()
-    for (root, _, files) in walkdir(proc_dir)
-        for file in files
-            !endswith(file, ".jl") && continue
-            filepath = joinpath(root, file)
-            push!(seen_files, filepath)
-            file_mt = try
-                mtime(filepath)
-            catch
-                0.0
-            end
 
-            cached_name = get(_parsed_proc_names, filepath, nothing)
-            func_name = if !isnothing(cached_name) &&
+    if isdir(proc_dir)
+        for (root, _, files) in walkdir(proc_dir)
+            for file in files
+                !endswith(file, ".jl") && continue
+                filepath = joinpath(root, file)
+                push!(seen_files, filepath)
+                file_mt = try
+                    mtime(filepath)
+                catch
+                    0.0
+                end
+
+                cached_name = get(_parsed_proc_names, filepath, nothing)
+                cached_hit = !isnothing(cached_name) &&
                     get(_parsed_proc_mtimes, filepath, -1.0) == file_mt &&
                     haskey(_procedures, cached_name)
-                cached_name
-            else
-                content = try
-                    read(filepath, String)
-                catch
-                    continue
-                end
-                rel_path = relpath(filepath, proj_dir)
-                parsed_name = Symbol(splitext(file)[1])
-                parsed = try
-                    Meta.parseall(content; filename = rel_path)
-                catch e
-                    Expr(:toplevel, Expr(:error, e))
-                end
-                doc_str = ""
-                sig_str = ""
-                parse_err = nothing
 
-                if parsed isa Expr && parsed.head in (:error, :incomplete)
-                    parse_err = !isempty(parsed.args) ? parsed.args[1] : nothing
-                elseif parsed isa Expr
-                    for a in parsed.args
-                        !(a isa Expr) && continue
-                        if a.head in (:error, :incomplete)
-                            isnothing(parse_err) && (parse_err = !isempty(a.args) ? a.args[1] : nothing)
-                            continue
-                        elseif a.head == :macrocall && length(a.args) >= 4
-                            mac_name = a.args[1]
-                            is_doc_mac = (
-                                mac_name == Symbol("@doc") ||
-                                    mac_name == GlobalRef(Core, Symbol("@doc")) ||
-                                    (mac_name isa GlobalRef && mac_name.name == Symbol("@doc"))
-                            )
-                            if is_doc_mac
-                                doc_str = string(a.args[3])
-                                if a.args[4] isa Expr
-                                    s, fn = _extract_sig_and_name(a.args[4], parsed_name)
-                                    !isempty(s) && (sig_str = s)
-                                    parsed_name = fn
-                                end
-                            end
-                        elseif a.head == :function || a.head == :(=)
-                            s, fn = _extract_sig_and_name(a, parsed_name)
-                            !isempty(s) && (sig_str = s)
-                            parsed_name = fn
-                        end
-                    end
-                end
-
-                if isempty(strip(doc_str))
-                    comment_lines = String[]
-                    for l in split(content, '\n')
-                        sl = strip(l)
-                        if startswith(sl, "#") && !occursin("Generated by jEMach", sl)
-                            push!(comment_lines, strip(lstrip(sl, ['#', ' '])))
-                        elseif !isempty(sl)
-                            break
-                        end
-                    end
-                    !isempty(comment_lines) && (doc_str = join(comment_lines, " "))
-                end
-
-                isempty(sig_str) && (sig_str = string(parsed_name) * "()")
-
-                if !haskey(_procedures, parsed_name)
-                    _procedures[parsed_name] = ProcedureInfo(
-                        parsed_name, sig_str, rel_path, strip(doc_str), content,
-                        0.0, 0, :never, "-"
-                    )
+                func_name = if cached_hit
+                    cached_name
                 else
-                    p = _procedures[parsed_name]
-                    p.signature = sig_str
-                    p.doc = strip(doc_str)
-                    p.code = content
-                    p.file = rel_path
-                end
-                p_cur = _procedures[parsed_name]
-                if !isnothing(parse_err)
-                    summary, detail, err_line, err_stmt = _format_error_pair(parse_err, nothing; target_file = rel_path, source_code = content)
-                    p_cur.last_run_status = :error
-                    p_cur.last_run_at = Dates.format(Dates.now(), "HH:MM:SS")
-                    p_cur.last_run_cmd = "parse(" * rel_path * ")"
-                    p_cur.last_error = summary
-                    p_cur.last_error_detail = detail
-                    p_cur.last_error_line = err_line
-                    p_cur.last_error_cmd = err_stmt
-                elseif p_cur.last_run_status == :error && startswith(p_cur.last_run_cmd, "parse(")
-                    p_cur.last_run_status = :never
-                    p_cur.last_run_cmd = ""
-                    p_cur.last_error = ""
-                    p_cur.last_error_detail = ""
-                    p_cur.last_error_line = 0
-                    p_cur.last_error_cmd = ""
-                end
-                _parsed_proc_mtimes[filepath] = file_mt
-                _parsed_proc_names[filepath] = parsed_name
-                parsed_name
-            end
-
-            push!(found_names, func_name)
-
-            if eval_in_main && (get(_loaded_proc_mtimes, filepath, -1.0) != file_mt || !Base.invokelatest(isdefined, Main, func_name))
-                p_cur = _procedures[func_name]
-                if !(p_cur.last_run_status == :error && startswith(p_cur.last_run_cmd, "parse("))
-                    try
-                        Base.include(Main, filepath)
-                        _loaded_proc_mtimes[filepath] = file_mt
-                        if p_cur.last_run_status == :error && startswith(p_cur.last_run_cmd, "include(")
-                            p_cur.last_run_status = :never
-                            p_cur.last_run_cmd = ""
-                            p_cur.last_error = ""
-                            p_cur.last_error_detail = ""
-                            p_cur.last_error_line = 0
-                            p_cur.last_error_cmd = ""
-                        end
+                    content = try
+                        read(filepath, String)
+                    catch
+                        continue
+                    end
+                    rel_path = relpath(filepath, proj_dir)
+                    parsed_name = Symbol(splitext(file)[1])
+                    parsed = try
+                        Meta.parseall(content; filename = rel_path)
                     catch e
-                        bt = catch_backtrace()
-                        summary, detail, err_line, err_stmt = _format_error_pair(e, bt; target_file = filepath, source_code = p_cur.code)
+                        Expr(:toplevel, Expr(:error, e))
+                    end
+                    doc_str = ""
+                    sig_str = ""
+                    parse_err = nothing
+
+                    if parsed isa Expr && parsed.head in (:error, :incomplete)
+                        parse_err = !isempty(parsed.args) ? parsed.args[1] : nothing
+                    elseif parsed isa Expr
+                        for a in parsed.args
+                            !(a isa Expr) && continue
+                            if a.head in (:error, :incomplete)
+                                isnothing(parse_err) && (parse_err = !isempty(a.args) ? a.args[1] : nothing)
+                                continue
+                            elseif a.head == :macrocall && length(a.args) >= 4
+                                mac_name = a.args[1]
+                                is_doc_mac = (
+                                    mac_name == Symbol("@doc") ||
+                                        mac_name == GlobalRef(Core, Symbol("@doc")) ||
+                                        (mac_name isa GlobalRef && mac_name.name == Symbol("@doc"))
+                                )
+                                if is_doc_mac
+                                    doc_str = string(a.args[3])
+                                    if a.args[4] isa Expr
+                                        s, fn = _extract_sig_and_name(a.args[4], parsed_name)
+                                        !isempty(s) && (sig_str = s)
+                                        parsed_name = fn
+                                    end
+                                end
+                            elseif a.head == :function || a.head == :(=)
+                                s, fn = _extract_sig_and_name(a, parsed_name)
+                                !isempty(s) && (sig_str = s)
+                                parsed_name = fn
+                            end
+                        end
+                    end
+
+                    if isempty(strip(doc_str))
+                        comment_lines = String[]
+                        for l in split(content, '\n')
+                            sl = strip(l)
+                            if startswith(sl, "#") && !occursin("Generated by jEMach", sl)
+                                push!(comment_lines, strip(lstrip(sl, ['#', ' '])))
+                            elseif !isempty(sl)
+                                break
+                            end
+                        end
+                        !isempty(comment_lines) && (doc_str = join(comment_lines, " "))
+                    end
+
+                    isempty(sig_str) && (sig_str = string(parsed_name) * "()")
+                    scan = _scan_proc_source(content)
+                    is_loaded = Base.invokelatest(isdefined, Main, parsed_name) &&
+                        get(_loaded_proc_mtimes, filepath, -1.0) == file_mt
+
+                    if !haskey(_procedures, parsed_name)
+                        _procedures[parsed_name] = ProcedureInfo(
+                            parsed_name, sig_str, rel_path, strip(doc_str), content,
+                            0.0, 0, :never, "-";
+                            origin = is_loaded ? :disk : :unloaded,
+                            disk_code = content,
+                            live_code = is_loaded ? content : "",
+                            edit_code = isempty(scan.edit_code) ? content : scan.edit_code,
+                            imports_block = scan.imports_block,
+                            disk_hash = scan.content_hash,
+                            live_hash = is_loaded ? scan.content_hash : UInt64(0),
+                            generation = 1,
+                            func_start_line = scan.func_line,
+                        )
+                    else
+                        p = _procedures[parsed_name]
+                        p.file = rel_path
+                        p.disk_code = content
+                        p.disk_hash = scan.content_hash
+                        p.imports_block = scan.imports_block
+                        if isempty(p.doc) || p.origin != :modified
+                            p.doc = strip(doc_str)
+                        end
+                        if p.origin == :modified && !eval_in_main
+                            # Preserve active in-memory edits until explicitly reloaded
+                            p.origin = (p.live_hash == scan.content_hash) ? :disk : :modified
+                        elseif p.origin == :live
+                            p.origin = (p.live_hash == scan.content_hash) ? :disk : :modified
+                        else
+                            p.signature = sig_str
+                            p.code = content
+                            p.live_code = is_loaded ? content : p.live_code
+                            p.edit_code = isempty(scan.edit_code) ? content : scan.edit_code
+                            p.func_start_line = scan.func_line
+                            p.origin = is_loaded ? :disk : :unloaded
+                            is_loaded && (p.live_hash = scan.content_hash)
+                        end
+                    end
+                    p_cur = _procedures[parsed_name]
+                    if !isnothing(parse_err)
+                        summary, detail, err_line, err_stmt = _format_error_pair(parse_err, nothing; target_file = rel_path, source_code = content)
                         p_cur.last_run_status = :error
                         p_cur.last_run_at = Dates.format(Dates.now(), "HH:MM:SS")
-                        p_cur.last_run_cmd = "include(" * p_cur.file * ")"
+                        p_cur.last_run_cmd = "parse(" * rel_path * ")"
                         p_cur.last_error = summary
                         p_cur.last_error_detail = detail
                         p_cur.last_error_line = err_line
                         p_cur.last_error_cmd = err_stmt
+                    elseif p_cur.last_run_status == :error && startswith(p_cur.last_run_cmd, "parse(")
+                        p_cur.last_run_status = :never
+                        p_cur.last_run_cmd = ""
+                        p_cur.last_error = ""
+                        p_cur.last_error_detail = ""
+                        p_cur.last_error_line = 0
+                        p_cur.last_error_cmd = ""
+                    end
+                    _parsed_proc_mtimes[filepath] = file_mt
+                    _parsed_proc_names[filepath] = parsed_name
+                    _proc_registry_epoch[] += 1
+                    parsed_name
+                end
+
+                push!(found_names, func_name)
+
+                if eval_in_main && (force || get(_loaded_proc_mtimes, filepath, -1.0) != file_mt || !Base.invokelatest(isdefined, Main, func_name))
+                    p_cur = _procedures[func_name]
+                    if !(p_cur.last_run_status == :error && startswith(p_cur.last_run_cmd, "parse("))
+                        try
+                            Base.include(Main, filepath)
+                            _loaded_proc_mtimes[filepath] = file_mt
+                            scan = _scan_proc_source(p_cur.disk_code)
+                            p_cur.live_code = p_cur.disk_code
+                            p_cur.code = p_cur.disk_code
+                            p_cur.edit_code = isempty(scan.edit_code) ? p_cur.disk_code : scan.edit_code
+                            p_cur.live_hash = p_cur.disk_hash
+                            p_cur.func_start_line = scan.func_line
+                            p_cur.origin = :disk
+                            p_cur.generation = 1
+                            _proc_registry_epoch[] += 1
+                            if p_cur.last_run_status == :error && startswith(p_cur.last_run_cmd, "include(")
+                                p_cur.last_run_status = :never
+                                p_cur.last_run_cmd = ""
+                                p_cur.last_error = ""
+                                p_cur.last_error_detail = ""
+                                p_cur.last_error_line = 0
+                                p_cur.last_error_cmd = ""
+                            end
+                        catch e
+                            bt = catch_backtrace()
+                            summary, detail, err_line, err_stmt = _format_error_pair(e, bt; target_file = filepath, source_code = p_cur.code)
+                            p_cur.last_run_status = :error
+                            p_cur.last_run_at = Dates.format(Dates.now(), "HH:MM:SS")
+                            p_cur.last_run_cmd = "include(" * p_cur.file * ")"
+                            p_cur.last_error = summary
+                            p_cur.last_error_detail = detail
+                            p_cur.last_error_line = err_line
+                            p_cur.last_error_cmd = err_stmt
+                            p_cur.origin = :unloaded
+                        end
                     end
                 end
             end
@@ -611,7 +903,25 @@ function _load_procedures!(; eval_in_main::Bool = false)
     end
 
     for k in collect(keys(_procedures))
-        !(k in found_names) && delete!(_procedures, k)
+        if !(k in found_names)
+            p_old = _procedures[k]
+            if p_old.origin == :live
+                # Keep live REPL functions while defined in Main
+                if !Base.invokelatest(isdefined, Main, k)
+                    delete!(_procedures, k)
+                    _proc_registry_epoch[] += 1
+                end
+            elseif p_old.origin == :modified && Base.invokelatest(isdefined, Main, k)
+                p_old.origin = :live
+                p_old.file = ""
+                p_old.disk_code = ""
+                p_old.disk_hash = UInt64(0)
+                _proc_registry_epoch[] += 1
+            else
+                delete!(_procedures, k)
+                _proc_registry_epoch[] += 1
+            end
+        end
     end
     for fp in collect(keys(_parsed_proc_mtimes))
         if !(fp in seen_files)
@@ -624,13 +934,14 @@ function _load_procedures!(; eval_in_main::Bool = false)
 end
 
 """
-    autoload_procedures!() -> Dict{Symbol, ProcedureInfo}
+    autoload_procedures!(; force::Bool = false) -> Dict{Symbol, ProcedureInfo}
 
 Discover all `.jl` files in the project's `procedures/` folder and evaluate them
 into `Main` so that tab-completion, direct function calls, and `?procedure_name`
-docstrings work immediately in the Julia REPL.
+docstrings work immediately in the Julia REPL. Pass `force=true` to overwrite any
+in-memory `:modified` edits with the versions currently saved on disk.
 """
-autoload_procedures!() = _load_procedures!(; eval_in_main = true)
+autoload_procedures!(; force::Bool = false) = _load_procedures!(; eval_in_main = true, force = force)
 
 # ---------------------------------------------------------------------------
 # AST scope & free-variable analyzer
@@ -678,7 +989,7 @@ function _collect_for_bindings!(spec, assigned::Set{Symbol}, referenced::Set{Sym
 end
 
 function _is_func_sig_lhs(lhs)::Bool
-    while lhs isa Expr && lhs.head == :where && !isempty(lhs.args)
+    while lhs isa Expr && lhs.head in (:where, :(::)) && !isempty(lhs.args)
         lhs = lhs.args[1]
     end
     return lhs isa Expr && lhs.head in (:call, :tuple)
@@ -1121,8 +1432,18 @@ function make_procedure(
             0.0
         end
         rel_path = relpath(filepath, _get_project_dir())
+        scan = _scan_proc_source(code)
         p_info = ProcedureInfo(
-            proc_name, func_sig, rel_path, doc_text, code, 0.0, 0, :never, "-"
+            proc_name, func_sig, rel_path, doc_text, code, 0.0, 0, :never, "-";
+            origin = :disk,
+            disk_code = code,
+            live_code = code,
+            edit_code = isempty(scan.edit_code) ? code : scan.edit_code,
+            imports_block = scan.imports_block,
+            disk_hash = scan.content_hash,
+            live_hash = scan.content_hash,
+            generation = 1,
+            func_start_line = scan.func_line,
         )
         try
             Base.include(Main, filepath)
@@ -1130,6 +1451,9 @@ function make_procedure(
         catch e
             bt = catch_backtrace()
             summary, detail, err_line, err_stmt = _format_error_pair(e, bt; target_file = filepath, source_code = code)
+            p_info.origin = :unloaded
+            p_info.live_code = ""
+            p_info.live_hash = UInt64(0)
             p_info.last_run_status = :error
             p_info.last_run_at = Dates.format(Dates.now(), "HH:MM:SS")
             p_info.last_run_cmd = "include(" * rel_path * ")"
@@ -1143,6 +1467,7 @@ function make_procedure(
         _procedures[proc_name] = p_info
         _parsed_proc_mtimes[filepath] = file_mt
         _parsed_proc_names[filepath] = proc_name
+        _proc_registry_epoch[] += 1
         publish_state()
 
         green, reset, cyan = "\e[32m\e[1m", "\e[0m", "\e[36m"
@@ -1276,18 +1601,33 @@ end
 Execute a saved procedure from `procedures/` with timing and memory profiling,
 updating its metrics and error details in the jEMach TUI.
 """
+function _format_raw_args_str(args, kwargs; max_len::Int = 200)::String
+    (isempty(args) && isempty(kwargs)) && return ""
+    return try
+        pos = [Base.invokelatest(repr, a) for a in args]
+        kw = ["$(k) = $(Base.invokelatest(repr, v))" for (k, v) in kwargs]
+        joined = isempty(kw) ? join(pos, ", ") :
+            isempty(pos) ? join(kw, "; ") :
+            join(pos, ", ") * "; " * join(kw, ", ")
+        length(joined) <= max_len ? joined : ""
+    catch
+        ""
+    end
+end
+
 function run_procedure(name::Union{Symbol, AbstractString}, args...; kwargs...)
     sym = Symbol(name)
     _load_procedures!()
 
     proj_dir = _get_project_dir()
-    proc_file = if haskey(_procedures, sym) && !isempty(_procedures[sym].file)
-        joinpath(proj_dir, _procedures[sym].file)
+    existing_p = get(_procedures, sym, nothing)
+    proc_file = if !isnothing(existing_p) && !isempty(existing_p.file)
+        joinpath(proj_dir, existing_p.file)
     else
         joinpath(proj_dir, "procedures", string(sym) * ".jl")
     end
 
-    if !isfile(proc_file) && isdir(joinpath(proj_dir, "procedures"))
+    if !isfile(proc_file) && (isnothing(existing_p) || existing_p.origin != :live) && isdir(joinpath(proj_dir, "procedures"))
         for (root, _, files) in walkdir(joinpath(proj_dir, "procedures"))
             if string(sym) * ".jl" in files
                 proc_file = joinpath(root, string(sym) * ".jl")
@@ -1299,27 +1639,44 @@ function run_procedure(name::Union{Symbol, AbstractString}, args...; kwargs...)
     call_str = _safe_call_str(sym, args, kwargs)
     now_str = Dates.format(Dates.now(), "HH:MM:SS")
 
-    if isfile(proc_file)
+    is_modified_or_live = !isnothing(existing_p) && (existing_p.origin == :modified || existing_p.origin == :live)
+    loaded_mt = isfile(proc_file) ? get(_loaded_proc_mtimes, proc_file, -1.0) : -1.0
+    disk_mt = isfile(proc_file) ? (try mtime(proc_file) catch; 0.0 end) : -1.0
+    should_include = isfile(proc_file) && !is_modified_or_live && (
+        isnothing(existing_p) ||
+        existing_p.origin == :unloaded ||
+        !Base.invokelatest(isdefined, Main, sym) ||
+        loaded_mt != disk_mt
+    )
+
+    if should_include
         try
             Base.include(Main, proc_file)
-            _loaded_proc_mtimes[proc_file] = try
-                mtime(proc_file)
-            catch
-                0.0
+            _loaded_proc_mtimes[proc_file] = disk_mt
+            if !isnothing(existing_p)
+                scan = _scan_proc_source(existing_p.disk_code)
+                existing_p.live_code = existing_p.disk_code
+                existing_p.code = existing_p.disk_code
+                existing_p.edit_code = isempty(scan.edit_code) ? existing_p.disk_code : scan.edit_code
+                existing_p.live_hash = existing_p.disk_hash
+                existing_p.func_start_line = scan.func_line
+                existing_p.origin = :disk
+                existing_p.generation = 1
+                _proc_registry_epoch[] += 1
             end
         catch e
             bt = catch_backtrace()
-            code_str = haskey(_procedures, sym) ? _procedures[sym].code : (try read(proc_file, String) catch; "" end)
+            code_str = !isnothing(existing_p) ? existing_p.code : (try read(proc_file, String) catch; "" end)
             summary, detail, err_line, err_stmt = _format_error_pair(e, bt; target_file = proc_file, source_code = code_str)
-            if haskey(_procedures, sym)
-                p = _procedures[sym]
-                p.last_run_status = :error
-                p.last_run_at = now_str
-                p.last_run_cmd = call_str
-                p.last_error = summary
-                p.last_error_detail = detail
-                p.last_error_line = err_line
-                p.last_error_cmd = err_stmt
+            if !isnothing(existing_p)
+                existing_p.origin = :unloaded
+                existing_p.last_run_status = :error
+                existing_p.last_run_at = now_str
+                existing_p.last_run_cmd = call_str
+                existing_p.last_error = summary
+                existing_p.last_error_detail = detail
+                existing_p.last_error_line = err_line
+                existing_p.last_error_cmd = err_stmt
             end
             publish_state()
             @warn "Failed to reload $proc_file" exception = e
@@ -1356,10 +1713,24 @@ function run_procedure(name::Union{Symbol, AbstractString}, args...; kwargs...)
     if !haskey(_procedures, sym)
         rel_f = isfile(proc_file) ? relpath(proc_file, proj_dir) : ""
         code_f = isfile(proc_file) ? (try read(proc_file, String) catch; "" end) : ""
-        _procedures[sym] = ProcedureInfo(
-            sym, string(sym) * "()", rel_f,
-            "", code_f, time_ms, alloc_bytes, status_sym, now_str
-        )
+        if !isempty(code_f)
+            scan = _scan_proc_source(code_f)
+            _procedures[sym] = ProcedureInfo(
+                sym, string(sym) * "()", rel_f,
+                "", code_f, time_ms, alloc_bytes, status_sym, now_str;
+                origin = :disk,
+                disk_code = code_f,
+                live_code = code_f,
+                edit_code = isempty(scan.edit_code) ? code_f : scan.edit_code,
+                imports_block = scan.imports_block,
+                disk_hash = scan.content_hash,
+                live_hash = scan.content_hash,
+                func_start_line = scan.func_line,
+            )
+            _proc_registry_epoch[] += 1
+        else
+            _ensure_live_proc_for_symbol(sym)
+        end
     end
 
     p = _procedures[sym]
@@ -1368,12 +1739,17 @@ function run_procedure(name::Union{Symbol, AbstractString}, args...; kwargs...)
     p.last_run_status = status_sym
     p.last_run_at = now_str
     p.last_run_cmd = call_str
+    raw_args = _format_raw_args_str(args, kwargs)
+    if !isempty(args) || !isempty(kwargs) || !is_err
+        p.last_args_str = raw_args
+    end
     _remember_cmd_outcome!(call_str, status_sym)
 
     if is_err
+        err_target = (p.origin in (:modified, :live) || !isfile(proc_file)) ? "" : proc_file
         summary, detail, err_line, err_stmt = _format_error_pair(
             err_ref[], bt_ref[];
-            target_file = isfile(proc_file) ? proc_file : "",
+            target_file = err_target,
             source_code = p.code
         )
         if err_ref[] isa MethodError && isempty(args) && isempty(kwargs)
@@ -1446,14 +1822,23 @@ function list_procedures(query::AbstractString = "")
         for p in procs
             status_icon = p.last_run_status == :ok ? (green * "✓" * reset) :
                 p.last_run_status == :error ? (red * "✗" * reset) : (dim * "○" * reset)
+            origin_tag = if p.origin == :modified
+                " " * yellow * bold * "[⚡v$(p.generation)]" * reset
+            elseif p.origin == :live
+                " " * cyan * bold * "[◆LIVE]" * reset
+            elseif p.origin == :unloaded
+                " " * dim * "[○DISK]" * reset
+            else
+                " " * green * "[●]" * reset
+            end
             time_str = p.last_run_status != :never ? " $(yellow)($(p.last_run_time_ms)ms, $(Base.format_bytes(p.last_run_alloc_bytes)))$(reset)" : ""
-            println("│ $status_icon " * cyan * bold * string(p.name) * reset * " → " * p.signature * time_str)
+            println("│ $status_icon " * cyan * bold * string(p.name) * reset * origin_tag * " → " * p.signature * time_str)
             if p.last_run_status == :error && !isempty(p.last_error)
                 loc = p.last_error_line > 0 ? " [L$(p.last_error_line)]" : ""
                 println("│   " * red * "✗ Error$(loc): " * p.last_error * reset)
             end
             !isempty(p.doc) && println("│   $(dim)\"$(split(p.doc, '\n')[1])\"$(reset)")
-            println("│   $(dim)File: $(p.file)$(reset)")
+            !isempty(p.file) && println("│   $(dim)File: $(p.file)$(reset)")
         end
         println(bold * cyan * "└" * ("─"^52) * reset)
     end
@@ -1468,4 +1853,491 @@ function list_procedures(query::AbstractString = "")
         println(bold * red * "└" * ("─"^52) * reset)
     end
     return nothing
+end
+
+# ---------------------------------------------------------------------------
+# Live REPL function capture, in-REPL editing, reload & save lifecycle
+# ---------------------------------------------------------------------------
+
+function _extract_balanced_block(lines::Vector{<:AbstractString}, start_idx::Int)::String
+    (start_idx < 1 || start_idx > length(lines)) && return ""
+    limit = min(length(lines), start_idx + 250)
+    buf = IOBuffer()
+    for i in start_idx:limit
+        i > start_idx && write(buf, '\n')
+        write(buf, lines[i])
+        candidate = String(take!(copy(buf)))
+        ex = Meta.parse(candidate; raise = false)
+        if !(ex isa Expr && (ex.head == :incomplete || ex.head == :error))
+            return String(strip(candidate))
+        end
+    end
+    return ""
+end
+
+function _resolve_main_function_source(sym::Symbol)::Tuple{String, String}
+    if !Base.invokelatest(isdefined, Main, sym)
+        return ("$(sym)()", "function $(sym)()\n    \nend")
+    end
+    val = Base.invokelatest(getfield, Main, sym)
+    if !(val isa Function)
+        return ("$(sym)()", "function $(sym)()\n    \nend")
+    end
+
+    ms = try
+        collect(Base.invokelatest(methods, val))
+    catch
+        Method[]
+    end
+
+    for m in ms
+        m.module === Main || continue
+        fpath = string(m.file)
+        if !startswith(fpath, "REPL[") && fpath != "none" && isfile(fpath) && m.line > 0
+            file_lines = try
+                readlines(fpath)
+            catch
+                String[]
+            end
+            block = _extract_balanced_block(file_lines, Int(m.line))
+            if !isempty(block)
+                ex = Meta.parse(block; raise = false)
+                sig = ex isa Expr ? _extract_sig_and_name(ex, sym; allow_qualified = false)[1] : ""
+                isempty(sig) && (sig = "$(sym)()")
+                return (sig, block)
+            end
+        end
+    end
+
+    for cmd in reverse(get_recent_commands(50))
+        parsed = try
+            Meta.parseall(cmd)
+        catch
+            nothing
+        end
+        parsed isa Expr || continue
+        for a in parsed.args
+            a isa Expr || continue
+            s, fn = _extract_sig_and_name(a, Symbol(""); allow_qualified = false)
+            if fn == sym && !isempty(s)
+                scan = _scan_proc_source(cmd)
+                clean = isempty(scan.edit_code) ? String(strip(cmd)) : scan.edit_code
+                return (s, clean)
+            end
+        end
+    end
+
+    sig_guess = if !isempty(ms)
+        m1 = ms[1]
+        argnames = try
+            Base.method_argnames(m1)[2:end]
+        catch
+            Symbol[]
+        end
+        params = [string(a) for a in argnames if a != Symbol("") && !startswith(string(a), "#")]
+        "$(sym)(" * join(params, ", ") * ")"
+    else
+        "$(sym)()"
+    end
+    return (sig_guess, "function $(sig_guess)\n    \nend")
+end
+
+function _ensure_live_proc_for_symbol(sym::Symbol)::Union{Nothing, ProcedureInfo}
+    haskey(_procedures, sym) && return _procedures[sym]
+    Base.invokelatest(isdefined, Main, sym) || return nothing
+    val = try
+        Base.invokelatest(getfield, Main, sym)
+    catch
+        return nothing
+    end
+    val isa Function || return nothing
+
+    sig, src = _resolve_main_function_source(sym)
+    scan = _scan_proc_source(src)
+    edit_s = isempty(scan.edit_code) ? src : scan.edit_code
+    p = ProcedureInfo(
+        sym, sig, "", "", src, 0.0, 0, :never, "-";
+        origin = :live,
+        disk_code = "",
+        live_code = src,
+        edit_code = edit_s,
+        imports_block = scan.imports_block,
+        disk_hash = UInt64(0),
+        live_hash = scan.content_hash,
+        generation = 1,
+        func_start_line = scan.func_line,
+    )
+    _procedures[sym] = p
+    _proc_registry_epoch[] += 1
+    return p
+end
+
+function _collect_top_func_defs!(defs::Vector{Tuple{Expr, String, Symbol, String}}, ex)
+    ex isa Expr || return nothing
+    if ex.head in (:toplevel, :block)
+        for a in ex.args
+            _collect_top_func_defs!(defs, a)
+        end
+    elseif ex.head == :macrocall && length(ex.args) >= 4
+        mac = ex.args[1]
+        is_doc = (mac == Symbol("@doc")) || (mac == GlobalRef(Core, Symbol("@doc"))) ||
+            (mac isa GlobalRef && mac.name == Symbol("@doc"))
+        if is_doc && ex.args[4] isa Expr
+            s, fn = _extract_sig_and_name(ex.args[4], Symbol(""); allow_qualified = false)
+            if fn != Symbol("") && !isempty(s) && !startswith(string(fn), "#")
+                push!(defs, (ex.args[4], string(ex.args[3]), fn, s))
+            end
+        end
+    elseif ex.head == :function || ex.head == :(=)
+        s, fn = _extract_sig_and_name(ex, Symbol(""); allow_qualified = false)
+        if fn != Symbol("") && !isempty(s) && !startswith(string(fn), "#")
+            push!(defs, (ex, "", fn, s))
+        end
+    end
+    return nothing
+end
+
+function _capture_repl_definitions!(code_str::AbstractString)::Bool
+    s = String(strip(code_str))
+    isempty(s) && return false
+    (!occursin("function", s) && !occursin("=", s)) && return false
+    startswith(s, "jEMach.") && return false
+
+    parsed = try
+        Meta.parseall(s)
+    catch
+        return false
+    end
+    defs = Tuple{Expr, String, Symbol, String}[]
+    _collect_top_func_defs!(defs, parsed)
+    isempty(defs) && return false
+
+    captured = false
+    for (fexpr, doc_str, fname, sig) in defs
+        Base.invokelatest(isdefined, Main, fname) || continue
+        val = try
+            Base.invokelatest(getfield, Main, fname)
+        catch
+            nothing
+        end
+        val isa Function || continue
+
+        raw_src = if length(defs) == 1
+            s
+        else
+            string(Base.remove_linenums!(copy(fexpr)))
+        end
+        scan = _scan_proc_source(raw_src)
+        edit_s = isempty(scan.edit_code) ? raw_src : scan.edit_code
+
+        if haskey(_procedures, fname)
+            p = _procedures[fname]
+            p.signature = sig
+            !isempty(strip(doc_str)) && (p.doc = strip(doc_str))
+            if !isempty(scan.imports_block)
+                p.imports_block = scan.imports_block
+            end
+            p.live_code = raw_src
+            p.code = raw_src
+            p.edit_code = edit_s
+            p.live_hash = scan.content_hash
+            p.func_start_line = scan.func_line
+            if !isempty(p.file)
+                if p.disk_hash != UInt64(0) && scan.content_hash == p.disk_hash
+                    p.origin = :disk
+                else
+                    p.origin = :modified
+                    p.generation += 1
+                end
+            else
+                p.origin = :live
+                p.generation += 1
+            end
+            p.last_error_line = 0
+            if p.last_run_status == :error &&
+                    (startswith(p.last_run_cmd, "parse(") || startswith(p.last_run_cmd, "include("))
+                p.last_run_status = :never
+                p.last_run_cmd = ""
+                p.last_error = ""
+                p.last_error_detail = ""
+                p.last_error_cmd = ""
+            end
+        else
+            _procedures[fname] = ProcedureInfo(
+                fname, sig, "", strip(doc_str), raw_src,
+                0.0, 0, :never, "-";
+                origin = :live,
+                disk_code = "",
+                live_code = raw_src,
+                edit_code = edit_s,
+                imports_block = scan.imports_block,
+                disk_hash = UInt64(0),
+                live_hash = scan.content_hash,
+                generation = 1,
+                func_start_line = scan.func_line,
+            )
+        end
+        _proc_registry_epoch[] += 1
+        captured = true
+    end
+    return captured
+end
+
+function _rewrite_func_name(src::AbstractString, old_sym::Symbol, new_sym::Symbol)::String
+    old_sym == new_sym && return String(src)
+    old_esc = replace(string(old_sym), r"([\\^$.|?*+()\[\]{}])" => s"\\\1")
+    new_str = string(new_sym)
+    lines = split(String(src), '\n')
+    pat = Regex("^(\\s*(?:function\\s+)?)($(old_esc))(\\s*\\()")
+    for i in eachindex(lines)
+        m = match(pat, lines[i])
+        if !isnothing(m)
+            lines[i] = replace(lines[i], pat => SubstitutionString("$(m.captures[1])$(new_str)$(m.captures[3])"); count = 1)
+            break
+        end
+    end
+    return join(lines, '\n')
+end
+
+"""
+    edit_procedure(name) -> Union{String, Nothing}
+
+Return the clean editable function definition (`function ... end`) for `name`,
+and if running in an interactive Julia REPL, load it into the active `julia>`
+input buffer so you can tweak the function directly in memory.
+"""
+function edit_procedure(name::Union{Symbol, AbstractString})
+    sym = Symbol(strip(string(name)))
+    _load_procedures!()
+    p = get(_procedures, sym, nothing)
+    if isnothing(p)
+        p = _ensure_live_proc_for_symbol(sym)
+    end
+    if isnothing(p)
+        println("\e[31m✗ Function or procedure ':$sym' not found.\e[0m")
+        return nothing
+    end
+
+    src = strip(isempty(strip(p.edit_code)) ? (isempty(strip(p.live_code)) ? p.code : p.live_code) : p.edit_code)
+    isempty(src) && (src = strip(p.code))
+
+    if isdefined(Base, :active_repl) && !isnothing(_get_mistate())
+        edit_txt = String(src)
+        @async begin
+            sleep(0.06)
+            _repl_switch_to_main_and_replace(edit_txt)
+        end
+    end
+    return String(src)
+end
+
+"""
+    reload_procedure(name) -> Union{ProcedureInfo, Nothing}
+
+Discard any in-memory modifications to `name` by re-evaluating its disk file
+`procedures/<name>.jl` into `Main`, resetting its status back to `:disk`.
+"""
+function reload_procedure(name::Union{Symbol, AbstractString})
+    sym = Symbol(strip(string(name)))
+    _load_procedures!()
+    proj_dir = _get_project_dir()
+    p = get(_procedures, sym, nothing)
+
+    proc_file = if !isnothing(p) && !isempty(p.file)
+        joinpath(proj_dir, p.file)
+    else
+        joinpath(proj_dir, "procedures", string(sym) * ".jl")
+    end
+    if !isfile(proc_file) && isdir(joinpath(proj_dir, "procedures"))
+        for (root, _, files) in walkdir(joinpath(proj_dir, "procedures"))
+            if string(sym) * ".jl" in files
+                proc_file = joinpath(root, string(sym) * ".jl")
+                break
+            end
+        end
+    end
+
+    if !isfile(proc_file)
+        println("\e[33m! No disk file for live function ':$sym'. Use `save $sym` or `jEMach.save_procedure(:$sym)` first.\e[0m")
+        return nothing
+    end
+
+    content = read(proc_file, String)
+    file_mt = try
+        mtime(proc_file)
+    catch
+        0.0
+    end
+    rel_path = relpath(proc_file, proj_dir)
+    scan = _scan_proc_source(content)
+
+    Base.include(Main, proc_file)
+    _loaded_proc_mtimes[proc_file] = file_mt
+    _parsed_proc_mtimes[proc_file] = file_mt
+    _parsed_proc_names[proc_file] = sym
+
+    if isnothing(p)
+        p = ProcedureInfo(
+            sym, string(sym) * "()", rel_path, "", content, 0.0, 0, :never, "-";
+            origin = :disk,
+            disk_code = content,
+            live_code = content,
+            edit_code = isempty(scan.edit_code) ? content : scan.edit_code,
+            imports_block = scan.imports_block,
+            disk_hash = scan.content_hash,
+            live_hash = scan.content_hash,
+            generation = 1,
+            func_start_line = scan.func_line,
+        )
+        _procedures[sym] = p
+    else
+        p.file = rel_path
+        p.origin = :disk
+        p.disk_code = content
+        p.live_code = content
+        p.code = content
+        p.edit_code = isempty(scan.edit_code) ? content : scan.edit_code
+        p.imports_block = scan.imports_block
+        p.disk_hash = scan.content_hash
+        p.live_hash = scan.content_hash
+        p.generation = 1
+        p.func_start_line = scan.func_line
+        p.last_error = ""
+        p.last_error_detail = ""
+        p.last_error_line = 0
+        p.last_error_cmd = ""
+        p.last_run_status == :error && (p.last_run_status = :never)
+    end
+    _proc_registry_epoch[] += 1
+    publish_state()
+    println("\e[32m✓ Reloaded ':$sym' from $rel_path\e[0m")
+    return p
+end
+
+"""
+    save_procedure(name; as_name = nothing) -> Union{String, Nothing}
+
+Write the current in-memory function definition of `name` cleanly to
+`procedures/<as_name || name>.jl`, include it in `Main`, and mark it `:disk`.
+"""
+function save_procedure(name::Union{Symbol, AbstractString}; as_name::Union{Nothing, Symbol, AbstractString} = nothing)
+    sym = Symbol(strip(string(name)))
+    _load_procedures!()
+    p = get(_procedures, sym, nothing)
+    if isnothing(p)
+        p = _ensure_live_proc_for_symbol(sym)
+    end
+    if isnothing(p)
+        println("\e[31m✗ Cannot save ':$sym': not found in procedures or Main.\e[0m")
+        return nothing
+    end
+
+    target_sym = if isnothing(as_name) || isempty(strip(string(as_name)))
+        sym
+    else
+        Symbol(strip(string(as_name)))
+    end
+
+    raw_src = strip(isempty(strip(p.edit_code)) ? (isempty(strip(p.live_code)) ? p.code : p.live_code) : p.edit_code)
+    isempty(raw_src) && (raw_src = strip(p.code))
+    raw_scan = _scan_proc_source(raw_src)
+    body = strip(isempty(raw_scan.edit_code) ? raw_src : raw_scan.edit_code)
+    if target_sym != sym
+        body = _rewrite_func_name(body, sym, target_sym)
+    end
+
+    imports_s = strip(isempty(raw_scan.imports_block) ? p.imports_block : raw_scan.imports_block)
+    doc_s = strip(p.doc)
+    sig_s = p.signature
+    if target_sym != sym
+        ex = try
+            Meta.parse(body; raise = false)
+        catch
+            nothing
+        end
+        if ex isa Expr
+            sig_new, _ = _extract_sig_and_name(ex, target_sym; allow_qualified = false)
+            !isempty(sig_new) && (sig_s = sig_new)
+        end
+    end
+
+    timestamp = Dates.format(Dates.now(), "yyyy-mm-dd HH:MM:SS")
+    parts = String["# Generated by jEMach on $timestamp"]
+    !isempty(imports_s) && push!(parts, imports_s)
+    if !isempty(doc_s) && !startswith(lstrip(body), "\"\"\"")
+        push!(parts, "\"\"\"\n    $sig_s\n\n$doc_s\n\"\"\"")
+    end
+    push!(parts, body)
+    full_code = join(parts, "\n\n") * "\n"
+
+    proc_dir = joinpath(_get_project_dir(), "procedures")
+    !isdir(proc_dir) && mkpath(proc_dir)
+    filepath = joinpath(proc_dir, string(target_sym) * ".jl")
+    write(filepath, full_code)
+
+    file_mt = try
+        mtime(filepath)
+    catch
+        0.0
+    end
+    rel_path = relpath(filepath, _get_project_dir())
+    scan = _scan_proc_source(full_code)
+
+    try
+        Base.include(Main, filepath)
+        _loaded_proc_mtimes[filepath] = file_mt
+    catch e
+        @warn "Saved $rel_path, but evaluating it into Main failed" exception = e
+    end
+
+    if target_sym == sym
+        p.file = rel_path
+        p.signature = sig_s
+        p.origin = :disk
+        p.disk_code = full_code
+        p.live_code = full_code
+        p.code = full_code
+        p.edit_code = isempty(scan.edit_code) ? full_code : scan.edit_code
+        p.imports_block = scan.imports_block
+        p.disk_hash = scan.content_hash
+        p.live_hash = scan.content_hash
+        p.generation = 1
+        p.func_start_line = scan.func_line
+    else
+        _procedures[target_sym] = ProcedureInfo(
+            target_sym, sig_s, rel_path, doc_s, full_code, 0.0, 0, :never, "-";
+            origin = :disk,
+            disk_code = full_code,
+            live_code = full_code,
+            edit_code = isempty(scan.edit_code) ? full_code : scan.edit_code,
+            imports_block = scan.imports_block,
+            disk_hash = scan.content_hash,
+            live_hash = scan.content_hash,
+            generation = 1,
+            func_start_line = scan.func_line,
+        )
+    end
+    _parsed_proc_mtimes[filepath] = file_mt
+    _parsed_proc_names[filepath] = target_sym
+    _proc_registry_epoch[] += 1
+    publish_state()
+    println("\e[32m✓ Saved ':$target_sym' to $rel_path\e[0m")
+    return rel_path
+end
+
+function _delete_procedure!(name::Union{Symbol, AbstractString})
+    sym = Symbol(strip(string(name)))
+    p = get(_procedures, sym, nothing)
+    isnothing(p) && return false
+    if !isempty(p.file)
+        full_p = joinpath(_get_project_dir(), p.file)
+        isfile(full_p) && rm(full_p; force = true)
+        delete!(_loaded_proc_mtimes, full_p)
+        delete!(_parsed_proc_mtimes, full_p)
+        delete!(_parsed_proc_names, full_p)
+    end
+    delete!(_procedures, sym)
+    _proc_registry_epoch[] += 1
+    publish_state()
+    return true
 end

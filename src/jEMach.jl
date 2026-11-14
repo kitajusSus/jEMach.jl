@@ -30,6 +30,7 @@ import Sockets
 
 export make_procedure, record, record_stop, run_procedure, list_procedures,
     find_procedures, search_procedures, autoload_procedures!, get_recent_commands,
+    edit_procedure, reload_procedure, save_procedure,
     detect_backend, terminal_info, workspace, inspect_var, save_clean_session,
     @jemach, @inspect
 
@@ -98,6 +99,11 @@ precompile(_exec_command, (String,))
 precompile(_jemach_completions, (String,))
 precompile(workspace, (String,))
 precompile(inspect_var, (Module, String))
+precompile(edit_procedure, (Symbol,))
+precompile(reload_procedure, (Symbol,))
+precompile(save_procedure, (Symbol,))
+precompile(_scan_proc_source, (String,))
+precompile(_capture_repl_definitions!, (String,))
 precompile(Base.show, (Base.TTY, MIME"text/plain", WorkspaceTable))
 precompile(Base.show, (IOContext{Base.TTY}, MIME"text/plain", WorkspaceTable))
 precompile(Base.show, (IOContext{Base.TTY}, MIME"text/plain", ProcedureInfo))

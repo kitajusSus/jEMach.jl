@@ -9,6 +9,10 @@ const _last_serialized_body = Ref{String}("")
 const _tui_pane_ref = Ref{String}("")
 const _tui_backend_ref = Ref{Symbol}(:none)
 const _tui_proc_ref = Ref{Union{Base.Process, Nothing}}(nothing)
+const _json_dst_buf = Vector{UInt8}(undef, 4096)
+const _serialize_lock = ReentrantLock()
+const _hasmethod_cache = Dict{Symbol, Bool}()
+const _hasmethod_world_ref = Ref{UInt64}(UInt64(0))
 
 function _write_json_str_col(buf::IOBuffer, vals::Vector{String}, dst_buf::Vector{UInt8})
     write(buf, '[')
@@ -29,8 +33,9 @@ function _write_json_int_col(buf::IOBuffer, vals::Vector{Int32})
 end
 
 function _serialize_dod_body(t::WorkspaceTable, packages_data::Vector)::String
-    buf = IOBuffer()
-    dst_buf = Vector{UInt8}(undef, 4096)
+    lock(_serialize_lock) do
+        buf = IOBuffer()
+        dst_buf = _json_dst_buf
 
     write(buf, "\"backend\":")
     _write_json_str(buf, string(detect_backend()), dst_buf)
@@ -99,21 +104,40 @@ function _serialize_dod_body(t::WorkspaceTable, packages_data::Vector)::String
         print(buf, p.last_error_line)
         write(buf, ",\"last_error_cmd\":")
         _write_json_str(buf, p.last_error_cmd, dst_buf)
-        needs_args = false
-        if Base.invokelatest(isdefined, Main, p.name)
-            fn_obj = try Base.invokelatest(getfield, Main, p.name) catch; nothing end
-            if fn_obj isa Function
-                needs_args = !Base.invokelatest(hasmethod, fn_obj, Tuple{})
+        cur_world = Base.get_world_counter()
+        if _hasmethod_world_ref[] != cur_world
+            empty!(_hasmethod_cache)
+            _hasmethod_world_ref[] = cur_world
+        end
+        needs_args = get(_hasmethod_cache, p.name, nothing)
+        if isnothing(needs_args)
+            needs_args = false
+            if Base.invokelatest(isdefined, Main, p.name)
+                fn_obj = try Base.invokelatest(getfield, Main, p.name) catch; nothing end
+                if fn_obj isa Function
+                    needs_args = !Base.invokelatest(hasmethod, fn_obj, Tuple{})
+                end
+            else
+                m_sig = match(r"^[^(]+\((.*)\)$"s, strip(p.signature))
+                if !isnothing(m_sig)
+                    inner_sig = strip(m_sig.captures[1])
+                    !isempty(inner_sig) && !startswith(inner_sig, ";") && !occursin("=", inner_sig) && (needs_args = true)
+                end
             end
-        else
-            m_sig = match(r"^[^(]+\((.*)\)$"s, strip(p.signature))
-            if !isnothing(m_sig)
-                inner_sig = strip(m_sig.captures[1])
-                !isempty(inner_sig) && !startswith(inner_sig, ";") && !occursin("=", inner_sig) && (needs_args = true)
-            end
+            _hasmethod_cache[p.name] = needs_args
         end
         write(buf, ",\"needs_args\":")
         write(buf, needs_args ? "true" : "false")
+        write(buf, ",\"origin\":")
+        _write_json_str(buf, string(p.origin), dst_buf)
+        write(buf, ",\"edit_code\":")
+        _write_json_str(buf, p.edit_code, dst_buf)
+        write(buf, ",\"generation\":")
+        print(buf, p.generation)
+        write(buf, ",\"func_start_line\":")
+        print(buf, p.func_start_line)
+        write(buf, ",\"last_args\":")
+        _write_json_str(buf, p.last_args_str, dst_buf)
         write(buf, '}')
     end
 
@@ -157,8 +181,9 @@ function _serialize_dod_body(t::WorkspaceTable, packages_data::Vector)::String
         st_str = st_sym == :ok ? "ok" : st_sym == :error ? "error" : ""
         _write_json_str(buf, st_str, dst_buf)
     end
-    write(buf, "]}")
-    return String(take!(buf))
+        write(buf, "]}")
+        return String(take!(buf))
+    end
 end
 
 function _serialize_dod(t::WorkspaceTable, packages_data::Vector)::String
@@ -188,15 +213,41 @@ function _clear_repl_input_area(s)
     end
 end
 
-function _repl_eval(code::AbstractString; silent::Bool = false, record_history::Bool = true)
+function _repl_eval(code::AbstractString; silent::Bool = false, record_history::Bool = true, filename::AbstractString = "REPL[TUI]", proc_hint::String = "")
     clean_code = strip(String(code))
     isempty(clean_code) && return
 
     if silent
         try
-            Base.invokelatest(Core.eval, Main, Meta.parseall(clean_code))
+            Base.invokelatest(Core.eval, Main, Meta.parseall(clean_code; filename = String(filename)))
+            _capture_repl_definitions!(clean_code)
+            if !isempty(proc_hint)
+                sym = Symbol(proc_hint)
+                if haskey(_procedures, sym) && _procedures[sym].last_run_status == :error &&
+                        startswith(_procedures[sym].last_run_cmd, "edit(")
+                    p = _procedures[sym]
+                    p.last_run_status = :never
+                    p.last_error = ""
+                    p.last_error_detail = ""
+                    p.last_error_line = 0
+                    p.last_error_cmd = ""
+                end
+            end
         catch e
-            @warn "jEMach background eval failed" exception = e
+            bt = catch_backtrace()
+            if !isempty(proc_hint) && haskey(_procedures, Symbol(proc_hint))
+                p = _procedures[Symbol(proc_hint)]
+                summary, detail, err_line, err_stmt = _format_error_pair(e, bt; source_code = clean_code)
+                p.last_run_status = :error
+                p.last_run_at = Dates.format(Dates.now(), "HH:MM:SS")
+                p.last_run_cmd = "edit(" * proc_hint * ")"
+                p.last_error = summary
+                p.last_error_detail = detail
+                p.last_error_line = err_line
+                p.last_error_cmd = err_stmt
+            else
+                @warn "jEMach background eval failed" exception = e
+            end
         end
         return Base.invokelatest(publish_state)
     end
@@ -213,16 +264,21 @@ function _repl_eval(code::AbstractString; silent::Bool = false, record_history::
     record_history && _append_repl_history(clean_code)
     is_proc_runner = startswith(clean_code, "jEMach.run_procedure(")
     is_internal = startswith(clean_code, "jEMach.inspect_var(") ||
-        startswith(clean_code, "jEMach.save_clean_session(")
+        startswith(clean_code, "jEMach.save_clean_session(") ||
+        startswith(clean_code, "jEMach.reload_procedure(") ||
+        startswith(clean_code, "jEMach.save_procedure(") ||
+        startswith(clean_code, "jEMach.edit_procedure(") ||
+        startswith(clean_code, "jEMach._")
 
     try
-        parsed_ast = Meta.parseall(clean_code; filename = "REPL[TUI]")
+        parsed_ast = Meta.parseall(clean_code; filename = String(filename))
         val = Base.invokelatest(Core.eval, Main, parsed_ast)
         try
             Core.eval(Main, Expr(:(=), :ans, QuoteNode(val)))
         catch
         end
 
+        _capture_repl_definitions!(clean_code)
         if !is_proc_runner && !is_internal
             _record_command_outcome!(clean_code, true; source = "tui")
         end
@@ -270,6 +326,31 @@ function _repl_insert(text::AbstractString, move_left::Int = 0)
     end
 end
 
+function _repl_replace_input(text::AbstractString, move_left::Int = 0; switch_to_main::Bool = false)
+    s = _get_mistate()
+    isnothing(s) && return
+    return try
+        le = parentmodule(typeof(s))
+        if switch_to_main && isdefined(Base, :active_repl) && hasproperty(Base.active_repl, :interface)
+            modes = Base.active_repl.interface.modes
+            if !isempty(modes) && Base.invokelatest(le.mode, s) !== modes[1]
+                Base.invokelatest(le.transition, s, modes[1])
+            end
+        end
+        ps = Base.invokelatest(le.state, s)
+        Base.invokelatest(le.push_undo, ps)
+        Base.invokelatest(le.replace_line, ps, String(text), true)
+        for _ in 1:move_left
+            Base.invokelatest(le.edit_move_left, s)
+        end
+        Base.invokelatest(le.refresh_line, s)
+    catch
+    end
+end
+
+_repl_switch_to_main_and_replace(text::AbstractString, move_left::Int = 0) =
+    _repl_replace_input(text, move_left; switch_to_main = true)
+
 function _repl_clear()
     s = _get_mistate()
     return try
@@ -293,11 +374,17 @@ function _handle_socket_message(line::AbstractString)
         @async _repl_eval(code; silent = false, record_history = rec_hist)
     elseif cmd == "eval_silent"
         code = string(get(msg, "code", ""))
-        @async _repl_eval(code; silent = true)
+        fname = string(get(msg, "filename", "REPL[TUI]"))
+        phint = string(get(msg, "proc_name", ""))
+        @async _repl_eval(code; silent = true, filename = fname, proc_hint = phint)
     elseif cmd == "insert"
         text = string(get(msg, "text", ""))
         move_left = Int(get(msg, "move_left", 0))
         @async _repl_insert(text, move_left)
+    elseif cmd == "replace_input"
+        text = string(get(msg, "text", ""))
+        move_left = Int(get(msg, "move_left", 0))
+        @async _repl_replace_input(text, move_left; switch_to_main = true)
     elseif cmd == "clear"
         @async _repl_clear()
     end

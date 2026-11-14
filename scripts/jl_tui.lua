@@ -34,6 +34,7 @@ ffi.cdef([[
 
   int     select(int, fd_set_t *, fd_set_t *, fd_set_t *, timeval_t *);
   ssize_t read  (int, void *, size_t);
+  int     gettimeofday(timeval_t *tv, void *tz);
 
   struct sockaddr_un {
     unsigned short sun_family;
@@ -162,11 +163,19 @@ check_and_discover(false)
 local socket_fd = -1
 local last_connect_try = 0
 local socket_buffer = ""
+local socket_read_buf = ffi.new("char[65536]")
+local stdin_buf = ffi.new("char[512]")
+local _tv_now = ffi.new("timeval_t")
 local dirty = true
 local state = nil -- last parsed JSON state
 local last_mtime = 0
 local last_state_ts = 0
 local history_selected = {}
+
+local function now_ms()
+	ffi.C.gettimeofday(_tv_now, nil)
+	return tonumber(_tv_now.tv_sec) * 1000 + math.floor(tonumber(_tv_now.tv_usec) / 1000)
+end
 
 local function realign_history_selection(old_hist, new_hist)
 	if not next(history_selected) then
@@ -266,7 +275,7 @@ local function try_connect_socket()
 end
 
 local function handle_socket_read()
-	local buf = ffi.new("char[65536]")
+	local buf = socket_read_buf
 	while socket_fd >= 0 do
 		local n = tonumber(ffi.C.read(socket_fd, buf, 65536))
 		if not n or n <= 0 then
@@ -342,17 +351,12 @@ local function read_key(timeout_ms)
 	end
 
 	if fd_set_isset(fds, STDIN) then
-		local buf = ffi.new("char[32]")
-		local n = tonumber(ffi.C.read(STDIN, buf, 32))
+		local n = tonumber(ffi.C.read(STDIN, stdin_buf, 512))
 		if not n or n <= 0 then
 			return nil
 		end
 
-		local s = ""
-		for i = 0, n - 1 do
-			s = s .. string.char(buf[i])
-		end
-		return s
+		return ffi.string(stdin_buf, n)
 	end
 
 	return nil
@@ -416,7 +420,8 @@ local function queue_keys(raw)
 	local len = #raw
 	while pos <= len do
 		if raw:sub(pos, pos) == "\27" then
-			local esc_seq = raw:match("^\27%[[%d;]*[a-zA-Z~u]", pos)
+			local esc_seq = raw:match("^\27%[<[%d;]+[Mm]", pos)
+				or raw:match("^\27%[[%d;]*[a-zA-Z~u]", pos)
 				or raw:match("^\27O[a-zA-Z]", pos)
 			if esc_seq then
 				table.insert(input_queue, normalize_key(esc_seq))
@@ -479,6 +484,11 @@ local FG_DARK_GRAY = ESC .. "[38;5;238m"
 local BG_TAB_ACT = ESC .. "[48;5;24m"
 local BG_ERR_LINE = ESC .. "[48;5;52m"
 local BG_PANEL = ESC .. "[48;5;235m"
+local BG_SEL = ESC .. "[48;5;237m"
+local BG_SEL_ERR = ESC .. "[48;5;52m"
+local BG_SEL_MOD = ESC .. "[48;5;58m"
+local MOUSE_ON = ESC .. "[?1000h" .. ESC .. "[?1006h"
+local MOUSE_OFF = ESC .. "[?1000l" .. ESC .. "[?1006l"
 
 local function strip_ansi(s)
 	return tostring(s or ""):gsub("\27%[[%d;]*[a-zA-Z]", "")
@@ -873,6 +883,16 @@ local detail_view_active = false
 local detail_scroll = 0
 local detail_item = nil
 local history_prev_collapsed = true
+local proc_errors_view = false
+local mouse_enabled = true
+local last_modal_args = {}
+local tab_hitboxes = {}
+local row_hitboxes = {}
+local action_hitboxes = {}
+local header_err_hitbox = nil
+local preview_split_row = 0
+local last_click_row = 0
+local last_click_ms = 0
 
 local GUIDE_SECTIONS = {
 	{
@@ -913,38 +933,39 @@ local GUIDE_SECTIONS = {
 			{ key = "help | ? | h", desc = "Print jemach> command reference in REPL" },
 			{ key = "ui | open | close | clear", desc = "Toggle/open/close TUI panel or clear REPL screen (clear())" },
 			{ key = "ws [filter]", desc = "Print workspace variables table with memory sizes" },
-			{ key = "ls [q] | find <q>", desc = "List or search saved procedures & failed commands" },
-			{ key = "show <name>", desc = "Show procedure card with status, errors & highlighted source" },
+			{ key = "ls [q] | find <q>", desc = "List or search saved & live procedures" },
+			{ key = "show <name> | edit <name>", desc = "Show procedure card / load clean function into julia> editor" },
 			{ key = "errors", desc = "List errored procedures & failed commands from this session" },
-			{ key = "<name>(args...) | run ...", desc = "Run a procedure with profiling (e.g. my_proc(10, 3))" },
+			{ key = "<name>(args...) | run ...", desc = "Run a procedure with profiling (keeps live in-memory edits)" },
 			{ key = "make <name> [N]", desc = "Extract last N commands into procedures/<name>.jl (hoists using)" },
 			{ key = "rec [name] | stop", desc = "Start / stop live procedure recording ([rec: name] julia>)" },
 			{ key = "inspect <expr> | @inspect", desc = "Deep-inspect variable/function, methods, origin & docstring" },
 			{ key = "@jemach [cmd]", desc = "Macro to toggle TUI or invoke jemach commands from julia>" },
-			{ key = "save | reload | status", desc = "Export clean session / reload procedures/*.jl / diagnostics" },
+			{ key = "save [<name> [as]] | reload", desc = "Save modified/live function to disk / reload from procedures/*.jl" },
 		},
 	},
 	{
-		title = "jEMach TUI Global Keys & Navigation",
+		title = "jEMach TUI Global Keys & Mouse Navigation",
 		items = {
-			{ key = "1 / 2 / 3 / 4", desc = "Jump to Workspace / History / Procedures / Packages" },
+			{ key = "1 / 2 / 3 / 4", desc = "Jump to Workspace / History / Procedures / Packages (or click tab)" },
 			{ key = "? (or 5)", desc = "Open or toggle this Guide tab (Esc returns to prior tab)" },
 			{ key = "Tab / ] / [", desc = "Cycle forward / backward through TUI tabs" },
 			{ key = "/", desc = "Live search & filter current tab (Esc or x clears filter)" },
 			{ key = "j / k or Up / Down", desc = "Move cursor down / up (g/G top/bottom, PgUp/PgDn page)" },
+			{ key = "Mouse / m", desc = "Click rows & pills, dbl-click edits, wheel scrolls; [m] toggles mouse" },
 			{ key = "c / q / Ctrl+C", desc = "Clear REPL screen / Quit TUI panel" },
 		},
 	},
 	{
-		title = "jEMach TUI Tab Actions & Error Preview",
+		title = "jEMach TUI Tab Actions & Live Functions",
 		items = {
-			{ key = "[1] Workspace", desc = "l/h/Enter fold/eval; i inspect; e paste; d/D hide/restore; s save" },
+			{ key = "[1] Workspace", desc = "l/h/Enter fold/eval; i inspect; e edit fn or paste var; d/D hide" },
 			{ key = "[2] History", desc = "Previous session folded! h/l/H fold; Space select; p make proc" },
 			{ key = "[2] v / e / Enter", desc = "Full cmd+error viewer / paste to REPL / re-run cmd" },
-			{ key = "[3] Procedures & Errors", desc = "Shows errored procs (ERR) + failed REPL commands" },
-			{ key = "[3] Enter / e", desc = "Run procedure (prompts for args if required) / paste to edit" },
-			{ key = "[3] v / J / K", desc = "Full-screen code+traceback viewer / scroll split preview" },
-			{ key = "[3] d / D / r", desc = "Delete proc or dismiss failed cmd / clear errors / reload" },
+			{ key = "[3] Procedures (● ⚡ ◆)", desc = "● Disk  ⚡ Modified in memory  ◆ Live REPL fn  ○ Unloaded  ✗ Error" },
+			{ key = "[3] e / E / c", desc = "Edit clean fn in julia> REPL / open $EDITOR -> Main / paste call" },
+			{ key = "[3] R / S / Enter", desc = "Reload from disk (reset ⚡) / Save to procedures/ / Run (remembers args)" },
+			{ key = "[3] F / v / J / K", desc = "Toggle Failed Commands sub-view / Full detail / Scroll preview" },
 			{ key = "[4] Packages", desc = "a add package / d remove package / u update packages" },
 		},
 	},
@@ -1189,16 +1210,65 @@ local function build_display_rows()
 		return
 	end
 
-	-- Tab 3: Procedures & Failed Commands
+	-- Tab 3: Procedures (with separate [F] Failed Commands sub-view)
 	if active_tab == 3 then
 		local procs = state and state.procedures or {}
 		local fcmds = state and state.failed_commands or {}
-		if #procs == 0 and #fcmds == 0 then
-			display_rows[1] = { kind = "empty_proc" }
+
+		if proc_errors_view then
+			if #fcmds == 0 then
+				display_rows[1] = {
+					kind = "msg",
+					text = "No failed commands recorded. Press [F] to return to Procedures.",
+				}
+				return
+			end
+			for i, fc in ipairs(fcmds) do
+				local fcmd = fc.cmd or ""
+				local ferr = fc.error or ""
+				local fdet = fc.error_detail or ""
+				local fstmt = fc.failed_stmt or ""
+				local match = true
+				if has_filter then
+					match = (fcmd:lower():find(q, 1, true) ~= nil)
+						or (ferr:lower():find(q, 1, true) ~= nil)
+						or (fdet:lower():find(q, 1, true) ~= nil)
+						or (fstmt:lower():find(q, 1, true) ~= nil)
+				end
+				if match then
+					table.insert(display_rows, {
+						kind = "failed_cmd",
+						idx = i,
+						id = tonumber(fc.id) or i,
+						cmd = fcmd,
+						source = fc.source or "repl",
+						proc_name = fc.proc_name or "",
+						error = ferr,
+						error_detail = fdet,
+						error_line = tonumber(fc.error_line) or 0,
+						failed_stmt = fstmt,
+						timestamp = fc.timestamp or "",
+					})
+				end
+			end
+			if #display_rows == 0 then
+				display_rows[1] = { kind = "empty_search", text = "No failed commands matching \"" .. search_query .. "\"." }
+			end
 			return
 		end
 
-		local matched_procs = {}
+		if #procs == 0 then
+			if #fcmds > 0 then
+				display_rows[1] = {
+					kind = "msg",
+					text = "No procedures yet. " .. #fcmds .. " failed REPL command(s) — press [F] to inspect.",
+				}
+			else
+				display_rows[1] = { kind = "empty_proc" }
+			end
+			return
+		end
+
 		for i, p in ipairs(procs) do
 			local pname = p.name or ""
 			local psig = p.signature or (pname .. "()")
@@ -1220,7 +1290,7 @@ local function build_display_rows()
 			end
 
 			if match then
-				table.insert(matched_procs, {
+				table.insert(display_rows, {
 					kind = "procedure",
 					idx = i,
 					name = pname,
@@ -1228,6 +1298,11 @@ local function build_display_rows()
 					file = pfile,
 					doc = pdoc,
 					code = pcode,
+					edit_code = p.edit_code or "",
+					origin = p.origin or ((pfile ~= "") and "disk" or "live"),
+					generation = tonumber(p.generation) or 1,
+					func_start_line = tonumber(p.func_start_line) or 1,
+					last_args = p.last_args or "",
 					time_ms = p.time_ms or 0.0,
 					alloc_bytes = p.alloc_bytes or 0,
 					status = p.status or "never",
@@ -1242,58 +1317,8 @@ local function build_display_rows()
 			end
 		end
 
-		local matched_fcmds = {}
-		for i, fc in ipairs(fcmds) do
-			local fcmd = fc.cmd or ""
-			local ferr = fc.error or ""
-			local fdet = fc.error_detail or ""
-			local fstmt = fc.failed_stmt or ""
-			local match = true
-			if has_filter then
-				match = (fcmd:lower():find(q, 1, true) ~= nil)
-					or (ferr:lower():find(q, 1, true) ~= nil)
-					or (fdet:lower():find(q, 1, true) ~= nil)
-					or (fstmt:lower():find(q, 1, true) ~= nil)
-			end
-			if match then
-				table.insert(matched_fcmds, {
-					kind = "failed_cmd",
-					idx = i,
-					id = tonumber(fc.id) or i,
-					cmd = fcmd,
-					source = fc.source or "repl",
-					proc_name = fc.proc_name or "",
-					error = ferr,
-					error_detail = fdet,
-					error_line = tonumber(fc.error_line) or 0,
-					failed_stmt = fstmt,
-					timestamp = fc.timestamp or "",
-				})
-			end
-		end
-
-		if #matched_procs > 0 and #matched_fcmds > 0 then
-			table.insert(display_rows, {
-				kind = "section",
-				text = "Saved Procedures (" .. #matched_procs .. ")",
-			})
-		end
-		for _, r in ipairs(matched_procs) do
-			table.insert(display_rows, r)
-		end
-		if #matched_fcmds > 0 then
-			table.insert(display_rows, {
-				kind = "section",
-				text = "Failed Commands (" .. #matched_fcmds .. ")",
-				is_error = true,
-			})
-			for _, r in ipairs(matched_fcmds) do
-				table.insert(display_rows, r)
-			end
-		end
-
 		if #display_rows == 0 then
-			display_rows[1] = { kind = "empty_search", text = "No procedures or errors matching \"" .. search_query .. "\"." }
+			display_rows[1] = { kind = "empty_search", text = "No procedures matching \"" .. search_query .. "\"." }
 		end
 		return
 	end
@@ -1654,12 +1679,38 @@ local function julia_quote_str(s)
 	return '"' .. s .. '"'
 end
 
-local function repl_eval(code, silent, record_history)
+local function repl_eval(code, silent, record_history, filename, proc_name)
 	local cmd_type = silent and "eval_silent" or "eval"
-	local hist_field = (record_history == false) and ',"history":false' or ""
-	local msg = string.format('{"cmd":"%s","code":"%s"%s}', cmd_type, json_escape(code), hist_field)
+	local extra = ""
+	if record_history == false then
+		extra = extra .. ',"history":false'
+	end
+	if filename and filename ~= "" then
+		extra = extra .. ',"filename":"' .. json_escape(filename) .. '"'
+	end
+	if proc_name and proc_name ~= "" then
+		extra = extra .. ',"proc_name":"' .. json_escape(proc_name) .. '"'
+	end
+	local msg = string.format('{"cmd":"%s","code":"%s"%s}', cmd_type, json_escape(code), extra)
 	if not send_socket_json(msg) then
 		fallback_mux_send(code, true)
+	end
+end
+
+local function focus_repl_pane()
+	local b = detect_backend()
+	if b == "tmux" and repl_pane and repl_pane ~= "" then
+		os.execute(string.format("tmux select-pane -t '%s' 2>/dev/null", repl_pane:gsub("'", "'\\''")))
+	elseif b == "kitty" and repl_pane and repl_pane:match("^%d+$") then
+		os.execute(string.format("kitten @ focus-window --match id:%s 2>/dev/null", repl_pane))
+	end
+end
+
+local function repl_replace_input(text, move_left)
+	local ml = tonumber(move_left) or 0
+	local msg = string.format('{"cmd":"replace_input","text":"%s","move_left":%d}', json_escape(text), ml)
+	if not send_socket_json(msg) then
+		fallback_mux_send(text, false)
 	end
 end
 
@@ -1715,13 +1766,43 @@ local function find_matching_failed_cmd(cmd)
 	return nil
 end
 
-local function build_item_preview_lines(dr, max_w)
+local function fmt_bytes(b)
+	b = tonumber(b) or 0
+	if b >= 1048576 then
+		return string.format("%.1fMB", b / 1048576)
+	elseif b >= 1024 then
+		return string.format("%.1fKB", b / 1024)
+	end
+	return string.format("%dB", b)
+end
+
+local function ws_col_widths(cols)
+	local name_w = (cols >= 90) and 28 or math.max(14, math.floor(cols * 0.36))
+	local type_w = (cols >= 90) and 22 or math.max(11, math.floor(cols * 0.25))
+	local val_max = math.max(6, cols - name_w - type_w - 4)
+	return name_w, type_w, val_max
+end
+
+local function origin_glyph_and_color(origin, status)
+	if status == "error" then
+		return "✗", FG_RED .. BOLD, false
+	elseif origin == "modified" then
+		return "◈", FG_YELLOW .. BOLD, false
+	elseif origin == "live" then
+		return "◆", FG_CYAN .. BOLD, false
+	elseif origin == "unloaded" then
+		return "○", DIM .. FG_GRAY, false
+	else
+		return "●", FG_GREEN, false
+	end
+end
+
+local function build_item_preview_lines(dr, max_w, compact)
 	local lines = {}
 	if not dr then
 		return { DIM .. FG_GRAY .. "  (Nothing selected)" .. RESET }
 	end
 	local w = math.max(20, max_w)
-	local body_w = math.max(12, w - 4)
 
 	local function add_section_title(color, title)
 		table.insert(lines, color .. BOLD .. "  " .. truncate_visible(title, w - 2) .. RESET)
@@ -1781,6 +1862,20 @@ local function build_item_preview_lines(dr, max_w)
 	end
 
 	if dr.kind == "procedure" then
+		if compact then
+			if dr.code and dr.code ~= "" then
+				add_code_block(dr.code, dr.last_error_line)
+			else
+				table.insert(lines, DIM .. FG_GRAY .. "    (No source code preview available)" .. RESET)
+			end
+			if dr.last_error_detail and dr.last_error_detail ~= "" then
+				table.insert(lines, "")
+				add_section_title(FG_ORANGE, "Stacktrace / Error Detail (scroll down or [v] full):")
+				add_wrapped_lines(dr.last_error_detail, FG_LIGHT_GRAY, "  ", false)
+			end
+			return lines
+		end
+
 		local st_badge
 		if dr.status == "ok" then
 			st_badge = FG_GREEN .. BOLD .. "✓ OK" .. RESET
@@ -1789,14 +1884,24 @@ local function build_item_preview_lines(dr, max_w)
 		else
 			st_badge = DIM .. FG_GRAY .. "○ NEVER RUN" .. RESET
 		end
-		local hdr = "  " .. BOLD .. FG_CYAN .. (dr.signature or dr.name or "") .. RESET .. "  " .. st_badge
+		local orig = dr.origin or "disk"
+		local orig_badge = (orig == "modified") and (FG_YELLOW .. BOLD .. "⚡ MOD v" .. tostring(dr.generation or 1) .. RESET)
+			or (orig == "live") and (FG_CYAN .. BOLD .. "◆ LIVE" .. RESET)
+			or (orig == "unloaded") and (DIM .. FG_GRAY .. "○ UNLOADED" .. RESET)
+			or (FG_GREEN .. "● DISK" .. RESET)
+		local hdr = "  " .. BOLD .. FG_CYAN .. (dr.signature or dr.name or "") .. RESET .. "  " .. orig_badge .. "  " .. st_badge
 		table.insert(lines, truncate_visible(hdr, w) == strip_ansi(hdr) and hdr or ("  " .. truncate_visible(strip_ansi(hdr), w - 2)))
 
-		local meta = "File: " .. (dr.file or "-")
+		local loc_str = (dr.file and dr.file ~= "") and dr.file or "(REPL memory — press [S] to save)"
+		local meta = "File: " .. loc_str
 		if dr.status ~= "never" then
-			meta = meta .. string.format("  |  %.2fms  %dB  (%s)", dr.time_ms or 0, dr.alloc_bytes or 0, dr.last_run or "-")
+			meta = meta .. string.format("  |  %.2fms  %s  (%s)", dr.time_ms or 0, fmt_bytes(dr.alloc_bytes or 0), dr.last_run or "-")
 		end
 		add_wrapped_lines(meta, DIM .. FG_GRAY, "  ", false)
+
+		if dr.doc and dr.doc ~= "" then
+			add_wrapped_lines(dr.doc, ITALIC .. FG_LIGHT_GRAY, "  ", false)
+		end
 
 		if dr.last_run_cmd and dr.last_run_cmd ~= "" then
 			table.insert(lines, "")
@@ -1817,7 +1922,7 @@ local function build_item_preview_lines(dr, max_w)
 		end
 
 		table.insert(lines, "")
-		add_section_title(FG_WHITE, "Source Code (" .. (dr.file or "procedure") .. "):")
+		add_section_title(FG_WHITE, "Source Code:")
 		if dr.code and dr.code ~= "" then
 			add_code_block(dr.code, dr.last_error_line)
 		else
@@ -1909,28 +2014,29 @@ end
 -- ---------------------------------------------------------------------------
 -- Rendering
 -- ---------------------------------------------------------------------------
-local function render(term_rows, term_cols)
-	local out_buf = {}
-	table.insert(out_buf, SYNC_START .. HIDE_CUR .. CLEAR)
-
-	local procs = state and state.procedures or {}
-	local fcmds = state and state.failed_commands or {}
+local function render_tab_bar(out_buf, term_cols, procs, fcmds)
 	local err_proc_count = 0
+	local mod_proc_count = 0
 	for _, p in ipairs(procs) do
 		if p.status == "error" then
 			err_proc_count = err_proc_count + 1
 		end
+		if p.origin == "modified" or p.origin == "live" then
+			mod_proc_count = mod_proc_count + 1
+		end
 	end
 	local total_err_count = err_proc_count + #fcmds
 
-	-- Row 1: Header / Tab bar
 	table.insert(out_buf, move(1, 1))
 	local compact_tabs = (term_cols <= 85)
 	local tab_labels = compact_tabs and TAB_SHORT or TAB_NAMES
 	local max_tab_idx = guide_tab_open and 5 or 4
 
 	local tab_parts = {}
-	table.insert(tab_parts, BOLD .. FG_CYAN .. (compact_tabs and "◆" or "◆ jEMach") .. RESET)
+	local lead = BOLD .. FG_CYAN .. (compact_tabs and "◆" or "◆ jEMach") .. RESET
+	table.insert(tab_parts, lead)
+	local sep = compact_tabs and "" or " "
+	local cur_tab_x = visible_len(lead) + 1 + #sep
 
 	for i = 1, max_tab_idx do
 		local name = tab_labels[i]
@@ -1948,6 +2054,13 @@ local function render(term_rows, term_cols)
 					badge = " " .. FG_RED .. BOLD .. "✗" .. total_err_count .. RESET
 				else
 					badge = " (" .. #procs .. " " .. FG_RED .. BOLD .. "✗" .. total_err_count .. RESET .. (active_tab == 3 and (BOLD .. FG_WHITE .. BG_TAB_ACT) or (DIM .. FG_WHITE)) .. ")"
+				end
+				badge_colored = true
+			elseif mod_proc_count > 0 then
+				if compact_tabs then
+					badge = " " .. FG_YELLOW .. BOLD .. "⚡" .. mod_proc_count .. RESET
+				else
+					badge = " (" .. #procs .. " " .. FG_YELLOW .. BOLD .. "⚡" .. mod_proc_count .. RESET .. (active_tab == 3 and (BOLD .. FG_WHITE .. BG_TAB_ACT) or (DIM .. FG_WHITE)) .. ")"
 				end
 				badge_colored = true
 			elseif #procs > 0 and not compact_tabs then
@@ -1968,13 +2081,17 @@ local function render(term_rows, term_cols)
 			end
 			table.insert(tab_parts, t_str)
 		else
-			t_str = " [" .. key_lbl .. "] " .. name .. badge .. " "
+			local raw_t = " [" .. key_lbl .. "] " .. name .. badge .. " "
 			if i == active_tab then
-				table.insert(tab_parts, BOLD .. FG_WHITE .. BG_TAB_ACT .. t_str .. RESET)
+				t_str = BOLD .. FG_WHITE .. BG_TAB_ACT .. raw_t .. RESET
 			else
-				table.insert(tab_parts, DIM .. FG_WHITE .. t_str .. RESET)
+				t_str = DIM .. FG_WHITE .. raw_t .. RESET
 			end
+			table.insert(tab_parts, t_str)
 		end
+		local t_w = visible_len(t_str)
+		table.insert(tab_hitboxes, { x1 = cur_tab_x, x2 = cur_tab_x + t_w - 1, tab = i })
+		cur_tab_x = cur_tab_x + t_w + #sep
 	end
 
 	local match_count = #display_rows
@@ -1987,7 +2104,6 @@ local function render(term_rows, term_cols)
 	end
 
 	local left_title = table.concat(tab_parts, compact_tabs and "" or " ")
-
 	local right_info
 	if toast_msg and os.time() <= toast_expires then
 		right_info = REV .. BOLD .. FG_GREEN .. " ⚡ " .. truncate_visible(toast_msg, math.max(10, term_cols - 20)) .. " " .. RESET
@@ -2012,52 +2128,181 @@ local function render(term_rows, term_cols)
 	end
 	local spacer_len = math.max(1, term_cols - left_len - right_len)
 	table.insert(out_buf, left_title .. string.rep(" ", spacer_len) .. right_info)
+	return match_count
+end
+
+local function render_detail_view(out_buf, term_rows, term_cols)
+	local box_w = math.max(20, term_cols)
+	local inner_w = math.max(14, box_w - 4)
+	local view_h = math.max(1, term_rows - 4)
+
+	local preview_lines = build_item_preview_lines(detail_item, inner_w)
+	local total_lines = #preview_lines
+	local max_scroll = math.max(0, total_lines - view_h)
+	if detail_scroll > max_scroll then
+		detail_scroll = max_scroll
+	end
+	if detail_scroll < 0 then
+		detail_scroll = 0
+	end
+
+	local item_label = detail_item.name or (detail_item.id and ("Failed #" .. detail_item.id)) or (detail_item.idx and ("History #" .. detail_item.idx)) or "Item"
+	local scroll_tag = string.format("[%d-%d/%d]", math.min(total_lines, detail_scroll + 1), math.min(total_lines, detail_scroll + view_h), total_lines)
+	local dtitle = " Detail: " .. truncate_visible(item_label, math.max(8, box_w - 28)) .. " " .. scroll_tag .. " "
+	local dfill = math.max(0, box_w - visible_len(dtitle) - 4)
+	table.insert(out_buf, move(2, 1))
+	table.insert(out_buf, FG_AQUA .. "╭─" .. BOLD .. FG_WHITE .. dtitle .. RESET .. FG_AQUA .. string.rep("─", dfill) .. "─╮" .. RESET)
+
+	for ri = 1, view_h do
+		local row = 2 + ri
+		local lidx = detail_scroll + ri
+		table.insert(out_buf, move(row, 1))
+		local lstr = preview_lines[lidx] or ""
+		if visible_len(lstr) > inner_w then
+			lstr = truncate_visible(lstr, inner_w)
+		end
+		table.insert(out_buf, FG_AQUA .. "│ " .. RESET .. pad_right(lstr, inner_w) .. FG_AQUA .. " │" .. RESET)
+	end
+
+	local bot_hint = " [j/k] Scroll  [↵] Run  [e] Edit REPL  [E] $EDITOR  [c] Call  [v/Esc] Close "
+	local bot_vis = truncate_visible(bot_hint, math.max(0, box_w - 4))
+	local bfill = math.max(0, box_w - visible_len(bot_vis) - 3)
+	table.insert(out_buf, move(term_rows - 1, 1))
+	table.insert(out_buf, FG_AQUA .. "╰" .. string.rep("─", bfill) .. DIM .. FG_LIGHT_GRAY .. bot_vis .. RESET .. FG_AQUA .. "─╯" .. RESET)
+
+	table.insert(out_buf, move(term_rows, 1))
+	local function pill(k, d)
+		return BOLD .. FG_CYAN .. "[" .. k .. "]" .. RESET .. DIM .. FG_LIGHT_GRAY .. d .. " " .. RESET
+	end
+	local help = pill("j/k", "Scroll") .. pill("PgUp/Dn", "Page") .. pill("↵", "Run") .. pill("e", "Edit") .. pill("E", "$ED") .. pill("c", "Call") .. pill("v/Esc", "Close") .. pill("q", "Quit")
+	table.insert(out_buf, pad_right(" " .. truncate_visible(help, math.max(1, term_cols - 1)), term_cols))
+end
+
+local function render_footer_pills(out_buf, term_rows, term_cols)
+	table.insert(out_buf, move(term_rows, 1))
+	local pills = {}
+	if active_tab == 1 then
+		pills = {
+			{ k = "/", d = "Find", act = "/" },
+			{ k = "h/l", d = "Fold", act = "l" },
+			{ k = "↵", d = "Eval", act = "\r" },
+			{ k = "e", d = "Edit/Use", act = "e" },
+			{ k = "i", d = "Insp", act = "i" },
+			{ k = "m", d = mouse_enabled and "Ms" or "Ms∅", act = "m" },
+			{ k = "?", d = "Guide", act = "?" },
+			{ k = "q", d = "Quit", act = "q" },
+		}
+	elseif active_tab == 2 then
+		pills = {
+			{ k = "Spc", d = "Sel", act = " " },
+			{ k = "h/l", d = "Fold", act = "H" },
+			{ k = "p", d = "Proc", act = "p" },
+			{ k = "e", d = "Paste", act = "e" },
+			{ k = "↵", d = "Run", act = "\r" },
+			{ k = "v", d = "View", act = "v" },
+			{ k = "?", d = "Guide", act = "?" },
+			{ k = "q", d = "Quit", act = "q" },
+		}
+	elseif active_tab == 3 then
+		if proc_errors_view then
+			pills = {
+				{ k = "F", d = "Procs", act = "F" },
+				{ k = "↵", d = "Retry", act = "\r" },
+				{ k = "e", d = "Edit", act = "e" },
+				{ k = "d", d = "Del", act = "d" },
+				{ k = "D", d = "Clr", act = "D" },
+				{ k = "v", d = "View", act = "v" },
+				{ k = "m", d = mouse_enabled and "Ms" or "Ms∅", act = "m" },
+				{ k = "q", d = "Quit", act = "q" },
+			}
+		else
+			pills = {
+				{ k = "↵", d = "Run", act = "\r" },
+				{ k = "e", d = "Edit", act = "e" },
+				{ k = "E", d = "$ED", act = "E" },
+				{ k = "c", d = "Call", act = "c" },
+				{ k = "S", d = "Save", act = "S" },
+				{ k = "R", d = "Load", act = "R" },
+				{ k = "F", d = "Err", act = "F" },
+				{ k = "v", d = "View", act = "v" },
+				{ k = "d", d = "Del", act = "d" },
+				{ k = "m", d = mouse_enabled and "Ms" or "Ms∅", act = "m" },
+				{ k = "?", d = "Guide", act = "?" },
+				{ k = "q", d = "Quit", act = "q" },
+			}
+		end
+	elseif active_tab == 4 then
+		pills = {
+			{ k = "/", d = "Find", act = "/" },
+			{ k = "a", d = "Add", act = "a" },
+			{ k = "d", d = "Rm", act = "d" },
+			{ k = "u", d = "Upd", act = "u" },
+			{ k = "?", d = "Guide", act = "?" },
+			{ k = "q", d = "Quit", act = "q" },
+		}
+	elseif active_tab == 5 then
+		pills = {
+			{ k = "/", d = "Find", act = "/" },
+			{ k = "j/k", d = "Nav", act = "j" },
+			{ k = "1-4", d = "Tabs", act = "1" },
+			{ k = "?/Esc", d = "Close", act = "?" },
+			{ k = "q", d = "Quit", act = "q" },
+		}
+	end
+
+	local pill_parts = { " " }
+	local cur_x = 2
+	for _, p in ipairs(pills) do
+		local kpart = "[" .. p.k .. "]"
+		local lpart = p.d .. " "
+		local pw = visible_len(kpart) + visible_len(lpart)
+		if cur_x + pw > term_cols then
+			break
+		end
+		table.insert(action_hitboxes, { x1 = cur_x, x2 = cur_x + pw - 2, key = p.act })
+		table.insert(pill_parts, BOLD .. FG_CYAN .. kpart .. RESET .. DIM .. FG_LIGHT_GRAY .. lpart .. RESET)
+		cur_x = cur_x + pw
+	end
+	table.insert(out_buf, pad_right(table.concat(pill_parts), term_cols))
+end
+
+local function render_modal(out_buf, term_rows, term_cols)
+	local box_w = math.max(24, math.min(56, term_cols - 4))
+	local inner = math.max(10, box_w - 2)
+	local box_h = 5
+	local top = math.max(2, math.floor((term_rows - box_h) / 2))
+	local left = math.max(1, math.floor((term_cols - box_w) / 2))
+
+	local title = " " .. truncate_visible(modal_title, math.max(6, box_w - 8)) .. " "
+	local fill_w = math.max(0, box_w - 4 - visible_len(title))
+	local top_border = "╭─" .. BOLD .. FG_WHITE .. title .. RESET .. FG_CYAN .. string.rep("─", fill_w) .. "╮"
+	local bot_border = "╰" .. string.rep("─", inner) .. "╯"
+	local prompt_line = "  Input: " .. BOLD .. FG_YELLOW .. truncate_visible(modal_input, math.max(4, inner - 11)) .. RESET .. REV .. " " .. RESET
+	local hint_line = "  " .. FG_GREEN .. "[↵]" .. RESET .. DIM .. " OK  " .. RESET .. FG_YELLOW .. "[C-u]" .. RESET .. DIM .. " Clr  " .. RESET .. FG_RED .. "[Esc]" .. RESET .. DIM .. " Cancel" .. RESET
+
+	table.insert(out_buf, move(top, left) .. BOLD .. FG_CYAN .. top_border .. RESET)
+	table.insert(out_buf, move(top + 1, left) .. BOLD .. FG_CYAN .. "│" .. RESET .. pad_right(prompt_line, inner) .. BOLD .. FG_CYAN .. "│" .. RESET)
+	table.insert(out_buf, move(top + 2, left) .. BOLD .. FG_CYAN .. "│" .. RESET .. pad_right(truncate_visible(hint_line, inner), inner) .. BOLD .. FG_CYAN .. "│" .. RESET)
+	table.insert(out_buf, move(top + 3, left) .. BOLD .. FG_CYAN .. bot_border .. RESET)
+end
+
+local function render(term_rows, term_cols)
+	local out_buf = {}
+	table.insert(out_buf, SYNC_START .. HIDE_CUR .. CLEAR)
+	tab_hitboxes = {}
+	row_hitboxes = {}
+	action_hitboxes = {}
+	header_err_hitbox = nil
+	preview_split_row = 0
+
+	local procs = state and state.procedures or {}
+	local fcmds = state and state.failed_commands or {}
+
+	-- Row 1: Header / Tab bar
+	local match_count = render_tab_bar(out_buf, term_cols, procs, fcmds)
 
 	if detail_view_active and detail_item then
-		local box_w = math.max(20, term_cols)
-		local inner_w = math.max(14, box_w - 4)
-		local view_h = math.max(1, term_rows - 4)
-
-		local preview_lines = build_item_preview_lines(detail_item, inner_w)
-		local total_lines = #preview_lines
-		local max_scroll = math.max(0, total_lines - view_h)
-		if detail_scroll > max_scroll then
-			detail_scroll = max_scroll
-		end
-		if detail_scroll < 0 then
-			detail_scroll = 0
-		end
-
-		local item_label = detail_item.name or (detail_item.id and ("Failed #" .. detail_item.id)) or (detail_item.idx and ("History #" .. detail_item.idx)) or "Item"
-		local scroll_tag = string.format("[%d-%d/%d]", math.min(total_lines, detail_scroll + 1), math.min(total_lines, detail_scroll + view_h), total_lines)
-		local dtitle = " Detail: " .. truncate_visible(item_label, math.max(8, box_w - 28)) .. " " .. scroll_tag .. " "
-		local dfill = math.max(0, box_w - visible_len(dtitle) - 4)
-		table.insert(out_buf, move(2, 1))
-		table.insert(out_buf, FG_AQUA .. "╭─" .. BOLD .. FG_WHITE .. dtitle .. RESET .. FG_AQUA .. string.rep("─", dfill) .. "─╮" .. RESET)
-
-		for ri = 1, view_h do
-			local row = 2 + ri
-			local lidx = detail_scroll + ri
-			table.insert(out_buf, move(row, 1))
-			local lstr = preview_lines[lidx] or ""
-			if visible_len(lstr) > inner_w then
-				lstr = truncate_visible(lstr, inner_w)
-			end
-			table.insert(out_buf, FG_AQUA .. "│ " .. RESET .. pad_right(lstr, inner_w) .. FG_AQUA .. " │" .. RESET)
-		end
-
-		local bot_hint = " [j/k] Scroll  [PgUp/PgDn] Page  [Enter] Run  [e] Paste  [v/Esc] Close "
-		local bot_vis = truncate_visible(bot_hint, math.max(0, box_w - 4))
-		local bfill = math.max(0, box_w - visible_len(bot_vis) - 3)
-		table.insert(out_buf, move(term_rows - 1, 1))
-		table.insert(out_buf, FG_AQUA .. "╰" .. string.rep("─", bfill) .. DIM .. FG_LIGHT_GRAY .. bot_vis .. RESET .. FG_AQUA .. "─╯" .. RESET)
-
-		table.insert(out_buf, move(term_rows, 1))
-		local function pill(k, d)
-			return BOLD .. FG_CYAN .. "[" .. k .. "] " .. RESET .. DIM .. FG_LIGHT_GRAY .. d .. "  " .. RESET
-		end
-		local help = pill("j/k", "Scroll") .. pill("PgUp/Dn", "Page") .. pill("g/G", "Top/Bot") .. pill("↵", "Run") .. pill("e", "Paste") .. pill("v/Esc", "Close") .. pill("q", "Quit")
-		table.insert(out_buf, pad_right(" " .. truncate_visible(help, math.max(1, term_cols - 1)), term_cols))
+		render_detail_view(out_buf, term_rows, term_cols)
 	else
 
 	-- Row 2: Top Separator
@@ -2068,14 +2313,28 @@ local function render(term_rows, term_cols)
 	table.insert(out_buf, move(3, 1))
 	local col_hdr = ""
 	if active_tab == 1 then
-		col_hdr = DIM .. FG_AQUA .. "   NAME                       TYPE                 VALUE" .. RESET
+		local nw, tw, _ = ws_col_widths(term_cols)
+		col_hdr = DIM .. FG_AQUA .. pad_right("    NAME", nw) .. "  " .. pad_right("TYPE", tw) .. "  VALUE" .. RESET
 	elseif active_tab == 2 then
 		col_hdr = DIM .. FG_AQUA .. "   SEL  ST   #   COMMAND" .. RESET
 	elseif active_tab == 3 then
-		if term_cols >= 90 then
-			col_hdr = DIM .. FG_AQUA .. "   ST  PROCEDURE / COMMAND            METRICS / ERROR              FILE" .. RESET
+		if proc_errors_view then
+			local right_tag = "[F] ← Procs"
+			local rw = #right_tag + 1
+			local left_w = math.max(10, term_cols - rw)
+			local left_hdr = pad_right("   ST  FAILED COMMAND / ERROR", left_w)
+			header_err_hitbox = { x1 = left_w + 1, x2 = term_cols }
+			col_hdr = DIM .. FG_RED .. truncate_visible(left_hdr, left_w) .. RESET .. BOLD .. FG_CYAN .. right_tag .. " " .. RESET
 		else
-			col_hdr = DIM .. FG_AQUA .. "   ST  PROCEDURE / COMMAND       STATUS / ERROR" .. RESET
+			local right_tag = (#fcmds > 0) and ("[F] Err:" .. #fcmds) or "[● Disk ⚡Mem ◆Live]"
+			local right_clr = (#fcmds > 0) and (BOLD .. FG_RED) or (DIM .. FG_GRAY)
+			local rw = visible_len(right_tag) + 1
+			local left_w = math.max(10, term_cols - rw)
+			local left_txt = (term_cols >= 90)
+				and "   ST  FUNCTION / SIGNATURE           STATUS / STATS           ORIGIN / FILE"
+				or "   ST  FUNCTION               STATUS / STATE"
+			header_err_hitbox = (#fcmds > 0) and { x1 = left_w + 1, x2 = term_cols } or nil
+			col_hdr = DIM .. FG_AQUA .. pad_right(truncate_visible(left_txt, left_w), left_w) .. RESET .. right_clr .. right_tag .. " " .. RESET
 		end
 	elseif active_tab == 4 then
 		col_hdr = DIM .. FG_AQUA .. "   PACKAGE                                  VERSION" .. RESET
@@ -2101,8 +2360,8 @@ local function render(term_rows, term_cols)
 	)
 
 	if is_proc_split then
-		-- Split view for procedures & failed commands: top list, bottom full wrapped preview
-		local list_max_h = math.min(total, math.max(3, math.floor(content_rows * 0.40)))
+		-- Split view for procedures / failed commands: top list, bottom clean panel preview
+		local list_max_h = math.min(total, math.max(3, math.floor(content_rows * 0.36)))
 		local preview_h = math.max(2, content_rows - list_max_h - 1)
 		local win_start = compute_win_start(total, list_max_h)
 
@@ -2110,6 +2369,7 @@ local function render(term_rows, term_cols)
 		for i = win_start, math.min(win_start + list_max_h - 1, total) do
 			local dr = display_rows[i]
 			local sel = (i == cursor)
+			row_hitboxes[row_idx] = i
 			table.insert(out_buf, move(row_idx, 1))
 
 			if dr.kind == "section" then
@@ -2118,41 +2378,68 @@ local function render(term_rows, term_cols)
 				local fill_w = math.max(0, term_cols - visible_len(sec_title))
 				table.insert(out_buf, BOLD .. sec_color .. sec_title .. FG_DARK_GRAY .. string.rep("─", fill_w) .. RESET)
 			elseif dr.kind == "procedure" then
-				local icon = (dr.status == "ok") and (FG_GREEN .. " ✓ " .. RESET)
-					or (dr.status == "error") and (FG_RED .. BOLD .. " ✗ " .. RESET)
-					or (DIM .. FG_GRAY .. " ○ " .. RESET)
+				local glyph, gclr, gwide = origin_glyph_and_color(dr.origin, dr.status)
+				local sel_bar = sel and (FG_CYAN .. BOLD .. "▸" .. RESET) or " "
+				local row_bg = sel and ((dr.status == "error") and BG_SEL_ERR or (dr.origin == "modified") and BG_SEL_MOD or BG_SEL) or ""
+				local icon = sel_bar .. gclr .. glyph .. (gwide and "" or " ") .. RESET
 
 				local avail = math.max(10, term_cols - 3)
 				local metrics
 				if dr.status == "error" then
 					local err_short = (dr.last_error or "Error"):gsub("%s+", " ")
 					local ltag = (dr.last_error_line and dr.last_error_line > 0) and ("L" .. dr.last_error_line .. " ") or ""
-					metrics = "ERR " .. ltag .. err_short
+					local mod_tag = (dr.origin == "modified") and ("⚡v" .. tostring(dr.generation or 1) .. " ") or ""
+					metrics = mod_tag .. "✗ " .. ltag .. err_short
+				elseif dr.origin == "modified" then
+					if dr.status ~= "never" then
+						metrics = string.format("⚡v%d  %.1fms %s", dr.generation or 1, dr.time_ms, fmt_bytes(dr.alloc_bytes))
+					else
+						metrics = string.format("⚡v%d  in memory", dr.generation or 1)
+					end
+				elseif dr.origin == "live" then
+					if dr.status ~= "never" then
+						metrics = string.format("◆ live  %.1fms %s", dr.time_ms, fmt_bytes(dr.alloc_bytes))
+					else
+						metrics = "◆ live (memory)"
+					end
+				elseif dr.origin == "unloaded" then
+					metrics = "○ on disk"
 				elseif dr.status ~= "never" then
-					metrics = string.format("%.1fms %dB %s", dr.time_ms, dr.alloc_bytes, dr.last_run)
+					metrics = string.format("%.1fms %s %s", dr.time_ms, fmt_bytes(dr.alloc_bytes), dr.last_run)
 				else
 					metrics = "never run"
 				end
 
 				local show_file = (term_cols >= 90)
-				local sig_w = show_file and 32 or math.max(14, math.floor(avail * 0.46))
-				local met_w = show_file and 28 or math.max(10, avail - sig_w - 1)
+				local sig_w = show_file and 32 or math.max(14, math.floor(avail * 0.48))
+				local met_w = show_file and 25 or math.max(10, avail - sig_w - 1)
 				local file_w = show_file and math.max(0, avail - sig_w - met_w - 2) or 0
 
 				local sig_col = pad_right(truncate_visible(dr.signature, sig_w), sig_w)
 				local met_col = pad_right(truncate_visible(metrics, met_w), met_w)
-				local file_col = show_file and (" " .. DIM .. FG_GRAY .. pad_right(truncate_visible(dr.file, file_w), file_w) .. RESET) or ""
+				local file_txt = (dr.file and dr.file ~= "") and dr.file or "(REPL memory)"
+				local file_col = show_file and (" " .. DIM .. FG_GRAY .. pad_right(truncate_visible(file_txt, file_w), file_w) .. RESET) or ""
 
-				local met_color = (dr.status == "error") and (FG_RED .. BOLD) or FG_YELLOW
+				local met_color = (dr.status == "error") and (FG_RED .. BOLD)
+					or (dr.origin == "modified") and FG_YELLOW
+					or (dr.origin == "live") and FG_CYAN
+					or FG_YELLOW
+				local name_color = (dr.status == "error") and FG_RED
+					or (dr.origin == "modified") and FG_YELLOW
+					or (dr.origin == "live") and FG_CYAN
+					or FG_WHITE
+
+				local row_txt = icon .. (sel and BOLD or "") .. name_color .. sig_col .. RESET .. " " .. met_color .. met_col .. RESET .. file_col
 				if sel then
-					local sel_bg = (dr.status == "error") and FG_RED or FG_CYAN
-					table.insert(out_buf, icon .. REV .. BOLD .. sel_bg .. sig_col .. RESET .. " " .. met_color .. met_col .. RESET .. file_col)
+					local body = row_txt:gsub("\27%[0m", RESET .. row_bg)
+					local pad = math.max(0, term_cols - visible_len(row_txt) - (gwide and 1 or 0))
+					table.insert(out_buf, row_bg .. body .. string.rep(" ", pad) .. RESET)
 				else
-					local name_color = (dr.status == "error") and FG_RED or FG_WHITE
-					table.insert(out_buf, icon .. BOLD .. name_color .. sig_col .. RESET .. " " .. met_color .. met_col .. RESET .. file_col)
+					table.insert(out_buf, row_txt)
 				end
 			elseif dr.kind == "failed_cmd" then
-				local icon = FG_RED .. BOLD .. " ✗ " .. RESET
+				local sel_bar = sel and (FG_RED .. BOLD .. "▸" .. RESET) or " "
+				local icon = sel_bar .. FG_RED .. BOLD .. "✗ " .. RESET
 				local avail = math.max(10, term_cols - 3)
 				local cmd_one = (dr.cmd or ""):gsub("%s+", " ")
 				local err_short = (dr.error or "Error"):gsub("%s+", " ")
@@ -2161,8 +2448,11 @@ local function render(term_rows, term_cols)
 
 				local cmd_col = pad_right(truncate_visible(cmd_one, cmd_w), cmd_w)
 				local err_col = pad_right(truncate_visible(err_short, err_w), err_w)
+				local row_txt = icon .. (sel and BOLD or "") .. FG_WHITE .. cmd_col .. RESET .. " " .. FG_ORANGE .. err_col .. RESET
 				if sel then
-					table.insert(out_buf, icon .. REV .. BOLD .. FG_RED .. cmd_col .. RESET .. " " .. FG_ORANGE .. err_col .. RESET)
+					local body = row_txt:gsub("\27%[0m", RESET .. BG_SEL_ERR)
+					local pad = math.max(0, term_cols - visible_len(row_txt))
+					table.insert(out_buf, BG_SEL_ERR .. body .. string.rep(" ", pad) .. RESET)
 				else
 					table.insert(out_buf, icon .. FG_WHITE .. cmd_col .. RESET .. " " .. FG_RED .. err_col .. RESET)
 				end
@@ -2170,7 +2460,6 @@ local function render(term_rows, term_cols)
 			row_idx = row_idx + 1
 		end
 
-		-- Reset split preview scroll when selected item changes
 		local sel_proc = display_rows[cursor]
 		local cur_pkey = ""
 		if sel_proc then
@@ -2180,14 +2469,28 @@ local function render(term_rows, term_cols)
 				cur_pkey = "f:" .. tostring(sel_proc.id or "")
 			end
 		end
+
+		local has_sticky_err = sel_proc and sel_proc.kind == "procedure" and sel_proc.status == "error"
+			and preview_h >= 4 and (sel_proc.last_error or "") ~= ""
+		local err_strip_h = has_sticky_err and 1 or 0
+		local code_view_h = math.max(1, preview_h - err_strip_h)
+
+		-- Build compact preview lines before separator to compute accurate line range & auto-scroll
+		local preview_lines = build_item_preview_lines(sel_proc, term_cols, true)
 		if cur_pkey ~= last_proc_preview_key then
 			last_proc_preview_key = cur_pkey
-			proc_preview_scroll = 0
+			if sel_proc and sel_proc.kind == "procedure" then
+				if sel_proc.last_error_line and sel_proc.last_error_line > 0 then
+					proc_preview_scroll = math.max(0, sel_proc.last_error_line - math.max(2, math.floor(code_view_h / 2)))
+				else
+					proc_preview_scroll = math.max(0, (sel_proc.func_start_line or 1) - 1)
+				end
+			else
+				proc_preview_scroll = 0
+			end
 		end
 
-		-- Build preview lines before separator so separator shows line range / scroll hint
-		local preview_lines = build_item_preview_lines(sel_proc, term_cols)
-		local max_pscroll = math.max(0, #preview_lines - preview_h)
+		local max_pscroll = math.max(0, #preview_lines - code_view_h)
 		if proc_preview_scroll > max_pscroll then
 			proc_preview_scroll = max_pscroll
 		end
@@ -2195,30 +2498,55 @@ local function render(term_rows, term_cols)
 			proc_preview_scroll = 0
 		end
 
-		-- Preview separator
+		-- Clean full-width BG_PANEL preview header bar (no broken floating corners)
 		local split_row = header_rows + 1 + list_max_h
+		preview_split_row = split_row
 		table.insert(out_buf, move(split_row, 1))
-		local p_name = " Preview "
+		local p_left = " Preview"
 		if sel_proc and sel_proc.kind == "procedure" then
-			local tag = (sel_proc.status == "error") and (FG_RED .. "✗ " .. RESET .. FG_WHITE) or ""
-			p_name = " " .. tag .. (sel_proc.file or sel_proc.name or "Procedure") .. " "
+			local glyph, gclr = origin_glyph_and_color(sel_proc.origin, sel_proc.status)
+			local orig_lbl = (sel_proc.origin == "modified") and ("⚡v" .. tostring(sel_proc.generation or 1))
+				or (sel_proc.origin == "live") and "◆ LIVE"
+				or (sel_proc.origin == "unloaded") and "○ DISK"
+				or "● DISK"
+			local fname_short = (sel_proc.file and sel_proc.file ~= "") and (sel_proc.file:match("[^/]+$") or sel_proc.file) or ""
+			local file_part = (fname_short ~= "" and fname_short ~= ((sel_proc.name or "") .. ".jl")) and (" · " .. fname_short) or ""
+			local stat_part = (sel_proc.status ~= "never")
+				and string.format(" · %.1fms %s", sel_proc.time_ms or 0, fmt_bytes(sel_proc.alloc_bytes or 0))
+				or ""
+			p_left = " " .. gclr .. glyph .. RESET .. " "
+				.. BOLD .. FG_WHITE .. (sel_proc.name or "proc") .. RESET
+				.. DIM .. FG_GRAY .. " [" .. orig_lbl .. file_part .. stat_part .. "]" .. RESET
 		elseif sel_proc and sel_proc.kind == "failed_cmd" then
-			p_name = " " .. FG_RED .. "✗ Failed Cmd #" .. tostring(sel_proc.id or "") .. RESET .. " "
+			p_left = " " .. FG_RED .. BOLD .. "✗ Failed Cmd #" .. tostring(sel_proc.id or "") .. RESET
+				.. DIM .. FG_GRAY .. " [" .. (sel_proc.source or "repl") .. "]" .. RESET
 		end
-		local scroll_info = ""
-		if #preview_lines > preview_h then
-			scroll_info = string.format(" [%d-%d/%d J/K] ", proc_preview_scroll + 1, math.min(#preview_lines, proc_preview_scroll + preview_h), #preview_lines)
-		else
-			scroll_info = " [v full] "
-		end
-		local max_ptitle_w = math.max(8, term_cols - visible_len(scroll_info) - 6)
-		local ptitle_vis = truncate_visible(p_name, max_ptitle_w)
-		local fill_w = math.max(0, term_cols - visible_len(ptitle_vis) - visible_len(scroll_info) - 4)
-		table.insert(out_buf, FG_AQUA .. "╭─" .. BOLD .. FG_WHITE .. ptitle_vis .. RESET .. FG_AQUA .. string.rep("─", fill_w) .. DIM .. FG_GRAY .. scroll_info .. RESET .. FG_AQUA .. "─╮" .. RESET)
 
-		-- Preview body (scrollable + wrapped)
+		local scroll_info = (#preview_lines > code_view_h)
+			and string.format(" [L%d-%d/%d J/K] ", proc_preview_scroll + 1, math.min(#preview_lines, proc_preview_scroll + code_view_h), #preview_lines)
+			or " [v full] "
+		local max_pleft_w = math.max(8, term_cols - visible_len(scroll_info) - 1)
+		local pleft_vis = truncate_visible(p_left, max_pleft_w)
+		local fill_sp = math.max(0, term_cols - visible_len(pleft_vis) - visible_len(scroll_info))
+		local hdr_line = pleft_vis .. string.rep(" ", fill_sp) .. DIM .. FG_LIGHT_GRAY .. scroll_info .. RESET
+		table.insert(out_buf, BG_PANEL .. hdr_line:gsub("\27%[0m", RESET .. BG_PANEL) .. RESET)
+
 		local preview_row = split_row + 1
-		for li = 1, preview_h do
+		if has_sticky_err and preview_row <= term_rows - 2 then
+			table.insert(out_buf, move(preview_row, 1))
+			local ltag = (sel_proc.last_error_line and sel_proc.last_error_line > 0) and ("L" .. sel_proc.last_error_line .. ": ") or ""
+			local err_txt = " ✗ " .. ltag .. ((sel_proc.last_error or ""):gsub("%s+", " "))
+			if sel_proc.last_run_cmd and sel_proc.last_run_cmd ~= "" then
+				err_txt = err_txt .. "  (" .. sel_proc.last_run_cmd:gsub("%s+", " ") .. ")"
+			end
+			local etrunc = truncate_visible(err_txt, term_cols)
+			local epad = math.max(0, term_cols - visible_len(etrunc))
+			table.insert(out_buf, BG_ERR_LINE .. FG_RED .. BOLD .. etrunc .. string.rep(" ", epad) .. RESET)
+			preview_row = preview_row + 1
+		end
+
+		-- Preview body (scrollable + wrapped source code)
+		for li = 1, code_view_h do
 			if preview_row > term_rows - 2 then
 				break
 			end
@@ -2241,6 +2569,7 @@ local function render(term_rows, term_cols)
 		for i = win_start, math.min(win_start + content_rows - 1, total) do
 			local dr = display_rows[i]
 			local sel = (i == cursor)
+			row_hitboxes[row_idx] = i
 			table.insert(out_buf, move(row_idx, 1))
 
 			if dr.kind == "module" then
@@ -2276,23 +2605,22 @@ local function render(term_rows, term_cols)
 
 				local indent = string.rep("  ", dr.depth or 0)
 				local tree_icon = dr.has_children and (dr.icon ~= "" and dr.icon .. " " or "  ") or kind_icon
+				local name_w, type_w, val_max = ws_col_widths(term_cols)
 				local name_text = "    " .. indent .. tree_icon .. dr.name
-				local name_col = pad_right(truncate_visible(name_text, 28), 28)
-				local type_col = pad_right(truncate_visible(dr.item_type, 20), 20)
-				local fixed_w = 28 + 20 + 4
-				local val_max = math.max(0, term_cols - fixed_w)
+				local name_col = pad_right(truncate_visible(name_text, name_w), name_w)
+				local type_col = pad_right(truncate_visible(dr.item_type, type_w), type_w)
 				local val_col = pad_right(truncate_visible(dr.value, val_max), val_max)
 
 				if sel then
 					local out_str
 					if col_cursor == 1 then
-						out_str = REV .. name_col .. RESET .. "  " .. kc .. type_col .. "  " .. FG_WHITE .. val_col
+						out_str = BG_SEL .. BOLD .. kc .. name_col .. RESET .. BG_SEL .. "  " .. kc .. type_col .. "  " .. FG_WHITE .. val_col .. RESET
 					elseif col_cursor == 2 then
-						out_str = name_col .. "  " .. REV .. kc .. type_col .. RESET .. "  " .. FG_WHITE .. val_col
+						out_str = BG_SEL .. kc .. name_col .. "  " .. BOLD .. FG_YELLOW .. type_col .. RESET .. BG_SEL .. "  " .. FG_WHITE .. val_col .. RESET
 					else
-						out_str = name_col .. "  " .. kc .. type_col .. "  " .. REV .. FG_WHITE .. val_col .. RESET
+						out_str = BG_SEL .. kc .. name_col .. "  " .. kc .. type_col .. "  " .. BOLD .. FG_WHITE .. val_col .. RESET
 					end
-					table.insert(out_buf, kc .. out_str .. RESET)
+					table.insert(out_buf, out_str)
 				else
 					table.insert(out_buf, kc .. name_col .. "  " .. FG_GRAY .. type_col .. "  " .. FG_WHITE .. val_col .. RESET)
 				end
@@ -2411,48 +2739,13 @@ local function render(term_rows, term_cols)
 		table.insert(out_buf, FG_DARK_GRAY .. string.rep("─", term_cols) .. RESET)
 	end
 
-	-- Row term_rows: Shortcut Pills
-	table.insert(out_buf, move(term_rows, 1))
-	local function pill(k, d)
-		return BOLD .. FG_CYAN .. "[" .. k .. "] " .. RESET .. DIM .. FG_LIGHT_GRAY .. d .. "  " .. RESET
-	end
-	local help = ""
-	if active_tab == 1 then
-		help = pill("/", "Search") .. pill("1-4", "Tabs") .. pill("j/k", "Nav") .. pill("h/l", "Fold") .. pill("↵", "Eval") .. pill("i", "Inspect") .. pill("?", "Guide") .. pill("q", "Quit")
-	elseif active_tab == 2 then
-		help = pill("Space", "Sel") .. pill("h/l", "Fold") .. pill("H", "Prev") .. pill("v", "View") .. pill("p", "Proc") .. pill("↵", "Send") .. pill("?", "Guide") .. pill("q", "Quit")
-	elseif active_tab == 3 then
-		help = pill("v", "View") .. pill("J/K", "Scroll") .. pill("↵", "Run") .. pill("e", "Edit") .. pill("d", "Del") .. pill("D", "ClrErr") .. pill("?", "Guide") .. pill("q", "Quit")
-	elseif active_tab == 4 then
-		help = pill("/", "Search") .. pill("1-4", "Tabs") .. pill("j/k", "Nav") .. pill("a", "Add") .. pill("d", "Remove") .. pill("u", "Update") .. pill("?", "Guide") .. pill("q", "Quit")
-	elseif active_tab == 5 then
-		help = pill("/", "Search") .. pill("j/k", "Nav") .. pill("g/G", "Top/Bot") .. pill("1-4", "Tabs") .. pill("?/Esc", "Close Guide") .. pill("q", "Quit")
-	end
-	if visible_len(" " .. help) > term_cols then
-		help = truncate_visible(help, math.max(1, term_cols - 1))
-	end
-	table.insert(out_buf, pad_right(" " .. help, term_cols))
+	-- Row term_rows: Shortcut Pills (adaptive width + mouse hitboxes)
+	render_footer_pills(out_buf, term_rows, term_cols)
 	end
 
 	-- Modal popup overlay if active
 	if modal_active then
-		local box_w = math.max(24, math.min(56, term_cols - 4))
-		local inner = math.max(10, box_w - 2)
-		local box_h = 5
-		local top = math.max(2, math.floor((term_rows - box_h) / 2))
-		local left = math.max(1, math.floor((term_cols - box_w) / 2))
-
-		local title = " " .. truncate_visible(modal_title, math.max(6, box_w - 8)) .. " "
-		local fill_w = math.max(0, box_w - 4 - visible_len(title))
-		local top_border = "╭─" .. BOLD .. FG_WHITE .. title .. RESET .. FG_CYAN .. string.rep("─", fill_w) .. "╮"
-		local bot_border = "╰" .. string.rep("─", inner) .. "╯"
-		local prompt_line = "  Input: " .. BOLD .. FG_YELLOW .. truncate_visible(modal_input, math.max(4, inner - 11)) .. RESET .. REV .. " " .. RESET
-		local hint_line = "  " .. FG_GREEN .. "[Enter]" .. RESET .. DIM .. " Confirm   " .. RESET .. FG_RED .. "[Esc]" .. RESET .. DIM .. " Cancel" .. RESET
-
-		table.insert(out_buf, move(top, left) .. BOLD .. FG_CYAN .. top_border .. RESET)
-		table.insert(out_buf, move(top + 1, left) .. BOLD .. FG_CYAN .. "│" .. RESET .. pad_right(prompt_line, inner) .. BOLD .. FG_CYAN .. "│" .. RESET)
-		table.insert(out_buf, move(top + 2, left) .. BOLD .. FG_CYAN .. "│" .. RESET .. pad_right(truncate_visible(hint_line, inner), inner) .. BOLD .. FG_CYAN .. "│" .. RESET)
-		table.insert(out_buf, move(top + 3, left) .. BOLD .. FG_CYAN .. bot_border .. RESET)
+		render_modal(out_buf, term_rows, term_cols)
 	end
 
 	table.insert(out_buf, SYNC_END)
@@ -2463,6 +2756,74 @@ end
 -- ---------------------------------------------------------------------------
 -- Input handling
 -- ---------------------------------------------------------------------------
+local function pick_editor()
+	for _, var in ipairs({ "VISUAL", "EDITOR" }) do
+		local v = os.getenv(var)
+		if v and v ~= "" then
+			return v
+		end
+	end
+	for _, ed in ipairs({ "nano", "nvim", "vim", "vi" }) do
+		local h = io.popen("command -v " .. ed .. " 2>/dev/null")
+		if h then
+			local res = h:read("*l")
+			h:close()
+			if res and res ~= "" then
+				return ed
+			end
+		end
+	end
+	return "vi"
+end
+
+local function open_in_external_editor(dr)
+	if not dr or dr.kind ~= "procedure" then
+		return
+	end
+	local src = (dr.edit_code and dr.edit_code ~= "") and dr.edit_code or (dr.code or "")
+	if src == "" then
+		src = "function " .. (dr.signature or (dr.name .. "()")) .. "\n    \nend\n"
+	end
+	local tmp_path = string.format("/tmp/jemach_edit_%s_%d.jl", dr.name:gsub("[^%w_]", "_"), os.time())
+	local wf = io.open(tmp_path, "w")
+	if not wf then
+		set_toast("✗ Cannot create temp file")
+		return
+	end
+	wf:write(src)
+	if src:sub(-1) ~= "\n" then
+		wf:write("\n")
+	end
+	wf:close()
+
+	io.write((mouse_enabled and MOUSE_OFF or "") .. SHOW_CUR .. ALT_SCREEN_OFF)
+	io.flush()
+	raw_mode_off()
+
+	local ed = pick_editor()
+	os.execute(string.format("%s '%s'", ed, tmp_path:gsub("'", "'\\''")))
+
+	raw_mode_on()
+	io.write(ALT_SCREEN_ON .. HIDE_CUR .. (mouse_enabled and MOUSE_ON or ""))
+	io.flush()
+
+	local rf = io.open(tmp_path, "r")
+	local edited = rf and rf:read("*a") or ""
+	if rf then
+		rf:close()
+	end
+	os.remove(tmp_path)
+
+	local trimmed = edited:gsub("^%s+", ""):gsub("%s+$", "")
+	local orig_trimmed = src:gsub("^%s+", ""):gsub("%s+$", "")
+	if trimmed ~= "" and trimmed ~= orig_trimmed then
+		repl_eval(trimmed, true, false, "jEMach:" .. dr.name, dr.name)
+		set_toast("⚡ Applied '" .. dr.name .. "' in Main memory")
+	else
+		set_toast("Edit cancelled (no changes)")
+	end
+end
+
 local function prompt_or_run_procedure(dr)
 	if not dr or dr.kind ~= "procedure" then
 		return
@@ -2470,9 +2831,14 @@ local function prompt_or_run_procedure(dr)
 	if dr.needs_args then
 		modal_active = true
 		modal_title = "Args for " .. (dr.signature or dr.name)
-		modal_input = ""
+		modal_input = (last_modal_args[dr.name] and last_modal_args[dr.name] ~= "")
+			and last_modal_args[dr.name]
+			or (dr.last_args or "")
 		modal_callback = function(ans)
 			local a = (ans or ""):gsub("^%s+", ""):gsub("%s+$", "")
+			if a ~= "" then
+				last_modal_args[dr.name] = a
+			end
 			if a == "" then
 				tmux_send(string.format("jEMach.run_procedure(:%s)", dr.name))
 			elseif a:sub(1, 1) == ";" then
@@ -2489,9 +2855,134 @@ local function prompt_or_run_procedure(dr)
 	end
 end
 
-local function handle_key(key, term_rows, term_cols)
+local handle_key -- forward declaration for mouse dispatcher
+
+local function handle_mouse(seq, term_rows, term_cols)
+	local btn_s, col_s, row_s, kind = seq:match("^\27%[<(%d+);(%d+);(%d+)([Mm])$")
+	if not btn_s then
+		return nil
+	end
+	local btn = tonumber(btn_s)
+	local mx = tonumber(col_s)
+	local my = tonumber(row_s)
+
+	-- Wheel up / down
+	if btn == 64 or btn == 68 or btn == 72 then
+		if detail_view_active then
+			detail_scroll = math.max(0, detail_scroll - 3)
+		elseif active_tab == 3 and preview_split_row > 0 and my > preview_split_row then
+			proc_preview_scroll = math.max(0, proc_preview_scroll - 3)
+		else
+			move_cursor(-3)
+		end
+		return nil
+	elseif btn == 65 or btn == 69 or btn == 73 then
+		if detail_view_active then
+			detail_scroll = detail_scroll + 3
+		elseif active_tab == 3 and preview_split_row > 0 and my > preview_split_row then
+			proc_preview_scroll = proc_preview_scroll + 3
+		else
+			move_cursor(3)
+		end
+		return nil
+	end
+
+	-- Only react to left button press (btn == 0, kind == "M")
+	if btn ~= 0 or kind ~= "M" then
+		return nil
+	end
+	if modal_active or search_mode then
+		return nil
+	end
+
+	-- Tab bar click (Row 1)
+	if my == 1 then
+		for _, hb in ipairs(tab_hitboxes) do
+			if mx >= hb.x1 and mx <= hb.x2 then
+				if detail_view_active then
+					detail_view_active = false
+					detail_item = nil
+				end
+				if hb.tab == 5 then
+					return handle_key("?", term_rows, term_cols)
+				else
+					guide_tab_open = false
+					switch_tab(hb.tab)
+					return nil
+				end
+			end
+		end
+		return nil
+	end
+
+	if detail_view_active then
+		if my >= term_rows - 1 then
+			detail_view_active = false
+			detail_item = nil
+		end
+		return nil
+	end
+
+	-- Tab 3 [F] Errors / Back header badge click (Row 3)
+	if my == 3 and active_tab == 3 and header_err_hitbox then
+		if mx >= header_err_hitbox.x1 and mx <= header_err_hitbox.x2 then
+			return handle_key("F", term_rows, term_cols)
+		end
+	end
+
+	-- Bottom footer pill click
+	if my == term_rows then
+		for _, ab in ipairs(action_hitboxes) do
+			if mx >= ab.x1 and mx <= ab.x2 then
+				return handle_key(ab.key, term_rows, term_cols)
+			end
+		end
+		return nil
+	end
+
+	-- Row selection + double-click action
+	local idx = row_hitboxes[my]
+	if idx and display_rows[idx] then
+		local dr = display_rows[idx]
+		local t_now = now_ms()
+		local is_dbl = (last_click_row == idx) and ((t_now - last_click_ms) < 420)
+		last_click_row = idx
+		last_click_ms = t_now
+
+		if is_selectable_row(dr) then
+			cursor = idx
+			tab_cursors[active_tab] = idx
+			if is_dbl then
+				if active_tab == 3 then
+					return handle_key("e", term_rows, term_cols)
+				elseif active_tab == 1 then
+					if dr.kind == "module" or dr.has_children then
+						local key_k = dr.collapsed and "l" or "h"
+						return handle_key(key_k, term_rows, term_cols)
+					elseif dr.kind == "item" and dr.item_kind == "function" then
+						return handle_key("e", term_rows, term_cols)
+					end
+				elseif active_tab == 2 then
+					if dr.kind == "hist_section" then
+						return handle_key(" ", term_rows, term_cols)
+					elseif dr.kind == "history" then
+						return handle_key("e", term_rows, term_cols)
+					end
+				end
+			end
+		end
+	end
+	return nil
+end
+
+handle_key = function(key, term_rows, term_cols)
 	if not key then
 		return
+	end
+
+	-- Mouse SGR sequences (\27[<btn;col;row[Mm])
+	if key:sub(1, 3) == "\27[<" then
+		return handle_mouse(key, term_rows, term_cols)
 	end
 
 	-- Global Quit
@@ -2513,6 +3004,10 @@ local function handle_key(key, term_rows, term_cols)
 			if cb then
 				cb(val)
 			end
+			return
+		elseif key == "\21" then -- Ctrl+U clear
+			modal_input = ""
+			dirty = true
 			return
 		elseif key == "\127" or key == "\8" then -- Backspace
 			if #modal_input > 0 then
@@ -2541,6 +3036,10 @@ local function handle_key(key, term_rows, term_cols)
 			search_mode = false
 			build_display_rows()
 			clamp_cursor()
+			dirty = true
+			return
+		elseif key == "\21" then -- Ctrl+U clear
+			modal_input = ""
 			dirty = true
 			return
 		elseif key == "\127" or key == "\8" then -- Backspace
@@ -2608,12 +3107,35 @@ local function handle_key(key, term_rows, term_cols)
 		elseif key == "e" then
 			if detail_item then
 				if detail_item.kind == "procedure" then
-					repl_insert(detail_item.name .. "()", 1)
-					set_toast("Pasted " .. detail_item.name .. "() into REPL")
+					local edit_src = (detail_item.edit_code and detail_item.edit_code ~= "") and detail_item.edit_code or (detail_item.code or "")
+					edit_src = edit_src:gsub("^%s+", ""):gsub("%s+$", "")
+					repl_replace_input(edit_src, 0)
+					focus_repl_pane()
+					detail_view_active = false
+					detail_item = nil
+					set_toast("✎ Loaded '" .. detail_item.name .. "' in REPL")
 				elseif detail_item.kind == "failed_cmd" or detail_item.kind == "history" then
-					repl_insert(detail_item.cmd or "", 0)
+					repl_replace_input(detail_item.cmd or "", 0)
+					focus_repl_pane()
 					set_toast("Pasted command into REPL")
 				end
+			end
+			return
+		elseif key == "E" then
+			if detail_item and detail_item.kind == "procedure" then
+				open_in_external_editor(detail_item)
+			end
+			return
+		elseif key == "c" then
+			if detail_item and detail_item.kind == "procedure" then
+				local a = (detail_item.last_args and detail_item.last_args ~= "") and detail_item.last_args or ""
+				if a ~= "" then
+					repl_insert(detail_item.name .. "(" .. a .. ")", 0)
+				else
+					repl_insert(detail_item.name .. "()", 1)
+				end
+				focus_repl_pane()
+				set_toast("Inserted " .. detail_item.name .. "() call")
 			end
 			return
 		end
@@ -2623,6 +3145,22 @@ local function handle_key(key, term_rows, term_cols)
 	-- Normal mode quit
 	if key == "q" then
 		return "quit"
+	end
+
+	-- Toggle SGR mouse tracking (allows easy native text selection without holding Shift)
+	if key == "m" then
+		mouse_enabled = not mouse_enabled
+		io.write(mouse_enabled and MOUSE_ON or MOUSE_OFF)
+		io.flush()
+		set_toast(mouse_enabled and "Mouse ON (click & scroll)" or "Mouse OFF (drag to copy)")
+		return
+	end
+
+	-- Global screen clear (Ctrl+L)
+	if key == "\12" then
+		repl_clear()
+		set_toast("Cleared REPL screen")
+		return
 	end
 
 	-- Enter search mode
@@ -2813,12 +3351,18 @@ local function handle_key(key, term_rows, term_cols)
 			local dr = display_rows[cursor]
 			if dr and dr.kind == "item" then
 				if dr.expr:match("^[%a_][%w_!%.%[%]%s%\"%:%']*$") then
-					if dr.item_kind == "function" then
+					if dr.item_kind == "function" and not dr.expr:find("%.") then
+						repl_eval(string.format("jEMach.edit_procedure(:%s)", dr.name), true, false)
+						focus_repl_pane()
+						set_toast("✎ Loaded '" .. dr.name .. "' in REPL")
+					elseif dr.item_kind == "function" then
 						repl_insert(dr.expr .. "()", 1)
+						focus_repl_pane()
+						set_toast("Inserted " .. dr.expr .. "() into REPL")
 					else
 						repl_insert(dr.expr .. " ", 0)
+						set_toast("Inserted " .. dr.expr .. " into REPL")
 					end
-					set_toast("Inserted " .. dr.expr .. " into REPL")
 				end
 			end
 		elseif key == "d" then
@@ -2968,6 +3512,11 @@ local function handle_key(key, term_rows, term_cols)
 		elseif key == "K" then
 			proc_preview_scroll = math.max(0, proc_preview_scroll - 3)
 			dirty = true
+		elseif key == "F" then
+			proc_errors_view = not proc_errors_view
+			build_display_rows()
+			clamp_cursor()
+			set_toast(proc_errors_view and "Failed Commands sub-view" or "Procedures view")
 		elseif key == "\r" or key == "\n" then
 			if dr and dr.kind == "procedure" then
 				prompt_or_run_procedure(dr)
@@ -2977,22 +3526,81 @@ local function handle_key(key, term_rows, term_cols)
 			end
 		elseif key == "e" then
 			if dr and dr.kind == "procedure" then
-				repl_insert(dr.name .. "()", 1)
-				set_toast("Pasted " .. dr.name .. "() into REPL")
+				local edit_src = (dr.edit_code and dr.edit_code ~= "") and dr.edit_code or (dr.code or "")
+				edit_src = edit_src:gsub("^%s+", ""):gsub("%s+$", "")
+				if edit_src ~= "" then
+					repl_replace_input(edit_src, 0)
+				else
+					repl_eval(string.format("jEMach.edit_procedure(:%s)", dr.name), true, false)
+				end
+				focus_repl_pane()
+				set_toast("✎ Loaded '" .. dr.name .. "' in REPL (Enter applies)")
 			elseif dr and dr.kind == "failed_cmd" then
-				repl_insert(dr.cmd, 0)
-				set_toast("Pasted failed command into REPL")
+				repl_replace_input(dr.cmd, 0)
+				focus_repl_pane()
+				set_toast("Loaded failed command into REPL")
+			end
+		elseif key == "E" then
+			if dr and dr.kind == "procedure" then
+				open_in_external_editor(dr)
+			end
+		elseif key == "c" then
+			if dr and dr.kind == "procedure" then
+				local a = (last_modal_args[dr.name] and last_modal_args[dr.name] ~= "")
+					and last_modal_args[dr.name]
+					or (dr.last_args or "")
+				if a ~= "" then
+					repl_insert(dr.name .. "(" .. a .. ")", 0)
+				else
+					repl_insert(dr.name .. "()", 1)
+				end
+				focus_repl_pane()
+				set_toast("Inserted " .. dr.name .. "(...) call")
+			else
+				repl_clear()
+			end
+		elseif key == "R" then
+			if dr and dr.kind == "procedure" then
+				if dr.file and dr.file ~= "" then
+					repl_eval(string.format("jEMach.reload_procedure(:%s)", dr.name), true, false)
+					set_toast("↺ Reloaded '" .. dr.name .. "' from disk")
+				else
+					set_toast("Live function only — press [S] to save to disk")
+				end
+			else
+				repl_eval("jEMach.autoload_procedures!(; force=true); jEMach.publish_state()", true, false)
+				set_toast("↺ Reloaded all disk procedures")
+			end
+		elseif key == "S" then
+			if dr and dr.kind == "procedure" then
+				modal_active = true
+				modal_title = "Save '" .. dr.name .. "' as (procedures/<name>.jl)"
+				modal_input = dr.name
+				modal_callback = function(ans)
+					local target = (ans or ""):gsub("%s+", "")
+					if target == "" then
+						target = dr.name
+					end
+					if target == dr.name then
+						repl_eval(string.format("jEMach.save_procedure(:%s)", dr.name), true, false)
+					else
+						repl_eval(string.format("jEMach.save_procedure(:%s; as_name=:%s)", dr.name, target), true, false)
+					end
+					set_toast("💾 Saved to procedures/" .. target .. ".jl")
+				end
 			end
 		elseif key == "d" then
 			if dr and dr.kind == "procedure" then
 				modal_active = true
-				modal_title = "Delete procedure '" .. dr.name .. "'? (y/n)"
+				modal_title = (dr.file and dr.file ~= "")
+					and ("Delete '" .. dr.name .. "' (" .. dr.file .. ")? (y/n)")
+					or ("Remove live '" .. dr.name .. "' from list? (y/n)")
 				modal_input = ""
 				modal_callback = function(ans)
 					local a = ans:lower():gsub("%s+", "")
 					if a == "y" or a == "yes" then
-						repl_eval(string.format("rm(joinpath(jEMach._get_project_dir(), %q), force=true); jEMach._load_procedures!(); jEMach.publish_state()", dr.file), true, false)
-						set_toast("Deleted procedure " .. dr.name)
+						repl_eval(string.format("jEMach._delete_procedure!(:%s)", dr.name), true, false)
+						set_toast("Removed procedure " .. dr.name)
 					end
 				end
 			elseif dr and dr.kind == "failed_cmd" then
@@ -3004,9 +3612,7 @@ local function handle_key(key, term_rows, term_cols)
 			set_toast("Cleared failed commands list")
 		elseif key == "r" then
 			repl_eval("jEMach._load_procedures!(); jEMach.publish_state()", true, false)
-			set_toast("Reloaded procedures")
-		elseif key == "c" then
-			repl_clear()
+			set_toast("Refreshed procedures")
 		end
 
 	-- -----------------------------------------------------------------------
@@ -3065,13 +3671,13 @@ end
 -- ---------------------------------------------------------------------------
 local function main()
 	raw_mode_on()
-	io.write(ALT_SCREEN_ON .. HIDE_CUR .. SET_TITLE)
+	io.write(ALT_SCREEN_ON .. HIDE_CUR .. (mouse_enabled and MOUSE_ON or "") .. SET_TITLE)
 	io.flush()
 
 	-- Ensure terminal is restored on exit
 	local function cleanup()
 		raw_mode_off()
-		io.write(SHOW_CUR .. ALT_SCREEN_OFF)
+		io.write(MOUSE_OFF .. SHOW_CUR .. ALT_SCREEN_OFF)
 		io.flush()
 	end
 

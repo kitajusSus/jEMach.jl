@@ -2,7 +2,7 @@
 
 const _JEMACH_COMMANDS = [
     "help", "ui", "toggle", "open", "close", "clear", "ws", "vars", "ls", "find", "show",
-    "run", "make", "rec", "stop", "inspect", "errors", "save", "reload", "status", "shutdown",
+    "run", "edit", "make", "rec", "stop", "inspect", "errors", "save", "reload", "status", "shutdown",
 ]
 
 function _print_jemach_help(io::IO = stdout)
@@ -11,16 +11,17 @@ function _print_jemach_help(io::IO = stdout)
         ("ui | toggle", "Toggle the TUI split/window (also Alt+j)"),
         ("open | close | clear", "Open / close TUI, or clear REPL screen (clear())"),
         ("ws [filter]", "Workspace table with memory sizes (also `workspace()`)"),
-        ("ls [query] | find <q>", "List / search saved procedures"),
+        ("ls [query] | find <q>", "List / search saved & live procedures"),
         ("show <name>", "Show a procedure card with status, errors & source"),
+        ("edit <name>", "Load clean function into `julia>` REPL editor"),
         ("errors", "Show recent failed commands and errored procedures"),
         ("run <name>(args...)", "Run a procedure with profiling (args space- or comma-sep)"),
         ("<name>(args...)", "Shortcut: run an existing procedure directly"),
         ("make <name> [N]", "Create a procedure from the last N commands (default 5)"),
         ("rec [name] | stop", "Start / stop recording a procedure (also Alt+r)"),
         ("inspect <expr> | i <expr>", "Deep inspection of a variable/function"),
-        ("save", "Save a clean, replayable session script"),
-        ("reload", "Reload procedures/ into Main"),
+        ("save [<name> [new]]", "Save session script, or save modified/live procedure"),
+        ("reload [<name>]", "Reload procedures/ (or one procedure) from disk"),
         ("status", "Watcher, socket and terminal diagnostics"),
         ("shutdown", "Stop the watcher and close the TUI"),
     ]
@@ -171,12 +172,32 @@ function _exec_command(line::AbstractString)
         inspect_var(Main, rest)
     elseif !is_proc_call && cmd in ("errors", "errs", "failed")
         _print_errors_summary()
+    elseif cmd in ("edit", "e") && isnothing(m_call)
+        isempty(rest) && throw(ArgumentError("usage: edit <name>"))
+        res = edit_procedure(rest)
+        return isnothing(_get_mistate()) ? res : nothing
     elseif !is_proc_call && cmd == "save"
-        save_clean_session()
+        if isempty(rest)
+            save_clean_session()
+        else
+            parts = split(rest)
+            as_arg = if length(parts) >= 3 && lowercase(parts[2]) == "as"
+                parts[3]
+            elseif length(parts) >= 2
+                parts[2]
+            else
+                nothing
+            end
+            save_procedure(parts[1]; as_name = as_arg)
+        end
     elseif !is_proc_call && cmd in ("reload", "autoload")
-        autoload_procedures!()
-        publish_state()
-        println("✓ Loaded $(length(_procedures)) procedure(s) into Main")
+        if isempty(rest)
+            autoload_procedures!(; force = true)
+            publish_state()
+            println("✓ Reloaded $(length(_procedures)) procedure(s) from disk into Main")
+        else
+            reload_procedure(rest)
+        end
     elseif !is_proc_call && cmd in ("status", "info")
         status()
         info = terminal_info()
@@ -263,8 +284,10 @@ function _jemach_completions(partial::AbstractString)
         vcat(_JEMACH_COMMANDS, proc_names)
     else
         c = lowercase(words_before[1])
-        if c in ("run", "show", "ls", "find") && length(words_before) == 1
+        if c in ("run", "show", "ls", "find", "reload", "save") && length(words_before) == 1
             proc_names
+        elseif c in ("edit", "e") && length(words_before) == 1
+            vcat(proc_names, _main_symbol_names())
         elseif c in ("inspect", "i", "ws", "vars")
             _main_symbol_names()
         else
@@ -345,6 +368,7 @@ function _install_repl_error_hook!(repl, main::LineEdit.Prompt)
                         Base.invokelatest(_record_command_outcome!, line, false, err_stack, nothing; source = "repl", is_stack = is_stack)
                     end
                 elseif !is_proc_runner
+                    Base.invokelatest(_capture_repl_definitions!, line)
                     Base.invokelatest(_record_command_outcome!, line, true; source = "repl")
                 end
                 @async (sleep(0.02); Base.invokelatest(publish_state))

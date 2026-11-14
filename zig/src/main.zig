@@ -89,6 +89,9 @@ pub fn main(init: std.process.Init) !void {
     var cached_state: std.ArrayList(u8) = .empty;
     defer cached_state.deinit(allocator);
 
+    var pub_scratch: std.ArrayList(u8) = .empty;
+    defer pub_scratch.deinit(allocator);
+
     var poll_fds: std.ArrayList(pollfd) = .empty;
     defer poll_fds.deinit(allocator);
 
@@ -144,41 +147,41 @@ pub fn main(init: std.process.Init) !void {
                     _ = write(client_fd, cached_state.items.ptr, cached_state.items.len);
                 }
             } else {
-                var pub_payload: std.ArrayList(u8) = .empty;
-                defer pub_payload.deinit(allocator);
+                pub_scratch.clearRetainingCapacity();
+                try pub_scratch.appendSlice(allocator, header);
 
-                try pub_payload.appendSlice(allocator, header);
-
+                var dropped = false;
                 while (true) {
                     var read_buf: [4096]u8 = undefined;
                     const n = read(client_fd, &read_buf, read_buf.len);
                     if (n <= 0) break;
-                    try pub_payload.appendSlice(allocator, read_buf[0..@intCast(n)]);
+                    try pub_scratch.appendSlice(allocator, read_buf[0..@intCast(n)]);
 
-                    if (pub_payload.items.len > 512 * 1024) {
-                        std.debug.print("Publisher payload too large, dropping.\n", .{});
+                    if (pub_scratch.items.len > 2 * 1024 * 1024) {
+                        std.debug.print("Publisher payload too large (>2MiB), dropping.\n", .{});
+                        dropped = true;
                         break;
                     }
                 }
                 _ = close(client_fd);
 
-                if (pub_payload.items.len > 0) {
-                    if (pub_payload.items[pub_payload.items.len - 1] != '\n') {
-                        try pub_payload.append(allocator, '\n');
+                if (!dropped and pub_scratch.items.len > 0) {
+                    if (pub_scratch.items[pub_scratch.items.len - 1] != '\n') {
+                        try pub_scratch.append(allocator, '\n');
                     }
 
-                    const is_cmd = std.mem.startsWith(u8, pub_payload.items, "CMD ") or
-                        std.mem.startsWith(u8, pub_payload.items, "{\"cmd\":");
+                    const is_cmd = std.mem.startsWith(u8, pub_scratch.items, "CMD ") or
+                        std.mem.startsWith(u8, pub_scratch.items, "{\"cmd\":");
 
                     if (!is_cmd) {
                         cached_state.clearRetainingCapacity();
-                        try cached_state.appendSlice(allocator, pub_payload.items);
+                        try cached_state.appendSlice(allocator, pub_scratch.items);
                     }
 
                     var i: usize = 0;
                     while (i < subscribers.items.len) {
                         const sub_fd = subscribers.items[i];
-                        const write_res = write(sub_fd, pub_payload.items.ptr, pub_payload.items.len);
+                        const write_res = write(sub_fd, pub_scratch.items.ptr, pub_scratch.items.len);
                         if (write_res < 0) {
                             std.debug.print("Subscriber disconnected on write, removing.\n", .{});
                             _ = close(sub_fd);
