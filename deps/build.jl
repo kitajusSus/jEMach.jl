@@ -1,6 +1,3 @@
-# Standard Pkg.build hook to compile the optional Zig native accelerator (libjemach_native).
-# Runs cleanly without hardcoded paths; falls back to pure Julia if `zig` is not installed.
-
 let zig_dir = normpath(joinpath(@__DIR__, "..", "zig"))
     zig_exe = Sys.which("zig")
     if !isnothing(zig_exe) && isfile(joinpath(zig_dir, "build.zig"))

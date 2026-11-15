@@ -7,7 +7,6 @@ pub const ItemKind = enum(u8) {
     type_def = 3,
 };
 
-/// Row entry for Struct-of-Arrays (SoA) layout
 pub const WorkspaceRow = struct {
     name_offset: u32,
     name_len: u32,
@@ -37,7 +36,6 @@ fn appendPoolString(pool: *std.ArrayList(u8), allocator: std.mem.Allocator, s: [
     };
 }
 
-/// Data-Oriented Design (DoD) Workspace Table using Struct-of-Arrays (SoA)
 pub const WorkspaceTable = struct {
     rows: std.MultiArrayList(WorkspaceRow),
     string_pool: std.ArrayList(u8),
@@ -106,7 +104,6 @@ pub const WorkspaceTable = struct {
         return self.rows.len;
     }
 
-    /// Fast-path filter searching for variable names without decoding unneeded fields (DoD benefit)
     pub fn findByName(self: *const WorkspaceTable, target: []const u8) ?usize {
         const name_offsets = self.rows.items(.name_offset);
         const name_lens = self.rows.items(.name_len);
@@ -157,7 +154,7 @@ pub const ProcStatus = enum(u8) {
     err = 2,
 };
 
-/// Row entry for DoD Procedures & Live REPL Functions table (SoA layout)
+/// Row entry for  Procedures & Live REPL Functions table
 pub const ProcRow = struct {
     name_offset: u32,
     name_len: u32,
@@ -176,7 +173,7 @@ pub const ProcRow = struct {
     status: ProcStatus,
 };
 
-/// Data-Oriented Design (DoD) Procedure Registry Table backed by a single contiguous string pool
+/// Procedure Registry Table backed by a single contiguous string pool
 pub const ProcTable = struct {
     rows: std.MultiArrayList(ProcRow),
     string_pool: std.ArrayList(u8),
@@ -247,7 +244,6 @@ pub const ProcTable = struct {
         return self.rows.len;
     }
 
-    /// Cache-friendly name lookup scanning only `name_offset` / `name_len` columns
     pub fn findByName(self: *const ProcTable, target: []const u8) ?usize {
         const name_offsets = self.rows.items(.name_offset);
         const name_lens = self.rows.items(.name_len);
@@ -297,7 +293,6 @@ test "DoD ProcTable SoA, origin tracking, and clearRetainingCapacity" {
     try testing.expectEqual(ProcOrigin.modified, procs.rows.items(.origin)[idx.?]);
     try testing.expectEqual(@as(u32, 3), procs.rows.items(.generation)[idx.?]);
 
-    // Reuse capacity cleanly without reallocations
     const pool_cap = procs.string_pool.capacity;
     procs.clearRetainingCapacity();
     try testing.expectEqual(@as(usize, 0), procs.count());
