@@ -1,6 +1,6 @@
 [deps]
-Documenter = "e30172f5-a6a5-577e-8435-431d89770129"
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
 jEMach = "67289db4-f2a6-40b9-80a9-9c8949710e38"
 
-[path]
-jEMach = ".."
+[sources]
+jEMach = {path = "/home/kitajusus/jEMach"}

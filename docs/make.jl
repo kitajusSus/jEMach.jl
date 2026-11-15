@@ -7,13 +7,15 @@ makedocs(
         prettyurls = get(ENV, "CI", nothing) == "true"
     ),
     modules = [jEMach],
+    warnonly = [:missing_docs],
     pages = [
         "System Log" => "index.md",
         "REPL Auto-Hook (startup.jl)" => "startup.md",
         "IPC & Socket Architecture" => "ipc.md",
         "Type Introspection & Inspection" => "types.md"
     ]
-        deploydocs(
-        repo = "github.com/kitajusSus/jEMach.jl.git",
-    )
+)
+
+deploydocs(
+    repo = "github.com/kitajusSus/jEMach.jl.git",
 )
