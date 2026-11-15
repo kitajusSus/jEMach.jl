@@ -860,9 +860,10 @@ local REFRESH_MS = 1500 -- state file poll interval (ms)
 -- hidden[key] = true  means the item is hidden from view
 -- key = "ModuleName" for a module header, "ModuleName/ItemName" for items
 local hidden = {}
--- collapsed[module_name] = true
+-- collapsed[module_name_or_item_path] = true
 local collapsed = {}
 local initialized_modules = { ["Main"] = true }
+local initialized_items = {}
 
 -- Flat list of "display rows" rebuilt each render pass
 local active_tab = 1 -- 1: Workspace, 2: History, 3: Procedures, 4: Packages, 5: Guide
@@ -1387,6 +1388,10 @@ local function build_display_rows()
 			end
 
 			local has_children = cols.has_children and cols.has_children[i] or false
+			if has_children and not initialized_items[key] then
+				initialized_items[key] = true
+				collapsed[key] = true
+			end
 			local is_collapsed = collapsed[key]
 			local icon = ""
 			if has_children then
@@ -1404,6 +1409,7 @@ local function build_display_rows()
 				depth = depth,
 				path = key,
 				has_children = has_children,
+				collapsed = is_collapsed,
 				icon = icon,
 			})
 
@@ -1440,6 +1446,10 @@ local function build_display_rows()
 		end
 
 		local has_children = item.children and #item.children > 0
+		if has_children and not initialized_items[key] then
+			initialized_items[key] = true
+			collapsed[key] = true
+		end
 		local is_collapsed = collapsed[key]
 		local icon = ""
 		if has_children then
@@ -1457,6 +1467,7 @@ local function build_display_rows()
 			depth = depth,
 			path = key,
 			has_children = has_children,
+			collapsed = is_collapsed,
 			icon = icon,
 		})
 
