@@ -6,7 +6,7 @@ const UPDATE_INTERVAL = 0.5  # seconds between state refreshes
 
 function _get_project_dir()::String
     proj_path = try
-        Pkg.project().path
+        Base.active_project()
     catch
         nothing
     end

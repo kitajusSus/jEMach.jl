@@ -23,7 +23,6 @@ Data-Oriented Julia Workspace Assistant & REPL Monitor with multi-terminal TUI
 module jEMach
 
 import Dates
-import Pkg
 import REPL
 import REPL.LineEdit
 import Sockets
@@ -53,11 +52,20 @@ function __init__()
 
     atexit(() -> stop(quiet = true))
 
-    if get(ENV, "JEMACH_AUTOLOAD", "1") != "0"
+    # Index procedures/*.jl metadata lazily without executing top-level code on startup.
+    # Procedures are evaluated into Main on demand when clicked/run or reloaded;
+    # set ENV["JEMACH_AUTOLOAD"] = "1" to opt into eager evaluation at startup.
+    if get(ENV, "JEMACH_AUTOLOAD", "0") == "1"
         try
             autoload_procedures!()
         catch e
             @debug "jEMach: autoload of procedures failed" exception = e
+        end
+    else
+        try
+            _load_procedures!(; eval_in_main = false)
+        catch e
+            @debug "jEMach: procedure indexing failed" exception = e
         end
     end
 

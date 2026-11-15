@@ -403,7 +403,9 @@ function start(; split::Bool = true, backend::Symbol = :auto, width::Int = 65, q
         _task_ref[] = @async begin
             !quiet && @info "jEMach Watcher started — writing state to $(STATE_FILE[]) and socket $(SOCKET_PATH[]) [backend: $(detect_backend())]"
             while _running[]
-                Base.invokelatest(publish_state)
+                if _has_active_tui_clients()
+                    Base.invokelatest(publish_state)
+                end
                 sleep(UPDATE_INTERVAL)
             end
             _stop_socket_server()

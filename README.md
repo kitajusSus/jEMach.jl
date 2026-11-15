@@ -134,7 +134,7 @@ Turn your experimental REPL commands into parameterized, reproducible procedures
 - **`Alt+j`**: Insert/browse a procedure call straight into the current `julia>` prompt.
 - **`Alt+r`**: Start or stop procedure recording (prompt dynamically switches to `⏺ [rec: name] julia> ` while recording).
 - **`↑` / `↓` history sync**: Commands executed from the TUI sidecar (`Enter` in History/Procedures) are appended to Julia's live in-memory `REPLHistoryProvider`, so pressing `↑` recalls them right away.
-- **Auto-loaded procedures**: Existing `procedures/*.jl` files are automatically loaded into `Main` on `using jEMach` (disable with `ENV["JEMACH_AUTOLOAD"] = "0"`).
+- **Lazy on-demand procedures**: Existing `procedures/*.jl` files are indexed (not executed) on `using jEMach` so startup stays instant; run or load a procedure from the TUI (`[↵]` / `[R]`) or via `jEMach.run_procedure` / `jEMach.reload_procedure` to evaluate it on demand (opt into eager startup loading with `ENV["JEMACH_AUTOLOAD"] = "1"`).
 
 ```julia
 using jEMach

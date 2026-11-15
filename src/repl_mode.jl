@@ -371,7 +371,7 @@ function _install_repl_error_hook!(repl, main::LineEdit.Prompt)
                     Base.invokelatest(_capture_repl_definitions!, line)
                     Base.invokelatest(_record_command_outcome!, line, true; source = "repl")
                 end
-                @async (sleep(0.02); Base.invokelatest(publish_state))
+                _has_active_tui_clients() && @async (sleep(0.02); Base.invokelatest(publish_state))
             catch
             end
         end
@@ -450,7 +450,7 @@ function _setup_repl_hooks(repl)
                 push!(
                     Base.active_repl_backend.ast_transforms,
                     function (ast)
-                        @async (sleep(0.02); Base.invokelatest(publish_state))
+                        _has_active_tui_clients() && @async (sleep(0.02); Base.invokelatest(publish_state))
                         return ast
                     end
                 )

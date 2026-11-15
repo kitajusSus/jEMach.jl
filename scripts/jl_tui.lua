@@ -3542,7 +3542,13 @@ handle_key = function(key, term_rows, term_cols)
 				local a = (last_modal_args[dr.name] and last_modal_args[dr.name] ~= "")
 					and last_modal_args[dr.name]
 					or (dr.last_args or "")
-				if a ~= "" then
+				if dr.origin == "unloaded" then
+					if a ~= "" then
+						repl_insert("jEMach.run_procedure(:" .. dr.name .. ", " .. a .. ")", 0)
+					else
+						repl_insert("jEMach.run_procedure(:" .. dr.name .. ")", 1)
+					end
+				elseif a ~= "" then
 					repl_insert(dr.name .. "(" .. a .. ")", 0)
 				else
 					repl_insert(dr.name .. "()", 1)

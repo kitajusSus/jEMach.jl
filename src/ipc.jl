@@ -14,6 +14,8 @@ const _serialize_lock = ReentrantLock()
 const _hasmethod_cache = Dict{Symbol, Bool}()
 const _hasmethod_world_ref = Ref{UInt64}(UInt64(0))
 
+_has_active_tui_clients()::Bool = any(isopen, _socket_clients)
+
 function _write_json_str_col(buf::IOBuffer, vals::Vector{String}, dst_buf::Vector{UInt8})
     write(buf, '[')
     @inbounds for i in eachindex(vals)
@@ -436,7 +438,9 @@ function _start_socket_server()
                                 line = readline(client)
                                 if startswith(line, "SUB")
                                     push!(_socket_clients, client)
-                                    if !isempty(_last_serialized_json[])
+                                    if isempty(_last_serialized_json[])
+                                        Base.invokelatest(publish_state)
+                                    else
                                         write(client, _last_serialized_json[] * "\n")
                                         flush(client)
                                     end

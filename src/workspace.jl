@@ -168,7 +168,11 @@ const _last_pkg_file = Ref{String}("")
 function _get_packages()::Vector{Dict{String, String}}
     proj_dir = _get_project_dir()
     proj_file = joinpath(proj_dir, "Project.toml")
-    mtime_proj = isfile(proj_file) ? mtime(proj_file) : 0.0
+    mf_path = joinpath(proj_dir, "Manifest.toml")
+    !isfile(mf_path) && isfile(joinpath(proj_dir, "JuliaManifest.toml")) &&
+        (mf_path = joinpath(proj_dir, "JuliaManifest.toml"))
+    mtime_proj = (isfile(proj_file) ? mtime(proj_file) : 0.0) +
+        (isfile(mf_path) ? mtime(mf_path) : 0.0)
 
     if !isempty(_cached_pkgs[]) && proj_file == _last_pkg_file[] && mtime_proj == _last_pkg_mtime[]
         return _cached_pkgs[]
@@ -176,14 +180,33 @@ function _get_packages()::Vector{Dict{String, String}}
 
     pkgs = Dict{String, String}[]
     try
-        for (name, uuid) in Pkg.project().dependencies
-            ver = "unknown"
-            try
-                dep_info = Pkg.dependencies()[uuid]
-                dep_info.version !== nothing && (ver = string(dep_info.version))
-            catch
+        isfile(proj_file) || return _cached_pkgs[]
+        proj_toml = Base.parsed_toml(proj_file)
+        deps = get(proj_toml, "deps", nothing)
+        deps isa AbstractDict || return _cached_pkgs[]
+
+        manifest_versions = Dict{String, String}()
+        if isfile(mf_path)
+            mf = Base.parsed_toml(mf_path)
+            mf_deps = get(mf, "deps", mf)
+            if mf_deps isa AbstractDict
+                for (_, entries) in mf_deps
+                    entries isa AbstractVector || continue
+                    for entry in entries
+                        entry isa AbstractDict || continue
+                        uuid = string(get(entry, "uuid", ""))
+                        ver = get(entry, "version", nothing)
+                        if !isnothing(ver) && !isempty(uuid)
+                            manifest_versions[uuid] = string(ver)
+                        end
+                    end
+                end
             end
-            push!(pkgs, Dict("name" => name, "version" => ver))
+        end
+
+        for (name, uuid) in deps
+            ver = get(manifest_versions, string(uuid), "unknown")
+            push!(pkgs, Dict("name" => String(name), "version" => ver))
         end
         sort!(pkgs; by = x -> x["name"])
         _cached_pkgs[] = pkgs
@@ -293,6 +316,29 @@ function _collect_children_dod!(
     end
 end
 
+const _methods_summary_cache = Dict{UInt64, String}()
+const _methods_summary_world_ref = Ref{UInt64}(UInt64(0))
+
+function _method_count_summary(val)::String
+    cur_world = Base.get_world_counter()
+    if _methods_summary_world_ref[] != cur_world
+        empty!(_methods_summary_cache)
+        _methods_summary_world_ref[] = cur_world
+    end
+    oid = objectid(val)
+    cached = get(_methods_summary_cache, oid, nothing)
+    !isnothing(cached) && return cached
+    s = try
+        ms = methods(val)
+        n = length(ms)
+        "($(n) method" * (n == 1 ? "" : "s") * ")"
+    catch
+        "(function)"
+    end
+    _methods_summary_cache[oid] = s
+    return s
+end
+
 function _collect_module_items_dod!(t::WorkspaceTable, mod::Module, mod_name::String, all::Bool)
     syms = names(mod; all = all, imported = false)
     candidates = Tuple{Symbol, String, Any, String}[]
@@ -328,12 +374,7 @@ function _collect_module_items_dod!(t::WorkspaceTable, mod::Module, mod_name::St
                 value_str = _value_preview(val)
             end
         elseif kind == "function"
-            try
-                ms = methods(val)
-                value_str = "($(length(ms)) method" * (length(ms) == 1 ? "" : "s") * ")"
-            catch
-                value_str = "(function)"
-            end
+            value_str = _method_count_summary(val)
         elseif kind == "type"
             value_str = "(type)"
         end
