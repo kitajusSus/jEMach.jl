@@ -78,7 +78,7 @@ Pkg.add(url="https://github.com/kitajusSus/jEMach")
 | **`tmux`**                | `$TMUX`                                   | `tmux split-window -h`                                                                                    | UNIX Socket RPC + `send-keys` fallback          |
 | **`zellij`**              | `$ZELLIJ` / `$ZELLIJ_SESSION_NAME`        | `zellij run --direction right --close-on-exit`                                                            | UNIX Socket RPC (`LineEdit` + `Main` eval)      |
 | **`kitty`**               | `$KITTY_WINDOW_ID` / `xterm-kitty`        | `kitten @ launch --location=vsplit` (or companion window)                                                 | UNIX Socket RPC + `kitten @ send-text` fallback |
-| **`ghostty`**             | `$TERM_PROGRAM=ghostty` / `xterm-ghostty` | Native split (`Ctrl+Shift+O` + `jl-assist`) or `ghostty` companion window/tab (`JEMACH_GHOSTTY_MODE=tab`) | UNIX Socket RPC (`LineEdit` + `Main` eval)      |
+| **`ghostty`**             | `$TERM_PROGRAM=ghostty` / `xterm-ghostty` | Companion `ghostty` window (`JEMACH_GHOSTTY_MODE=tab` for tab, or `Ctrl+Shift+O` + `jl-assist`) | UNIX Socket RPC (`LineEdit` + `Main` eval)      |
 | **`rex`** _(Ghostty mux)_ | `$REX_SESSION` / `$REX` / `$GHOSTTY_REX`  | `rex pane split` / `rex split-window` / `$JEMACH_REX_SPLIT_CMD`                                           | UNIX Socket RPC + `rex send-keys` fallback      |
 
 ---

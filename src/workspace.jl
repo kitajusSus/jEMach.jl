@@ -56,7 +56,27 @@ function _add_entry!(
     return length(t.names)
 end
 
+function _append_table!(dst::WorkspaceTable, src::WorkspaceTable)
+    offset = Int32(length(dst.names))
+    append!(dst.names, src.names)
+    append!(dst.kinds, src.kinds)
+    append!(dst.types, src.types)
+    append!(dst.values, src.values)
+    append!(dst.exprs, src.exprs)
+    append!(dst.modules, src.modules)
+    append!(dst.depths, src.depths)
+    for pidx in src.parent_indices
+        push!(dst.parent_indices, pidx >= Int32(0) ? pidx + offset : Int32(-1))
+    end
+    append!(dst.has_children, src.has_children)
+    return dst
+end
+
 const _shared_workspace_table = Ref{WorkspaceTable}(WorkspaceTable())
+const _pkg_items_cache = WorkspaceTable()
+const _pkg_items_world_ref = Ref{UInt64}(UInt64(0))
+const _pkg_items_mods_ref = Ref{UInt64}(UInt64(0))
+const _pkg_cache_lock = ReentrantLock()
 
 function Base.show(io::IO, t::WorkspaceTable)
     top_count = count(==(0), t.depths)
@@ -130,7 +150,7 @@ their memory footprint (`summarysize`), and value previews directly in the REPL.
 Optionally filter entries by `query`.
 """
 function workspace(query::AbstractString = "")
-    t = Base.invokelatest(_collect_state_dod!, _shared_workspace_table[])
+    t = Base.invokelatest(_collect_state_dod!, WorkspaceTable())
     q = lowercase(strip(query))
     if isempty(q)
         Base.invokelatest(show, IOContext(stdout, :color => true), MIME("text/plain"), t)
@@ -237,6 +257,16 @@ function _value_preview(val)::String
     (val isa Number || val isa Bool || val isa Symbol) && return string(val)
     if val isa AbstractString
         return length(val) > 60 ? repr(first(val, 57)) * "…" : repr(val)
+    elseif val isa AbstractArray && length(val) > 64
+        s = try
+            summary(val)
+        catch
+            string(typeof(val))
+        end
+        return length(s) > 60 ? first(s, 60) * "…" : s
+    elseif val isa AbstractDict && length(val) > 16
+        s = "$(typeof(val)) ($(length(val)) entries)"
+        return length(s) > 60 ? first(s, 60) * "…" : s
     end
     return try
         s = sprint((io, x) -> Base.invokelatest(show, io, x), val; context = IOContext(devnull, :limit => true, :compact => true))
@@ -425,6 +455,8 @@ function _collect_state_dod!(t::WorkspaceTable)::WorkspaceTable
     _collect_module_items_dod!(t, Main, "Main", true)
 
     seen = copy(_IGNORED_LOADED_MODULES)
+    pkg_mods = Tuple{Module, String}[]
+    mods_hash = UInt64(0)
     for mod in _snapshot_loaded_modules()
         name = string(mod)
         name in seen && continue
@@ -437,8 +469,24 @@ function _collect_state_dod!(t::WorkspaceTable)::WorkspaceTable
             end
             if bound === mod
                 push!(seen, name)
-                _collect_module_items_dod!(t, mod, name, false)
+                push!(pkg_mods, (mod, name))
+                mods_hash = hash(objectid(mod), mods_hash)
             end
+        end
+    end
+
+    if !isempty(pkg_mods)
+        cur_world = Base.get_world_counter()
+        lock(_pkg_cache_lock) do
+            if _pkg_items_world_ref[] != cur_world || _pkg_items_mods_ref[] != mods_hash
+                empty!(_pkg_items_cache)
+                for (mod, name) in pkg_mods
+                    _collect_module_items_dod!(_pkg_items_cache, mod, name, false)
+                end
+                _pkg_items_world_ref[] = cur_world
+                _pkg_items_mods_ref[] = mods_hash
+            end
+            _append_table!(t, _pkg_items_cache)
         end
     end
 

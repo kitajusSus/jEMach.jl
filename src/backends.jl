@@ -68,112 +68,13 @@ function _expand_split_template(tpl::AbstractString, width::Int, proj_dir::Strin
     )
 end
 
-function _ensure_ghostty_shell_hook()
-    return try
-        zshenv = joinpath(homedir(), ".zshenv")
-        hook_line = "[[ -o interactive && -f \"/tmp/jemach_ghostty_split_\${PPID}.sh\" ]] && source \"/tmp/jemach_ghostty_split_\${PPID}.sh\""
-        existing = isfile(zshenv) ? read(zshenv, String) : ""
-        if !occursin("jemach_ghostty_split_", existing)
-            open(zshenv, "a") do f
-                !isempty(existing) && !endswith(existing, "\n") && write(f, "\n")
-                write(f, "# jEMach Ghostty native split bootstrap\n" * hook_line * "\n")
-            end
-        end
-    catch
-    end
+function _tui_luajit_cmd(tui_script::String, target_arg::String, sock::String, st_file::String)::Cmd
+    return `luajit $tui_script $target_arg $sock $st_file`
 end
 
-function _find_ghostty_ancestor_pid()::Int
-    Sys.islinux() || return 0
-    pid = Int(getpid())
-    for _ in 1:16
-        pid <= 1 && break
-        comm_file = "/proc/$pid/comm"
-        stat_file = "/proc/$pid/stat"
-        (isfile(comm_file) && isfile(stat_file)) || break
-        comm = try
-            lowercase(strip(read(comm_file, String)))
-        catch
-            ""
-        end
-        comm == "ghostty" && return pid
-        stat_str = try
-            read(stat_file, String)
-        catch
-            ""
-        end
-        idx = findlast(')', stat_str)
-        isnothing(idx) && break
-        fields = split(strip(stat_str[(idx + 1):end]))
-        length(fields) < 2 && break
-        ppid = tryparse(Int, fields[2])
-        isnothing(ppid) && break
-        pid = ppid
-    end
-    return 0
-end
-
-function _trigger_ghostty_dbus_split(proj_dir::String, sock::String, st_file::String, tui_script::String)::Bool
-    Sys.islinux() || return false
-    (isnothing(Sys.which("gdbus")) || isnothing(Sys.which("busctl"))) && return false
-
-    ghostty_pid = _find_ghostty_ancestor_pid()
-    ghostty_pid <= 0 && return false
-
-    _ensure_ghostty_shell_hook()
-
-    dbus_dest = "com.mitchellh.ghostty"
-    try
-        out = read(`busctl --user list --no-pager`, String)
-        for line in split(out, '\n')
-            parts = split(strip(line))
-            if length(parts) >= 3 && startswith(parts[1], ":") && parts[2] == string(ghostty_pid)
-                dbus_dest = String(parts[1])
-                break
-            end
-        end
-    catch
-    end
-
-    win_path = "/com/mitchellh/ghostty/window/1"
-    try
-        intro = read(pipeline(`gdbus introspect --session --dest $dbus_dest --object-path /com/mitchellh/ghostty/window`, stderr = devnull), String)
-        m = match(r"node\s+(?:/com/mitchellh/ghostty/window/)?(\d+)", intro)
-        !isnothing(m) && (win_path = "/com/mitchellh/ghostty/window/" * m.captures[1])
-    catch
-    end
-
-    split_script = "/tmp/jemach_ghostty_split_$(ghostty_pid).sh"
-    sq_escape(s) = "'" * replace(s, "'" => "'\\''") * "'"
-    script_body = """
-    rm -f $(sq_escape(split_script))
-    cd $(sq_escape(proj_dir)) 2>/dev/null || true
-    export JEMACH_SOCKET=$(sq_escape(sock))
-    export JEMACH_STATE=$(sq_escape(st_file))
-    export JEMACH_PROJ=$(sq_escape(proj_dir))
-    export JEMACH_BACKEND='ghostty'
-    exec luajit $(sq_escape(tui_script)) ghostty $(sq_escape(sock)) $(sq_escape(st_file))
-    """
-    try
-        open(split_script, "w") do f
-            write(f, script_body)
-        end
-        run(pipeline(`gdbus call --session --dest $dbus_dest --object-path $win_path --method org.gtk.Actions.Activate split-right "[]" "{}"`, stdout = devnull, stderr = devnull))
-        @async begin
-            sleep(3.0)
-            try
-                rm(split_script; force = true)
-            catch
-            end
-        end
-        return true
-    catch
-        try
-            rm(split_script; force = true)
-        catch
-        end
-        return false
-    end
+function _tui_env_cmd(tui_script::String, target_arg::String, proj_dir::String, sock::String, st_file::String, backend::Symbol)::Cmd
+    b_str = string(backend)
+    return `env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=$b_str luajit $tui_script $target_arg $sock $st_file`
 end
 
 function _close_tui_pane()
@@ -208,7 +109,7 @@ function _close_tui_pane()
                     !isempty(parts) || continue
                     pid = parts[1]
                     line_str = lowercase(line)
-                    if pid != cur_pane && (occursin("luajit", line_str) || occursin("jl_tui", line_str) || occursin("jl-assist", line_str))
+                    if pid != cur_pane && (occursin("jl_tui", line_str) || occursin("jl-assist", line_str) || occursin("jemach", line_str))
                         try
                             run(pipeline(`tmux kill-pane -t $pid`, devnull))
                         catch
@@ -218,6 +119,9 @@ function _close_tui_pane()
             catch
             end
         end
+    elseif backend == :zellij
+        # Zellij panes launched with `--close-on-exit` terminate automatically when the socket stops
+        _tui_pane_ref[] = ""
     elseif backend == :kitty && !isempty(_tui_pane_ref[])
         try
             run(pipeline(`kitten @ close-window --match id:$(_tui_pane_ref[])`, devnull))
@@ -251,6 +155,11 @@ function _open_tui_pane(; backend::Symbol = detect_backend(), width::Int = 65)
         return nothing
     end
 
+    if _has_active_tui_clients() || (!isempty(_tui_pane_ref[]) && _is_tui_open())
+        println("🚀 jEMach TUI is already active ($backend)")
+        return nothing
+    end
+
     if haskey(ENV, "JEMACH_SPLIT_CMD") && !isempty(strip(ENV["JEMACH_SPLIT_CMD"]))
         cmd_str = _expand_split_template(ENV["JEMACH_SPLIT_CMD"], width, proj_dir, sock, st_file, tui_script)
         _tui_proc_ref[] = run(Cmd(`sh -c $cmd_str`; dir = proj_dir); wait = false)
@@ -261,39 +170,27 @@ function _open_tui_pane(; backend::Symbol = detect_backend(), width::Int = 65)
 
     if backend == :tmux
         try
-            already_open = false
-            if !isempty(_tui_pane_ref[])
-                try
-                    run(pipeline(`tmux display-message -t $(_tui_pane_ref[]) -p "#{pane_id}"`, devnull))
-                    already_open = true
-                catch
-                    _tui_pane_ref[] = ""
-                end
+            _close_tui_pane()
+            cur_pane = try
+                strip(read(`tmux display-message -p "#{pane_id}"`, String))
+            catch
+                ""
             end
-
-            if already_open
-                println("🚀 tmux TUI split already active ($(_tui_pane_ref[]))")
-            else
-                _close_tui_pane()
-                cur_pane = try
-                    strip(read(`tmux display-message -p "#{pane_id}"`, String))
-                catch
-                    ""
-                end
-                pane_arg = !isempty(cur_pane) ? cur_pane : "{left-of}"
-                cmd = `tmux split-window -P -F "#{pane_id}" -h -l $width -c $proj_dir -e JEMACH_SOCKET=$sock -e JEMACH_STATE=$st_file -e JEMACH_PROJ=$proj_dir -e JEMACH_BACKEND=tmux luajit $tui_script $pane_arg $sock $st_file`
-                pane_id = strip(read(cmd, String))
-                _tui_pane_ref[] = pane_id
-                _tui_backend_ref[] = :tmux
-                println("🚀 tmux TUI split opened ($pane_id)!")
-            end
+            pane_arg = !isempty(cur_pane) ? cur_pane : "{left-of}"
+            luajit_cmd = _tui_luajit_cmd(tui_script, pane_arg, sock, st_file)
+            cmd = `tmux split-window -P -F "#{pane_id}" -h -l $width -c $proj_dir -e JEMACH_SOCKET=$sock -e JEMACH_STATE=$st_file -e JEMACH_PROJ=$proj_dir -e JEMACH_BACKEND=tmux $luajit_cmd`
+            pane_id = strip(read(cmd, String))
+            _tui_pane_ref[] = pane_id
+            _tui_backend_ref[] = :tmux
+            println("🚀 tmux TUI split opened ($pane_id)!")
         catch e
             @warn "Failed to open tmux TUI pane" exception = e
         end
     elseif backend == :zellij
         try
             direction_args = get(ENV, "JEMACH_ZELLIJ_FLOATING", "0") == "1" ? ["--floating"] : ["--direction", "right"]
-            cmd = `zellij run $(direction_args) --name jEMach --cwd $proj_dir --close-on-exit -- env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=zellij luajit $tui_script zellij $sock $st_file`
+            env_cmd = _tui_env_cmd(tui_script, "zellij", proj_dir, sock, st_file, :zellij)
+            cmd = `zellij run $(direction_args) --name jEMach --cwd $proj_dir --close-on-exit -- $env_cmd`
             run(cmd; wait = false)
             _tui_backend_ref[] = :zellij
             println("🚀 Zellij TUI pane opened!")
@@ -306,7 +203,8 @@ function _open_tui_pane(; backend::Symbol = detect_backend(), width::Int = 65)
             kitty_win_id = get(ENV, "KITTY_WINDOW_ID", "kitty")
             if !isnothing(Sys.which("kitten"))
                 try
-                    cmd = `kitten @ launch --type=window --location=vsplit --keep-focus --title=jEMach --cwd=$proj_dir --env JEMACH_SOCKET=$sock --env JEMACH_STATE=$st_file --env JEMACH_PROJ=$proj_dir --env JEMACH_BACKEND=kitty luajit $tui_script $kitty_win_id $sock $st_file`
+                    luajit_cmd = _tui_luajit_cmd(tui_script, kitty_win_id, sock, st_file)
+                    cmd = `kitten @ launch --type=window --location=vsplit --keep-focus --title=jEMach --cwd=$proj_dir --env JEMACH_SOCKET=$sock --env JEMACH_STATE=$st_file --env JEMACH_PROJ=$proj_dir --env JEMACH_BACKEND=kitty $luajit_cmd`
                     win_id = strip(read(pipeline(cmd, stderr = devnull), String))
                     _tui_pane_ref[] = win_id
                     _tui_backend_ref[] = :kitty
@@ -316,7 +214,8 @@ function _open_tui_pane(; backend::Symbol = detect_backend(), width::Int = 65)
                 end
             end
             if !rc_ok
-                cmd = `kitty --title=jEMach --directory=$proj_dir -o initial_window_width=$(width)c -o remember_window_size=no env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=kitty luajit $tui_script $kitty_win_id $sock $st_file`
+                env_cmd = _tui_env_cmd(tui_script, kitty_win_id, proj_dir, sock, st_file, :kitty)
+                cmd = `kitty --title=jEMach --directory=$proj_dir -o initial_window_width=$(width)c -o remember_window_size=no $env_cmd`
                 _tui_proc_ref[] = run(cmd; wait = false)
                 _tui_backend_ref[] = :kitty
                 println("🚀 Kitty companion TUI window opened! (Tip: set `allow_remote_control yes` in kitty.conf for in-tab vsplit)")
@@ -326,31 +225,30 @@ function _open_tui_pane(; backend::Symbol = detect_backend(), width::Int = 65)
         end
     elseif backend == :ghostty
         try
+            env_cmd = _tui_env_cmd(tui_script, "ghostty", proj_dir, sock, st_file, :ghostty)
             if haskey(ENV, "JEMACH_GHOSTTY_CMD") && !isempty(strip(ENV["JEMACH_GHOSTTY_CMD"]))
                 cmd_str = _expand_split_template(ENV["JEMACH_GHOSTTY_CMD"], width, proj_dir, sock, st_file, tui_script)
                 _tui_proc_ref[] = run(Cmd(`sh -c $cmd_str`; dir = proj_dir); wait = false)
                 println("🚀 Ghostty jEMach TUI custom command launched!")
             elseif Sys.isapple()
-                cmd = `open -na Ghostty.app --args --title=jEMach --working-directory=$proj_dir --window-width=$width --wait-after-command=false -e env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=ghostty luajit $tui_script ghostty $sock $st_file`
+                cmd = `open -na Ghostty.app --args --title=jEMach --working-directory=$proj_dir --window-width=$width --wait-after-command=false -e $env_cmd`
                 _tui_proc_ref[] = run(cmd; wait = false)
                 println("🚀 Ghostty jEMach TUI window opened!")
             else
-                mode = lowercase(get(ENV, "JEMACH_GHOSTTY_MODE", "split"))
-                if mode == "split" && _trigger_ghostty_dbus_split(proj_dir, sock, st_file, tui_script)
-                    println("🚀 Ghostty TUI right-split opened!")
-                elseif mode == "tab"
-                    cmd = `ghostty +new-tab -e env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=ghostty luajit $tui_script ghostty $sock $st_file`
+                mode = lowercase(get(ENV, "JEMACH_GHOSTTY_MODE", "window"))
+                if mode == "tab"
+                    cmd = `ghostty +new-tab -e $env_cmd`
                     _tui_proc_ref[] = run(cmd; wait = false)
                     println("🚀 Ghostty jEMach TUI tab opened!")
                 else
-                    cmd = `ghostty --gtk-single-instance=false --title=jEMach --working-directory=$proj_dir --window-width=$width --wait-after-command=false -e env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=ghostty luajit $tui_script ghostty $sock $st_file`
+                    cmd = `ghostty --gtk-single-instance=false --title=jEMach --working-directory=$proj_dir --window-width=$width --wait-after-command=false -e $env_cmd`
                     _tui_proc_ref[] = run(cmd; wait = false)
                     println("🚀 Ghostty jEMach TUI window opened!")
                 end
             end
             _tui_backend_ref[] = :ghostty
         catch e
-            @warn "Failed to launch Ghostty TUI split/window." exception = e
+            @warn "Failed to launch Ghostty TUI window." exception = e
         end
     elseif backend == :rex
         rex_bin = get(ENV, "JEMACH_REX_BIN", "rex")
@@ -362,11 +260,12 @@ function _open_tui_pane(; backend::Symbol = detect_backend(), width::Int = 65)
                 println("🚀 Rex TUI split opened!")
             elseif !isnothing(Sys.which(rex_bin))
                 pane_arg = get(ENV, "REX_PANE_ID", "rex")
+                env_cmd = _tui_env_cmd(tui_script, pane_arg, proj_dir, sock, st_file, :rex)
                 opened = false
                 for candidate in (
-                        `$rex_bin pane split --direction right --size $width --cwd $proj_dir -- env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=rex luajit $tui_script $pane_arg $sock $st_file`,
-                        `$rex_bin split-window -h -l $width -c $proj_dir env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=rex luajit $tui_script $pane_arg $sock $st_file`,
-                        `$rex_bin split --right --cwd $proj_dir -- env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=rex luajit $tui_script $pane_arg $sock $st_file`,
+                        `$rex_bin pane split --direction right --size $width --cwd $proj_dir -- $env_cmd`,
+                        `$rex_bin split-window -h -l $width -c $proj_dir $env_cmd`,
+                        `$rex_bin split --right --cwd $proj_dir -- $env_cmd`,
                     )
                     try
                         run(pipeline(candidate, stderr = devnull))
