@@ -9,8 +9,13 @@ julia_workspace_save.jl
 # System files
 .DS_Store
 
+# Julia package local/build artifacts
+Manifest.toml
+LocalPreferences.toml
+.setup_done
+docs/build/
+
 # Test files
-test/
 *.test.jl
 
 # Temporary files
