@@ -2,7 +2,7 @@ using Documenter
 using jEMach
 
 makedocs(
-    sitename = "jEMach.jl - Technical Notebook",
+    sitename = "jEMach.jl - Notebook",
     format = Documenter.HTML(
         prettyurls = get(ENV, "CI", nothing) == "true"
     ),
@@ -12,7 +12,7 @@ makedocs(
         "System Log" => "index.md",
         "REPL Auto-Hook (startup.jl)" => "startup.md",
         "IPC & Socket Architecture" => "ipc.md",
-        "Type Introspection & Inspection" => "types.md"
+        "Type Introspection & Inspection" => "types.md",
     ]
 )
 
