@@ -41,3 +41,5 @@ Overview of communication mechanics implemented between `jEMach.jl` and UI consu
 #### Automatic Fallback File
 
 In addition to socket streaming, state updates are written to `/tmp/jl_tui_state_<project_safe_name>.json` to ensure recovery if socket connections reset or close.
+
+`DOCS CREATED BY VIBES`:

@@ -13,4 +13,7 @@ makedocs(
         "IPC & Socket Architecture" => "ipc.md",
         "Type Introspection & Inspection" => "types.md"
     ]
+        deploydocs(
+        repo = "github.com/kitajusSus/jEMach.jl.git",
+    )
 )
