@@ -2,7 +2,7 @@
 
 const _JEMACH_COMMANDS = [
     "help", "ui", "toggle", "open", "close", "clear", "ws", "vars", "ls", "find", "show",
-    "run", "edit", "make", "rec", "stop", "inspect", "errors", "save", "reload", "status", "shutdown",
+    "run", "edit", "make", "rec", "stop", "inspect", "errors", "save", "reload", "status", "shutdown", "rss_chemia",
 ]
 
 function _print_jemach_help(io::IO = stdout)
@@ -206,6 +206,9 @@ function _exec_command(line::AbstractString)
         end
         println("  ", rpad("procedures", 14), length(_procedures), "   recording: ", _recording[] ? string(_record_name[]) : "no")
         println("  ", rpad("tui open", 14), _is_tui_open())
+    elseif !is_proc_call && cmd in ("rss_chemia")
+        _julia_julia_run()
+        println("Pozdro z fartem!")
     elseif !is_proc_call && cmd in ("shutdown", "quit")
         stop()
     else
@@ -216,6 +219,12 @@ function _exec_command(line::AbstractString)
     end
     return nothing
 end
+
+
+function _julia_julia_run()
+    return println("Pozdrawiam serdenicze RSS Chemia i Taylor S ")
+end
+
 
 """
     @jemach
