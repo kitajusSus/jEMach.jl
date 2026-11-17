@@ -13,6 +13,8 @@ makedocs(
         "REPL Auto-Hook (startup.jl)" => "startup.md",
         "IPC & Socket Architecture" => "ipc.md",
         "Type Introspection & Inspection" => "types.md",
+        "Development" => "development.md",
+        "Performance" => "performance.md",
     ]
 )
 

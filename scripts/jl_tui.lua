@@ -14,151 +14,37 @@
 --   d            — hide item from view (press D to restore all hidden)
 --   q / Ctrl-c   — quit
 
+local script_dir = assert(arg[0]:match("^(.*)/[^/]+$"), "launch jl_tui.lua using its path")
+package.path = script_dir .. "/?.lua;" .. package.path
 local ffi = require("ffi")
 
--- ---------------------------------------------------------------------------
--- FFI: non-blocking stdin read via select(2) + read(2) + sockets
--- ---------------------------------------------------------------------------
-ffi.cdef([[
-  typedef long          ssize_t;
-  typedef unsigned long size_t;
-  typedef long          time_t;
-  typedef long          suseconds_t;
-
-  typedef struct {
-    time_t      tv_sec;
-    suseconds_t tv_usec;
-  } timeval_t;
-
-  typedef struct { unsigned long fds_bits[16]; } fd_set_t;
-
-  int     select(int, fd_set_t *, fd_set_t *, fd_set_t *, timeval_t *);
-  ssize_t read  (int, void *, size_t);
-  int     gettimeofday(timeval_t *tv, void *tz);
-
-  struct sockaddr_un {
-    unsigned short sun_family;
-    char           sun_path[108];
-  };
-
-  struct winsize {
-    unsigned short ws_row;
-    unsigned short ws_col;
-    unsigned short ws_xpixel;
-    unsigned short ws_ypixel;
-  };
-
-  int     socket(int domain, int type, int protocol);
-  int     connect(int sockfd, const struct sockaddr_un *addr, unsigned int addrlen);
-  int     close(int fd);
-  ssize_t write(int fd, const void *buf, size_t count);
-  int     ioctl(int fd, unsigned long request, ...);
-]])
-
+local platform = require("tui.platform")
 local STDIN = 0
-local STDOUT = 1
-local TIOCGWINSZ = (ffi.os == "OSX") and 0x40087468 or 0x5413
-
-local function fd_set_new()
-	local s = ffi.new("fd_set_t")
-	for i = 0, 15 do
-		s.fds_bits[i] = 0
-	end
-	return s
-end
-
-local function fd_set_set(s, fd)
-	local word = math.floor(fd / 64)
-	local b = fd % 64
-	-- Use math.floor(2^b) to stay in integer range (safe for b < 53)
-	s.fds_bits[word] = s.fds_bits[word] + math.floor(2 ^ b)
-end
-
-local function fd_set_isset(s, fd)
-	local word = math.floor(fd / 64)
-	local b = fd % 64
-	local mask = math.floor(2 ^ b)
-	return (s.fds_bits[word] % (2 * mask)) >= mask
-end
+local fd_set_new = platform.fd_set_new
+local fd_set_set = platform.fd_set_set
+local fd_set_isset = platform.fd_set_isset
+local get_terminal_size = platform.get_terminal_size
+local raw_mode_on = platform.raw_mode_on
+local raw_mode_off = platform.raw_mode_off
 
 local json_parse -- forward declaration
 
-local function get_project_dir()
-	local env_proj = os.getenv("JEMACH_PROJ")
-	if env_proj and env_proj ~= "" then
-		return env_proj
-	end
-	local handle = io.popen("pwd")
-	local cwd = handle:read("*a"):gsub("%s+", "")
-	handle:close()
-	local dir = cwd
-	while dir and dir ~= "" and dir ~= "/" do
-		local f = io.open(dir .. "/Project.toml", "r")
-		if f then
-			f:close()
-			return dir
-		end
-		local parent = dir:match("(.*)/[^/]+$")
-		if not parent or parent == dir then
-			break
-		end
-		dir = parent
-	end
-	return cwd
-end
-
-local function get_safe_name(dir)
-	local pdir = dir or get_project_dir()
-	return pdir:gsub("[^a-zA-Z0-9]", "_")
-end
-
-local function find_active_jemach()
-	-- Look for the most recently modified jl_tui_state_*.json in /tmp
-	local h = io.popen("ls -t /tmp/jl_tui_state_*.json 2>/dev/null | head -n 1")
-	if h then
-		local latest_file = h:read("*l")
-		h:close()
-		if latest_file and latest_file ~= "" then
-			local sname = latest_file:match("/tmp/jl_tui_state_(.*)%.json$")
-			local sock = sname and ("/tmp/jemach_" .. sname .. ".sock") or nil
-			return sock, latest_file
-		end
-	end
-	return nil, nil
-end
-
+local sessions = require("tui.sessions")
 local repl_pane = (arg and arg[1] and arg[1] ~= "") and arg[1] or "{left-of}"
-
-local default_safe_name = get_safe_name()
-local socket_path = (arg and arg[2] and arg[2] ~= "") and arg[2]
-	or os.getenv("JEMACH_SOCKET")
-	or ("/tmp/jemach_" .. default_safe_name .. ".sock")
-
-local STATE_FILE = (arg and arg[3] and arg[3] ~= "") and arg[3]
-	or os.getenv("JEMACH_STATE")
-	or ("/tmp/jl_tui_state_" .. default_safe_name .. ".json")
-
-local function check_and_discover(force)
-	if not force then
-		local f = io.open(STATE_FILE, "r")
-		if f then
-			f:close()
-			return
-		end
+local socket_path = (arg[2] and arg[2] ~= "") and arg[2] or os.getenv("JEMACH_SOCKET")
+local STATE_FILE = (arg[3] and arg[3] ~= "") and arg[3] or os.getenv("JEMACH_STATE")
+if not socket_path or socket_path == "" then
+	local session, err = sessions.select()
+	if not session then
+		io.stderr:write(err .. "\n")
+		os.exit(1)
 	end
-	local auto_sock, auto_state = find_active_jemach()
-	if auto_state then
-		local af = io.open(auto_state, "r")
-		if af then
-			af:close()
-			STATE_FILE = auto_state
-			if auto_sock then
-				socket_path = auto_sock
-			end
-		end
-	end
+	socket_path = session.socket
+	STATE_FILE = STATE_FILE or session.state
 end
-check_and_discover(false)
+STATE_FILE = STATE_FILE or socket_path:gsub("/repl%.sock$", "/state.json")
+-- A chosen session stays pinned, including when its socket becomes unavailable.
+assert(#socket_path < 104, "UNIX socket path is too long")
 
 local socket_fd = -1
 local last_connect_try = 0
@@ -168,7 +54,6 @@ local stdin_buf = ffi.new("char[512]")
 local _tv_now = ffi.new("timeval_t")
 local dirty = true
 local state = nil -- last parsed JSON state
-local last_mtime = 0
 local last_state_ts = 0
 local history_selected = {}
 
@@ -246,31 +131,18 @@ local function try_connect_socket()
 
 	local addr = ffi.new("struct sockaddr_un")
 	addr.sun_family = 1
-	ffi.copy(addr.sun_path, socket_path)
+	if ffi.os == "OSX" then
+		addr.sun_len = ffi.sizeof(addr)
+	end
+	ffi.copy(addr.sun_path, socket_path, #socket_path)
 
-	local res = ffi.C.connect(fd, addr, 110)
+	local res = ffi.C.connect(fd, addr, ffi.sizeof(addr))
 	if res == 0 then
 		socket_fd = fd
+		socket_buffer = ""
 		ffi.C.write(socket_fd, "SUB\n", 4)
 	else
 		ffi.C.close(fd)
-		-- If connect failed, try discovering active session and retry immediately
-		local old_sock = socket_path
-		check_and_discover(true)
-		if socket_path ~= old_sock then
-			local fd2 = ffi.C.socket(1, 1, 0)
-			if fd2 >= 0 then
-				ffi.fill(addr, ffi.sizeof(addr))
-				addr.sun_family = 1
-				ffi.copy(addr.sun_path, socket_path)
-				if ffi.C.connect(fd2, addr, 110) == 0 then
-					socket_fd = fd2
-					ffi.C.write(socket_fd, "SUB\n", 4)
-				else
-					ffi.C.close(fd2)
-				end
-			end
-		end
 	end
 end
 
@@ -365,86 +237,9 @@ end
 local input_queue = {}
 
 -- Normalize Ghostty / Kitty CSI-u & SS3 application cursor keys to standard keys
-local function normalize_key(k)
-	if not k then
-		return nil
-	end
-	-- Application cursor keys (SS3)
-	if k == "\27OA" then
-		return "\27[A"
-	end
-	if k == "\27OB" then
-		return "\27[B"
-	end
-	if k == "\27OC" then
-		return "\27[C"
-	end
-	if k == "\27OD" then
-		return "\27[D"
-	end
-	if k == "\27OM" then
-		return "\r"
-	end
-
-	-- Kitty keyboard protocol / CSI-u sequences (\27[<codepoint>;<modifiers>u)
-	local csi_u_code, csi_u_mod = k:match("^\27%[(%d+)[:%d]*;?(%d*)[:%d]*u$")
-	if csi_u_code then
-		local code = tonumber(csi_u_code)
-		local mod = tonumber(csi_u_mod) or 1
-		if code == 27 then
-			return "\27"
-		elseif code == 13 then
-			return "\r"
-		elseif code == 9 then
-			return "\t"
-		elseif code == 127 or code == 8 then
-			return "\127"
-		elseif code == 99 and (mod == 5 or mod == 6) then -- Ctrl+C in CSI-u
-			return "\3"
-		elseif code >= 32 and code <= 126 then
-			if mod == 1 then
-				return string.char(code)
-			elseif mod == 2 then -- Shift in CSI-u (e.g. ?, J, K, D)
-				if code >= 97 and code <= 122 then
-					return string.char(code - 32)
-				elseif code == 47 then
-					return "?"
-				else
-					return string.char(code)
-				end
-			end
-		end
-	end
-
-	-- Extended cursor keys with modifiers (\27[1;...A)
-	local arrow_dir = k:match("^\27%[1;%d+([ABCD])$")
-	if arrow_dir then
-		return "\27[" .. arrow_dir
-	end
-
-	return k
-end
-
+local keys = require("tui.keys")
 local function queue_keys(raw)
-	local pos = 1
-	local len = #raw
-	while pos <= len do
-		if raw:sub(pos, pos) == "\27" then
-			local esc_seq = raw:match("^\27%[<[%d;]+[Mm]", pos)
-				or raw:match("^\27%[[%d;]*[a-zA-Z~u]", pos)
-				or raw:match("^\27O[a-zA-Z]", pos)
-			if esc_seq then
-				table.insert(input_queue, normalize_key(esc_seq))
-				pos = pos + #esc_seq
-			else
-				table.insert(input_queue, "\27")
-				pos = pos + 1
-			end
-		else
-			table.insert(input_queue, raw:sub(pos, pos))
-			pos = pos + 1
-		end
-	end
+	keys.enqueue(raw, input_queue)
 end
 
 local function get_next_key(timeout_ms)
@@ -462,455 +257,51 @@ end
 -- ---------------------------------------------------------------------------
 -- Terminal control helpers (ANSI/VT100 + Synchronized Output Mode 2026)
 -- ---------------------------------------------------------------------------
-local ESC = "\27"
-local CLEAR = ESC .. "[2J" .. ESC .. "[H"
-local HIDE_CUR = ESC .. "[?25l"
-local SHOW_CUR = ESC .. "[?25h"
-local ALT_SCREEN_ON = ESC .. "[?1049h"
-local ALT_SCREEN_OFF = ESC .. "[?1049l"
-local SYNC_START = ESC .. "[?2026h"
-local SYNC_END = ESC .. "[?2026l"
-local SET_TITLE = ESC .. "]2;jEMach — Julia Workspace\7"
-local BOLD = ESC .. "[1m"
-local DIM = ESC .. "[2m"
-local ITALIC = ESC .. "[3m"
-local RESET = ESC .. "[0m"
-local REV = ESC .. "[7m" -- reverse video (selection highlight)
-
--- Modern 256-color palette
-local FG_CYAN = ESC .. "[38;5;51m"
-local FG_AQUA = ESC .. "[38;5;45m"
-local FG_TEAL = ESC .. "[38;5;37m"
-local FG_GREEN = ESC .. "[38;5;84m"
-local FG_YELLOW = ESC .. "[38;5;221m"
-local FG_ORANGE = ESC .. "[38;5;215m"
-local FG_PURPLE = ESC .. "[38;5;141m"
-local FG_RED = ESC .. "[38;5;203m"
-local FG_WHITE = ESC .. "[38;5;255m"
-local FG_LIGHT_GRAY = ESC .. "[38;5;250m"
-local FG_GRAY = ESC .. "[38;5;244m"
-local FG_DARK_GRAY = ESC .. "[38;5;238m"
-
-local BG_TAB_ACT = ESC .. "[48;5;24m"
-local BG_ERR_LINE = ESC .. "[48;5;52m"
-local BG_PANEL = ESC .. "[48;5;235m"
-local MOUSE_ON = ESC .. "[?1000h" .. ESC .. "[?1006h"
-local MOUSE_OFF = ESC .. "[?1000l" .. ESC .. "[?1006l"
-
-local function strip_ansi(s)
-	return tostring(s or ""):gsub("\27%[[%d;]*[a-zA-Z]", "")
-end
-
-local function visible_len(s)
-	local clean = strip_ansi(s)
-	local _, count = clean:gsub("[%z\1-\127\194-\244][\128-\191]*", "")
-	return count
-end
-
-local function pad_right(s, width)
-	s = tostring(s or "")
-	local vlen = visible_len(s)
-	if vlen >= width then
-		return s
-	end
-	return s .. string.rep(" ", width - vlen)
-end
-
-local function truncate_visible(s, max_w)
-	s = tostring(s or "")
-	if max_w <= 0 then
-		return ""
-	end
-	local clean = strip_ansi(s)
-	local vlen = visible_len(clean)
-	if vlen <= max_w then
-		return s
-	end
-	if max_w == 1 then
-		return "…"
-	end
-	local cur_w = 0
-	local res = {}
-	for c in clean:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
-		if cur_w >= max_w - 1 then
-			table.insert(res, "…")
-			break
-		end
-		table.insert(res, c)
-		cur_w = cur_w + 1
-	end
-	return table.concat(res)
-end
-
-local function wrap_text(s, max_w)
-	s = tostring(s or "")
-	if max_w <= 1 then
-		return { s }
-	end
-	local chars = {}
-	for c in s:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
-		table.insert(chars, c)
-	end
-	if #chars == 0 then
-		return { "" }
-	end
-	local lines = {}
-	local i = 1
-	while i <= #chars do
-		local j = math.min(#chars, i + max_w - 1)
-		if j < #chars then
-			local min_break = i + math.floor(max_w * 0.65)
-			for k = j, min_break, -1 do
-				if chars[k] == " " or chars[k] == "\t" then
-					j = k
-					break
-				end
-			end
-		end
-		local chunk = {}
-		for k = i, j do
-			table.insert(chunk, chars[k])
-		end
-		local line_str = table.concat(chunk)
-		if j < #chars and (chars[j] == " " or chars[j] == "\t") then
-			line_str = line_str:gsub("%s+$", "")
-		end
-		table.insert(lines, line_str)
-		i = j + 1
-	end
-	return lines
-end
-
-local JL_KEYWORDS = {
-	["function"] = true,
-	["end"] = true,
-	["return"] = true,
-	["if"] = true,
-	["else"] = true,
-	["elseif"] = true,
-	["for"] = true,
-	["while"] = true,
-	["in"] = true,
-	["let"] = true,
-	["begin"] = true,
-	["try"] = true,
-	["catch"] = true,
-	["finally"] = true,
-	["using"] = true,
-	["import"] = true,
-	["export"] = true,
-	["struct"] = true,
-	["mutable"] = true,
-	["const"] = true,
-	["global"] = true,
-	["local"] = true,
-	["macro"] = true,
-	["module"] = true,
-	["baremodule"] = true,
-	["quote"] = true,
-	["do"] = true,
-}
-local JL_TYPES = {
-	["Int"] = true,
-	["Int64"] = true,
-	["Int32"] = true,
-	["Int16"] = true,
-	["Int8"] = true,
-	["UInt"] = true,
-	["UInt64"] = true,
-	["UInt32"] = true,
-	["UInt16"] = true,
-	["UInt8"] = true,
-	["Float64"] = true,
-	["Float32"] = true,
-	["String"] = true,
-	["Char"] = true,
-	["Vector"] = true,
-	["Matrix"] = true,
-	["Array"] = true,
-	["DataFrame"] = true,
-	["Bool"] = true,
-	["Dict"] = true,
-	["Set"] = true,
-	["Symbol"] = true,
-	["Any"] = true,
-	["Nothing"] = true,
-	["Missing"] = true,
-	["Tuple"] = true,
-	["NamedTuple"] = true,
-	["Union"] = true,
-	["Number"] = true,
-	["Real"] = true,
-	["Integer"] = true,
-	["Ref"] = true,
-}
-local JL_LITERALS = {
-	["true"] = true,
-	["false"] = true,
-	["nothing"] = true,
-	["missing"] = true,
-	["undef"] = true,
-}
-
-local function highlight_julia_line(line)
-	local out = {}
-	local pos = 1
-	local len = #line
-
-	while pos <= len do
-		local c = line:sub(pos, pos)
-		if c == "#" then
-			table.insert(out, FG_GRAY .. ITALIC .. line:sub(pos) .. RESET)
-			break
-		elseif c == '"' or c == "'" then
-			local quote = c
-			local end_pos = pos + 1
-			while end_pos <= len do
-				local ch = line:sub(end_pos, end_pos)
-				if ch == "\\" then
-					end_pos = end_pos + 2
-				elseif ch == quote then
-					end_pos = end_pos + 1
-					break
-				else
-					end_pos = end_pos + 1
-				end
-			end
-			table.insert(out, FG_GREEN .. line:sub(pos, end_pos - 1) .. RESET)
-			pos = end_pos
-		elseif c == ":" and pos < len and line:sub(pos + 1, pos + 1):match("[%a_]") then
-			local sym_end = pos + 1
-			while sym_end <= len and line:sub(sym_end, sym_end):match("[%w_!]") do
-				sym_end = sym_end + 1
-			end
-			table.insert(out, FG_AQUA .. line:sub(pos, sym_end - 1) .. RESET)
-			pos = sym_end
-		elseif c == "@" and pos < len and line:sub(pos + 1, pos + 1):match("[%a_]") then
-			local mac_end = pos + 1
-			while mac_end <= len and line:sub(mac_end, mac_end):match("[%w_!]") do
-				mac_end = mac_end + 1
-			end
-			table.insert(out, FG_PURPLE .. line:sub(pos, mac_end - 1) .. RESET)
-			pos = mac_end
-		elseif c:match("[%a_]") then
-			local word_end = pos + 1
-			while word_end <= len and line:sub(word_end, word_end):match("[%w_!]") do
-				word_end = word_end + 1
-			end
-			local w = line:sub(pos, word_end - 1)
-			if JL_KEYWORDS[w] then
-				table.insert(out, BOLD .. FG_PURPLE .. w .. RESET)
-			elseif JL_TYPES[w] then
-				table.insert(out, BOLD .. FG_CYAN .. w .. RESET)
-			elseif JL_LITERALS[w] then
-				table.insert(out, FG_ORANGE .. w .. RESET)
-			else
-				table.insert(out, FG_WHITE .. w .. RESET)
-			end
-			pos = word_end
-		elseif c:match("%d") then
-			local num_end = pos + 1
-			while num_end <= len and line:sub(num_end, num_end):match("[%d%.eExXa-fA-F_]") do
-				num_end = num_end + 1
-			end
-			table.insert(out, FG_YELLOW .. line:sub(pos, num_end - 1) .. RESET)
-			pos = num_end
-		elseif c:match("[%[%]%{%}%(%),;]") then
-			table.insert(out, FG_LIGHT_GRAY .. c .. RESET)
-			pos = pos + 1
-		elseif c:match("[%+%-*%/%^=<>!&|~]") then
-			table.insert(out, FG_AQUA .. c .. RESET)
-			pos = pos + 1
-		else
-			table.insert(out, c)
-			pos = pos + 1
-		end
-	end
-	return table.concat(out)
-end
+local theme = require("tui.theme")
+local ESC = theme.ESC
+local CLEAR = theme.CLEAR
+local HIDE_CUR = theme.HIDE_CUR
+local SHOW_CUR = theme.SHOW_CUR
+local ALT_SCREEN_ON = theme.ALT_SCREEN_ON
+local ALT_SCREEN_OFF = theme.ALT_SCREEN_OFF
+local SYNC_START = theme.SYNC_START
+local SYNC_END = theme.SYNC_END
+local SET_TITLE = theme.SET_TITLE
+local BOLD = theme.BOLD
+local DIM = theme.DIM
+local RESET = theme.RESET
+local REV = theme.REV
+local FG_CYAN = theme.FG_CYAN
+local FG_AQUA = theme.FG_AQUA
+local FG_TEAL = theme.FG_TEAL
+local FG_GREEN = theme.FG_GREEN
+local FG_YELLOW = theme.FG_YELLOW
+local FG_ORANGE = theme.FG_ORANGE
+local FG_PURPLE = theme.FG_PURPLE
+local FG_RED = theme.FG_RED
+local FG_WHITE = theme.FG_WHITE
+local FG_LIGHT_GRAY = theme.FG_LIGHT_GRAY
+local FG_GRAY = theme.FG_GRAY
+local FG_DARK_GRAY = theme.FG_DARK_GRAY
+local BG_TAB_ACT = theme.BG_TAB_ACT
+local BG_ERR_LINE = theme.BG_ERR_LINE
+local BG_PANEL = theme.BG_PANEL
+local MOUSE_ON = theme.MOUSE_ON
+local MOUSE_OFF = theme.MOUSE_OFF
+local text = require("tui.text")
+local visible_len = text.visible_len
+local pad_right = text.pad_right
+local truncate_visible = text.truncate_visible
+local highlight_julia_line = require("tui.highlight")
 
 local function move(row, col)
 	return ESC .. "[" .. row .. ";" .. col .. "H"
 end
 
-local winsize_buf = ffi.new("struct winsize")
-
-local function get_terminal_size()
-	-- Fast path: zero-fork ioctl(TIOCGWINSZ) on STDOUT or STDIN
-	if ffi.C.ioctl(STDOUT, TIOCGWINSZ, winsize_buf) == 0 and winsize_buf.ws_row > 0 and winsize_buf.ws_col > 0 then
-		return tonumber(winsize_buf.ws_row), tonumber(winsize_buf.ws_col)
-	end
-	if ffi.C.ioctl(STDIN, TIOCGWINSZ, winsize_buf) == 0 and winsize_buf.ws_row > 0 and winsize_buf.ws_col > 0 then
-		return tonumber(winsize_buf.ws_row), tonumber(winsize_buf.ws_col)
-	end
-	-- Fallback to tput
-	local handle = io.popen("tput lines && tput cols 2>/dev/null")
-	if not handle then
-		return 24, 80
-	end
-	local lines = tonumber(handle:read("*l")) or 24
-	local cols = tonumber(handle:read("*l")) or 80
-	handle:close()
-	return lines, cols
-end
-
-local function raw_mode_on()
-	os.execute("stty raw -echo 2>/dev/null")
-end
-
-local function raw_mode_off()
-	os.execute("stty sane 2>/dev/null")
-end
-
 -- ---------------------------------------------------------------------------
 -- Minimal JSON parser (handles the format emitted by jl_watcher.jl)
 -- ---------------------------------------------------------------------------
-json_parse = function(s)
-	local pos = 1
-
-	local function skip_ws()
-		while pos <= #s and s:sub(pos, pos):match("%s") do
-			pos = pos + 1
-		end
-	end
-
-	local parse_value -- forward declaration
-
-	local function parse_string()
-		assert(s:sub(pos, pos) == '"', "expected '\"' at pos " .. pos)
-		pos = pos + 1
-		local buf = {}
-		while pos <= #s do
-			local c = s:sub(pos, pos)
-			if c == '"' then
-				pos = pos + 1
-				break
-			end
-			if c == "\\" then
-				pos = pos + 1
-				local esc = s:sub(pos, pos)
-				if esc == '"' then
-					buf[#buf + 1] = '"'
-				elseif esc == "\\" then
-					buf[#buf + 1] = "\\"
-				elseif esc == "n" then
-					buf[#buf + 1] = "\n"
-				elseif esc == "r" then
-					buf[#buf + 1] = "\r"
-				elseif esc == "t" then
-					buf[#buf + 1] = "\t"
-				elseif esc == "b" then
-					buf[#buf + 1] = "\b"
-				elseif esc == "f" then
-					buf[#buf + 1] = "\f"
-				elseif esc == "u" then
-					local hex = s:sub(pos + 1, pos + 4)
-					local cp = tonumber(hex, 16)
-					if cp and cp < 128 then
-						buf[#buf + 1] = string.char(cp)
-					end
-					pos = pos + 4
-				else
-					buf[#buf + 1] = esc
-				end
-			else
-				buf[#buf + 1] = c
-			end
-			pos = pos + 1
-		end
-		return table.concat(buf)
-	end
-
-	local function parse_number()
-		local start = pos
-		if s:sub(pos, pos) == "-" then
-			pos = pos + 1
-		end
-		while pos <= #s and s:sub(pos, pos):match("[%d%.eE+%-]") do
-			pos = pos + 1
-		end
-		return tonumber(s:sub(start, pos - 1))
-	end
-
-	local function parse_object()
-		assert(s:sub(pos, pos) == "{", "expected '{' at pos " .. pos)
-		pos = pos + 1
-		local obj = {}
-		skip_ws()
-		if s:sub(pos, pos) == "}" then
-			pos = pos + 1
-			return obj
-		end
-		while true do
-			skip_ws()
-			local key = parse_string()
-			skip_ws()
-			assert(s:sub(pos, pos) == ":", "expected ':' at pos " .. pos)
-			pos = pos + 1
-			skip_ws()
-			obj[key] = parse_value()
-			skip_ws()
-			local sep = s:sub(pos, pos)
-			if sep == "}" then
-				pos = pos + 1
-				break
-			end
-			assert(sep == ",", "expected ',' or '}' at pos " .. pos)
-			pos = pos + 1
-		end
-		return obj
-	end
-
-	local function parse_array()
-		assert(s:sub(pos, pos) == "[", "expected '[' at pos " .. pos)
-		pos = pos + 1
-		local arr = {}
-		skip_ws()
-		if s:sub(pos, pos) == "]" then
-			pos = pos + 1
-			return arr
-		end
-		while true do
-			skip_ws()
-			arr[#arr + 1] = parse_value()
-			skip_ws()
-			local sep = s:sub(pos, pos)
-			if sep == "]" then
-				pos = pos + 1
-				break
-			end
-			assert(sep == ",", "expected ',' or ']' at pos " .. pos)
-			pos = pos + 1
-		end
-		return arr
-	end
-
-	parse_value = function()
-		skip_ws()
-		local c = s:sub(pos, pos)
-		if c == '"' then
-			return parse_string()
-		elseif c == "{" then
-			return parse_object()
-		elseif c == "[" then
-			return parse_array()
-		elseif c == "t" then
-			pos = pos + 4
-			return true
-		elseif c == "f" then
-			pos = pos + 5
-			return false
-		elseif c == "n" then
-			pos = pos + 4
-			return nil
-		else
-			return parse_number()
-		end
-	end
-
-	skip_ws()
-	return parse_value()
-end
+json_parse = require("tui.json").decode
 
 -- ---------------------------------------------------------------------------
 -- State management
@@ -952,95 +343,6 @@ local preview_split_row = 0
 local last_click_row = 0
 local last_click_ms = 0
 
-local GUIDE_SECTIONS = {
-	{
-		title = "Julia REPL Editing & Navigation Shortcuts",
-		items = {
-			{ key = "Ctrl+A / Ctrl+E", desc = "Jump cursor to beginning / end of line (Home / End)" },
-			{ key = "Alt+B / Alt+F", desc = "Move backward / forward by one word" },
-			{ key = "Ctrl+W / Alt+Bksp", desc = "Delete previous word" },
-			{ key = "Ctrl+U / Ctrl+K", desc = "Clear text before cursor / to end of line" },
-			{ key = "Ctrl+R / Ctrl+S", desc = "Reverse / forward incremental history search" },
-			{ key = "Up / Down", desc = "Cycle REPL history (type prefix + Up for prefix match)" },
-			{ key = "Tab (x2)", desc = "Autocomplete symbols, methods, file paths & kwargs" },
-			{ key = "\\alpha + Tab", desc = "Insert Unicode/LaTeX math symbols (\\alpha, \\sum, \\in)" },
-			{ key = "Alt+Enter", desc = "Insert newline inside a multi-line expression" },
-			{ key = "Ctrl+L", desc = "Clear REPL terminal screen" },
-			{ key = "Ctrl+C / Ctrl+D", desc = "Interrupt running code or cancel / exit REPL on empty line" },
-		},
-	},
-	{
-		title = "Julia REPL Modes & Everyday Utilities",
-		items = {
-			{ key = "?  (at julia>)", desc = "help?> documentation mode (?println, ?Vector)" },
-			{ key = ";  (at julia>)", desc = "shell> OS shell mode (;ls, ;git status)" },
-			{ key = "]  (at julia>)", desc = "pkg> package manager (status, add Foo, rm, up, activate ., test)" },
-			{ key = "} or Alt+m", desc = "Enter jemach> mode (Tab completes, Backspace exits to julia>)" },
-			{ key = "Alt+j / Alt+r", desc = "Toggle jEMach TUI split panel / Start-stop live proc recording" },
-			{ key = "ans / varinfo()", desc = "Last evaluated value / list variables in current module" },
-			{ key = "methods(f)", desc = "List all methods defined for function f" },
-			{ key = "@which f(x)", desc = "Show which method & file:line a call dispatches to" },
-			{ key = "@edit f(x)", desc = "Open the exact method definition in your editor" },
-			{ key = "@time / @allocated", desc = "Measure runtime and heap allocations of an expression" },
-			{ key = "using Revise", desc = "Auto-reload edited package & project files without restarting" },
-		},
-	},
-	{
-		title = "Using jEMach in REPL (jemach> & Macros)",
-		items = {
-			{ key = "help | ? | h", desc = "Print jemach> command reference in REPL" },
-			{ key = "ui | open | close | clear", desc = "Toggle/open/close TUI panel or clear REPL screen (clear())" },
-			{ key = "ws [filter]", desc = "Print workspace variables table with memory sizes" },
-			{ key = "ls [q] | find <q>", desc = "List or search saved & live procedures" },
-			{
-				key = "show <name> | edit <name>",
-				desc = "Show procedure card / load clean function into julia> editor",
-			},
-			{ key = "errors", desc = "List errored procedures & failed commands from this session" },
-			{ key = "<name>(args...) | run ...", desc = "Run a procedure with profiling (keeps live in-memory edits)" },
-			{ key = "make <name> [N]", desc = "Extract last N commands into procedures/<name>.jl (hoists using)" },
-			{ key = "rec [name] | stop", desc = "Start / stop live procedure recording ([rec: name] julia>)" },
-			{ key = "inspect <expr> | @inspect", desc = "Deep-inspect variable/function, methods, origin & docstring" },
-			{ key = "@jemach [cmd]", desc = "Macro to toggle TUI or invoke jemach commands from julia>" },
-			{
-				key = "save [<name> [as]] | reload",
-				desc = "Save modified/live function to disk / reload from procedures/*.jl",
-			},
-		},
-	},
-	{
-		title = "jEMach TUI Global Keys & Mouse Navigation",
-		items = {
-			{ key = "1 / 2 / 3 / 4", desc = "Jump to Workspace / History / Procedures / Packages (or click tab)" },
-			{ key = "? (or 5)", desc = "Open or toggle this Guide tab (Esc returns to prior tab)" },
-			{ key = "Tab / ] / [", desc = "Cycle forward / backward through TUI tabs" },
-			{ key = "/", desc = "Live search & filter current tab (Esc or x clears filter)" },
-			{ key = "j / k or Up / Down", desc = "Move cursor down / up (g/G top/bottom, PgUp/PgDn page)" },
-			{ key = "Mouse / m", desc = "Click rows & pills, dbl-click edits, wheel scrolls; [m] toggles mouse" },
-			{ key = "c / q / Ctrl+C", desc = "Clear REPL screen / Quit TUI panel" },
-		},
-	},
-	{
-		title = "jEMach TUI Tab Actions & Live Functions",
-		items = {
-			{ key = "[1] Workspace", desc = "l/h/Enter fold/eval; i inspect; e edit fn or paste var; d/D hide" },
-			{ key = "[2] History", desc = "Previous session folded! h/l/H fold; Space select; p make proc" },
-			{ key = "[2] v / e / Enter", desc = "Full cmd+error viewer / paste to REPL / re-run cmd" },
-			{
-				key = "[3] Procedures (● ⚡ ◆)",
-				desc = "● Disk  ⚡ Modified in memory  ◆ Live REPL fn  ○ Unloaded  ✗ Error",
-			},
-			{ key = "[3] e / E / c", desc = "Edit clean fn in julia> REPL / open $EDITOR -> Main / paste call" },
-			{
-				key = "[3] R / S / Enter",
-				desc = "Reload from disk (reset ⚡) / Save to procedures/ / Run (remembers args)",
-			},
-			{ key = "[3] F / v / J / K", desc = "Toggle Failed Commands sub-view / Full detail / Scroll preview" },
-			{ key = "[4] Packages", desc = "a add package / d remove package / u update packages" },
-		},
-	},
-}
-
 -- Search & Filter state
 local search_mode = false
 local search_query = ""
@@ -1059,14 +361,6 @@ local function set_toast(msg, duration)
 	toast_msg = msg
 	toast_expires = os.time() + (duration or 3)
 	dirty = true
-end
-
-local function split_lines(s)
-	local lines = {}
-	for line in (s .. "\n"):gmatch("(.-)\r?\n") do
-		table.insert(lines, line)
-	end
-	return lines
 end
 
 local display_rows = {}
@@ -1088,30 +382,12 @@ end
 -- ---------------------------------------------------------------------------
 -- Read & refresh state
 -- ---------------------------------------------------------------------------
-local function file_mtime(path)
-	local h = io.popen("stat -c %Y " .. path .. " 2>/dev/null")
-	if not h then
-		return 0
-	end
-	local v = tonumber(h:read("*l")) or 0
-	h:close()
-	return v
-end
+local last_file_content = nil
 
 local function load_state()
 	if socket_fd >= 0 and last_state_ts > 0 and (os.time() - last_state_ts) < 3 then
 		return false
 	end
-
-	local mt = file_mtime(STATE_FILE)
-	if mt == 0 then
-		check_and_discover()
-		mt = file_mtime(STATE_FILE)
-	end
-	if mt == 0 or mt == last_mtime then
-		return false
-	end
-	last_mtime = mt
 
 	local f = io.open(STATE_FILE, "r")
 	if not f then
@@ -1119,9 +395,13 @@ local function load_state()
 	end
 	local content = f:read("*a")
 	f:close()
+	if content == last_file_content then
+		return false
+	end
 
 	local ok, parsed = pcall(json_parse, content)
 	if ok and parsed then
+		last_file_content = content
 		apply_new_state(parsed)
 		return true
 	end
@@ -1131,458 +411,20 @@ end
 -- ---------------------------------------------------------------------------
 -- Build the flat display_rows list with search filter
 -- ---------------------------------------------------------------------------
+local build_rows = require("tui.rows")
 local function build_display_rows()
-	display_rows = {}
-	local q = (search_query or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
-	local has_filter = (q ~= "")
-
-	-- Tab 5: Guide
-	if active_tab == 5 then
-		for _, sec in ipairs(GUIDE_SECTIONS) do
-			local matched_items = {}
-			local sec_match = has_filter and (sec.title:lower():find(q, 1, true) ~= nil)
-			for _, item in ipairs(sec.items) do
-				if
-					not has_filter
-					or sec_match
-					or item.key:lower():find(q, 1, true)
-					or item.desc:lower():find(q, 1, true)
-				then
-					table.insert(matched_items, item)
-				end
-			end
-			if #matched_items > 0 then
-				table.insert(display_rows, {
-					kind = "guide_hdr",
-					title = sec.title,
-				})
-				for _, item in ipairs(matched_items) do
-					table.insert(display_rows, {
-						kind = "guide_item",
-						key = item.key,
-						desc = item.desc,
-					})
-				end
-			end
-		end
-		if #display_rows == 0 then
-			display_rows[1] = { kind = "empty_search", text = 'No guide entries matching "' .. search_query .. '".' }
-		end
-		return
-	end
-
-	-- Tab 4: Packages
-	if active_tab == 4 then
-		if not state or not state.packages then
-			display_rows[1] = {
-				kind = "msg",
-				text = "Waiting for packages state…",
-			}
-			return
-		end
-
-		for _, pkg in ipairs(state.packages) do
-			local pname = pkg.name or ""
-			local pver = pkg.version or ""
-			if not has_filter or pname:lower():find(q, 1, true) or pver:lower():find(q, 1, true) then
-				table.insert(display_rows, {
-					kind = "package",
-					name = pname,
-					version = pver,
-				})
-			end
-		end
-
-		if #display_rows == 0 then
-			if has_filter then
-				display_rows[1] = { kind = "empty_search", text = 'No packages matching "' .. search_query .. '".' }
-			else
-				display_rows[1] = { kind = "msg", text = "No packages in active environment." }
-			end
-		end
-		return
-	end
-
-	-- Tab 2: History (splits Previous Sessions vs Current Session; previous folded by default)
-	if active_tab == 2 then
-		local hist = state and state.history or {}
-		local hstat = state and state.history_statuses or {}
-		local prev_count = math.min(#hist, math.max(0, tonumber(state and state.history_prev_count) or 0))
-		if #hist == 0 then
-			display_rows[1] = {
-				kind = "msg",
-				text = "No REPL commands captured yet in this session.",
-			}
-			return
-		end
-
-		local matched_prev = {}
-		local matched_curr = {}
-		for i, cmd in ipairs(hist) do
-			if not has_filter or cmd:lower():find(q, 1, true) then
-				local entry = {
-					kind = "history",
-					idx = i,
-					cmd = cmd,
-					status = hstat[i] or "",
-					is_prev = (i <= prev_count),
-					selected = history_selected[i] or false,
-				}
-				if i <= prev_count then
-					table.insert(matched_prev, entry)
-				else
-					table.insert(matched_curr, entry)
-				end
-			end
-		end
-
-		if prev_count > 0 then
-			local is_collapsed = history_prev_collapsed and not has_filter
-			if not has_filter or #matched_prev > 0 then
-				local lbl = has_filter and string.format("Previous Sessions (%d/%d matches)", #matched_prev, prev_count)
-					or string.format("Previous Sessions (%d)", prev_count)
-				table.insert(display_rows, {
-					kind = "hist_section",
-					sec_id = "prev",
-					title = lbl,
-					collapsed = is_collapsed,
-					count = prev_count,
-				})
-				if not is_collapsed then
-					for _, r in ipairs(matched_prev) do
-						table.insert(display_rows, r)
-					end
-				end
-			end
-
-			table.insert(display_rows, {
-				kind = "section",
-				text = string.format("Current Session (%d)", #matched_curr),
-			})
-			if #matched_curr > 0 then
-				for _, r in ipairs(matched_curr) do
-					table.insert(display_rows, r)
-				end
-			elseif not has_filter then
-				table.insert(display_rows, {
-					kind = "hist_note",
-					text = "No commands executed in this session yet (run code in julia> or press [l] above).",
-				})
-			end
-		else
-			for _, r in ipairs(matched_curr) do
-				table.insert(display_rows, r)
-			end
-		end
-
-		if #display_rows == 0 or (has_filter and #matched_prev == 0 and #matched_curr == 0) then
-			display_rows = { { kind = "empty_search", text = 'No commands matching "' .. search_query .. '".' } }
-		end
-		return
-	end
-
-	-- Tab 3: Procedures (with separate [F] Failed Commands sub-view)
-	if active_tab == 3 then
-		local procs = state and state.procedures or {}
-		local fcmds = state and state.failed_commands or {}
-
-		if proc_errors_view then
-			if #fcmds == 0 then
-				display_rows[1] = {
-					kind = "msg",
-					text = "No failed commands recorded. Press [F] to return to Procedures.",
-				}
-				return
-			end
-			for i, fc in ipairs(fcmds) do
-				local fcmd = fc.cmd or ""
-				local ferr = fc.error or ""
-				local fdet = fc.error_detail or ""
-				local fstmt = fc.failed_stmt or ""
-				local match = true
-				if has_filter then
-					match = (fcmd:lower():find(q, 1, true) ~= nil)
-						or (ferr:lower():find(q, 1, true) ~= nil)
-						or (fdet:lower():find(q, 1, true) ~= nil)
-						or (fstmt:lower():find(q, 1, true) ~= nil)
-				end
-				if match then
-					table.insert(display_rows, {
-						kind = "failed_cmd",
-						idx = i,
-						id = tonumber(fc.id) or i,
-						cmd = fcmd,
-						source = fc.source or "repl",
-						proc_name = fc.proc_name or "",
-						error = ferr,
-						error_detail = fdet,
-						error_line = tonumber(fc.error_line) or 0,
-						failed_stmt = fstmt,
-						timestamp = fc.timestamp or "",
-					})
-				end
-			end
-			if #display_rows == 0 then
-				display_rows[1] =
-					{ kind = "empty_search", text = 'No failed commands matching "' .. search_query .. '".' }
-			end
-			return
-		end
-
-		if #procs == 0 then
-			if #fcmds > 0 then
-				display_rows[1] = {
-					kind = "msg",
-					text = "No procedures yet. " .. #fcmds .. " failed REPL command(s) — press [F] to inspect.",
-				}
-			else
-				display_rows[1] = { kind = "empty_proc" }
-			end
-			return
-		end
-
-		for i, p in ipairs(procs) do
-			local pname = p.name or ""
-			local psig = p.signature or (pname .. "()")
-			local pdoc = p.doc or ""
-			local pfile = p.file or ""
-			local pcode = p.code or ""
-			local perr = p.last_error or ""
-			local pcmd = p.last_run_cmd or ""
-
-			local match = true
-			if has_filter then
-				match = (pname:lower():find(q, 1, true) ~= nil)
-					or (psig:lower():find(q, 1, true) ~= nil)
-					or (pdoc:lower():find(q, 1, true) ~= nil)
-					or (pfile:lower():find(q, 1, true) ~= nil)
-					or (pcode:lower():find(q, 1, true) ~= nil)
-					or (perr:lower():find(q, 1, true) ~= nil)
-					or (pcmd:lower():find(q, 1, true) ~= nil)
-			end
-
-			if match then
-				table.insert(display_rows, {
-					kind = "procedure",
-					idx = i,
-					name = pname,
-					signature = psig,
-					file = pfile,
-					doc = pdoc,
-					code = pcode,
-					edit_code = p.edit_code or "",
-					origin = p.origin or ((pfile ~= "") and "disk" or "live"),
-					generation = tonumber(p.generation) or 1,
-					func_start_line = tonumber(p.func_start_line) or 1,
-					last_args = p.last_args or "",
-					time_ms = p.time_ms or 0.0,
-					alloc_bytes = p.alloc_bytes or 0,
-					status = p.status or "never",
-					last_run = p.last_run or "-",
-					last_run_cmd = pcmd,
-					last_error = perr,
-					last_error_detail = p.last_error_detail or "",
-					last_error_line = tonumber(p.last_error_line) or 0,
-					last_error_cmd = p.last_error_cmd or "",
-					needs_args = p.needs_args or false,
-				})
-			end
-		end
-
-		if #display_rows == 0 then
-			display_rows[1] = { kind = "empty_search", text = 'No procedures matching "' .. search_query .. '".' }
-		end
-		return
-	end
-
-	-- Tab 1: Workspace
-	if not state or (not state.modules and not state.columns) then
-		display_rows[1] = {
-			kind = "msg",
-			text = "Waiting for Julia watcher… (using jEMach)",
-		}
-		return
-	end
-
-	if state.columns then
-		local cols = state.columns
-		local count = #(cols.names or {})
-		local skip_until_depth = -1
-		local current_mod = nil
-
-		for i = 1, count do
-			local mname = (cols.modules and cols.modules[i]) or "Main"
-			if not initialized_modules[mname] then
-				initialized_modules[mname] = true
-				collapsed[mname] = true
-			end
-			if mname ~= current_mod then
-				current_mod = mname
-				if not hidden[mname] then
-					local is_collapsed = collapsed[mname] and not has_filter
-					local icon = is_collapsed and "▶" or "▼"
-					table.insert(display_rows, {
-						kind = "module",
-						name = mname,
-						collapsed = is_collapsed,
-						icon = icon,
-					})
-				end
-			end
-
-			if hidden[current_mod] or (collapsed[current_mod] and not has_filter) then
-				goto continue
-			end
-
-			local depth = (cols.depths and cols.depths[i]) or 0
-			if skip_until_depth >= 0 then
-				if depth > skip_until_depth then
-					goto continue
-				else
-					skip_until_depth = -1
-				end
-			end
-
-			local iname = cols.names[i] or "?"
-			local itype = (cols.types and cols.types[i]) or ""
-			local ival = (cols.values and cols.values[i]) or ""
-			local key = current_mod .. "/" .. ((cols.exprs and cols.exprs[i]) or iname)
-			if hidden[key] then
-				goto continue
-			end
-
-			if has_filter then
-				local match = iname:lower():find(q, 1, true)
-					or itype:lower():find(q, 1, true)
-					or ival:lower():find(q, 1, true)
-					or current_mod:lower():find(q, 1, true)
-				if not match then
-					goto continue
-				end
-			end
-
-			local has_children = cols.has_children and cols.has_children[i] or false
-			if has_children and not initialized_items[key] then
-				initialized_items[key] = true
-				collapsed[key] = true
-			end
-			local is_collapsed = collapsed[key]
-			local icon = ""
-			if has_children then
-				icon = is_collapsed and "▶" or "▼"
-			end
-
-			table.insert(display_rows, {
-				kind = "item",
-				module_name = current_mod,
-				name = iname,
-				item_kind = (cols.kinds and cols.kinds[i]) or "variable",
-				item_type = itype,
-				value = ival,
-				expr = (cols.exprs and cols.exprs[i]) or iname,
-				depth = depth,
-				path = key,
-				has_children = has_children,
-				collapsed = is_collapsed,
-				icon = icon,
-			})
-
-			if has_children and is_collapsed then
-				skip_until_depth = depth
-			end
-
-			::continue::
-		end
-
-		if #display_rows == 0 then
-			if has_filter then
-				display_rows[1] = { kind = "empty_search", text = 'No variables matching "' .. search_query .. '".' }
-			else
-				display_rows[1] = { kind = "msg", text = "No variables in workspace." }
-			end
-		end
-		return
-	end
-
-	-- Fallback for legacy state.modules structure
-	local function add_item_rows(mname, item, depth, path)
-		local iname = item.name or "?"
-		local itype = item.type or ""
-		local ival = item.value or ""
-		local key = path .. "/" .. iname
-		if hidden[key] then
-			return
-		end
-
-		if has_filter then
-			local match = iname:lower():find(q, 1, true)
-				or itype:lower():find(q, 1, true)
-				or ival:lower():find(q, 1, true)
-			if not match then
-				return
-			end
-		end
-
-		local has_children = item.children and #item.children > 0
-		if has_children and not initialized_items[key] then
-			initialized_items[key] = true
-			collapsed[key] = true
-		end
-		local is_collapsed = collapsed[key]
-		local icon = ""
-		if has_children then
-			icon = is_collapsed and "▶" or "▼"
-		end
-
-		table.insert(display_rows, {
-			kind = "item",
-			module_name = mname,
-			name = iname,
-			item_kind = item.kind or "variable",
-			item_type = itype,
-			value = ival,
-			expr = item.expr or iname,
-			depth = depth,
-			path = key,
-			has_children = has_children,
-			collapsed = is_collapsed,
-			icon = icon,
-		})
-
-		if has_children and not is_collapsed then
-			for _, child in ipairs(item.children) do
-				add_item_rows(mname, child, depth + 1, key)
-			end
-		end
-	end
-
-	for _, mod in ipairs(state.modules or {}) do
-		local mname = mod.name or "?"
-		if not hidden[mname] then
-			local is_collapsed = collapsed[mname]
-			local icon = is_collapsed and "▶" or "▼"
-			table.insert(display_rows, {
-				kind = "module",
-				name = mname,
-				collapsed = is_collapsed,
-				icon = icon,
-			})
-
-			if not is_collapsed and mod.items then
-				for _, item in ipairs(mod.items) do
-					add_item_rows(mname, item, 0, mname)
-				end
-			end
-		end
-	end
-
-	if #display_rows == 0 then
-		if has_filter then
-			display_rows[1] = { kind = "empty_search", text = 'No variables matching "' .. search_query .. '".' }
-		else
-			display_rows[1] = { kind = "msg", text = "Workspace is empty." }
-		end
-	end
+	display_rows = build_rows({
+		state = state,
+		search_query = search_query,
+		active_tab = active_tab,
+		history_selected = history_selected,
+		history_prev_collapsed = history_prev_collapsed,
+		proc_errors_view = proc_errors_view,
+		hidden = hidden,
+		collapsed = collapsed,
+		initialized_items = initialized_items,
+		initialized_modules = initialized_modules,
+	})
 end
 
 -- ---------------------------------------------------------------------------
@@ -1712,10 +554,7 @@ local function get_backend_badge()
 	return b
 end
 
-local function json_escape(s)
-	s = tostring(s or "")
-	return (s:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n"):gsub("\r", "\\r"):gsub("\t", "\\t"))
-end
+local json_escape = require("tui.json").escape
 
 local function send_socket_json(json_line)
 	try_connect_socket()
@@ -1825,307 +664,12 @@ end
 -- ---------------------------------------------------------------------------
 -- Preview builder (shared by Tab 3 split preview & full-screen detail viewer)
 -- ---------------------------------------------------------------------------
-local function apply_bg_to_highlighted(hl, bg, pad_w)
-	local body = hl:gsub("\27%[0m", RESET .. bg)
-	local fill = math.max(0, pad_w - visible_len(hl))
-	return bg .. body .. string.rep(" ", fill) .. RESET
-end
-
-local function find_matching_failed_cmd(cmd)
-	if not state or not state.failed_commands or not cmd or cmd == "" then
-		return nil
-	end
-	local norm = cmd:gsub("^%s+", ""):gsub("%s+$", "")
-	for i = #state.failed_commands, 1, -1 do
-		local fc = state.failed_commands[i]
-		local fnorm = (fc.cmd or ""):gsub("^%s+", ""):gsub("%s+$", "")
-		if fc.cmd == cmd or fnorm == norm then
-			return fc
-		end
-	end
-	return nil
-end
-
-local function fmt_bytes(b)
-	b = tonumber(b) or 0
-	if b >= 1048576 then
-		return string.format("%.1fMB", b / 1048576)
-	elseif b >= 1024 then
-		return string.format("%.1fKB", b / 1024)
-	end
-	return string.format("%dB", b)
-end
-
-local function ws_col_widths(cols)
-	local name_w = (cols >= 90) and 28 or math.max(14, math.floor(cols * 0.36))
-	local type_w = (cols >= 90) and 22 or math.max(11, math.floor(cols * 0.25))
-	local val_max = math.max(6, cols - name_w - type_w - 4)
-	return name_w, type_w, val_max
-end
-
-local function origin_glyph_and_color(origin, status)
-	if status == "error" then
-		return "✗", FG_RED .. BOLD, false
-	elseif origin == "modified" then
-		return "◈", FG_YELLOW .. BOLD, false
-	elseif origin == "live" then
-		return "◆", FG_CYAN .. BOLD, false
-	elseif origin == "unloaded" then
-		return "○", DIM .. FG_GRAY, false
-	else
-		return "●", FG_GREEN, false
-	end
-end
-
+local preview = require("tui.preview")
+local fmt_bytes = preview.fmt_bytes
+local ws_col_widths = preview.ws_col_widths
+local origin_glyph_and_color = preview.origin_glyph_and_color
 local function build_item_preview_lines(dr, max_w, compact)
-	local lines = {}
-	if not dr then
-		return { DIM .. FG_GRAY .. "  (Nothing selected)" .. RESET }
-	end
-	local w = math.max(20, max_w)
-
-	local function add_section_title(color, title)
-		table.insert(lines, color .. BOLD .. "  " .. truncate_visible(title, w - 2) .. RESET)
-	end
-
-	local function add_wrapped_lines(text, color, indent_str, highlight_jl)
-		indent_str = indent_str or "    "
-		local iw = visible_len(indent_str)
-		local cw = math.max(10, w - iw)
-		for _, raw_line in ipairs(split_lines(tostring(text or ""))) do
-			local wrapped = wrap_text(raw_line, cw)
-			for _, sub in ipairs(wrapped) do
-				if highlight_jl then
-					table.insert(lines, indent_str .. highlight_julia_line(sub))
-				elseif color then
-					table.insert(lines, indent_str .. color .. sub .. RESET)
-				else
-					table.insert(lines, indent_str .. sub)
-				end
-			end
-		end
-	end
-
-	local function add_code_block(code_str, err_line)
-		local raw_lines = split_lines(code_str)
-		local gutter_w = (#raw_lines >= 100) and 7 or 6
-		local code_w = math.max(8, w - gutter_w)
-		for li, raw_line in ipairs(raw_lines) do
-			local is_err = (err_line and err_line > 0 and li == err_line)
-			local wrapped = wrap_text(raw_line, code_w)
-			for wi, sub in ipairs(wrapped) do
-				local gutter
-				if wi == 1 then
-					if is_err then
-						local fmt = (gutter_w == 7) and "✗%3d │ " or "✗%2d │ "
-						gutter = FG_RED .. BOLD .. string.format(fmt, li) .. RESET
-					else
-						local fmt = (gutter_w == 7) and "%4d " or "%3d "
-						gutter = DIM .. FG_YELLOW .. string.format(fmt, li) .. RESET .. FG_DARK_GRAY .. "│ " .. RESET
-					end
-				else
-					local sp = string.rep(" ", gutter_w - 4)
-					if is_err then
-						gutter = FG_RED .. sp .. "↪ │ " .. RESET
-					else
-						gutter = DIM .. FG_GRAY .. sp .. "↪ │ " .. RESET
-					end
-				end
-				local hl = highlight_julia_line(sub)
-				if is_err then
-					table.insert(lines, gutter .. apply_bg_to_highlighted(hl, BG_ERR_LINE, code_w))
-				else
-					table.insert(lines, gutter .. hl)
-				end
-			end
-		end
-	end
-
-	if dr.kind == "procedure" then
-		if compact then
-			if dr.code and dr.code ~= "" then
-				add_code_block(dr.code, dr.last_error_line)
-			else
-				table.insert(lines, DIM .. FG_GRAY .. "    (No source code preview available)" .. RESET)
-			end
-			if dr.last_error_detail and dr.last_error_detail ~= "" then
-				table.insert(lines, "")
-				add_section_title(FG_ORANGE, "Stacktrace / Error Detail (scroll down or [v] full):")
-				add_wrapped_lines(dr.last_error_detail, FG_LIGHT_GRAY, "  ", false)
-			end
-			return lines
-		end
-
-		local st_badge
-		if dr.status == "ok" then
-			st_badge = FG_GREEN .. BOLD .. "✓ OK" .. RESET
-		elseif dr.status == "error" then
-			st_badge = FG_RED .. BOLD .. "✗ ERROR" .. RESET
-		else
-			st_badge = DIM .. FG_GRAY .. "○ NEVER RUN" .. RESET
-		end
-		local orig = dr.origin or "disk"
-		local orig_badge = (orig == "modified")
-				and (FG_YELLOW .. BOLD .. "⚡ MOD v" .. tostring(dr.generation or 1) .. RESET)
-			or (orig == "live") and (FG_CYAN .. BOLD .. "◆ LIVE" .. RESET)
-			or (orig == "unloaded") and (DIM .. FG_GRAY .. "○ UNLOADED" .. RESET)
-			or (FG_GREEN .. "● DISK" .. RESET)
-		local hdr = "  "
-			.. BOLD
-			.. FG_CYAN
-			.. (dr.signature or dr.name or "")
-			.. RESET
-			.. "  "
-			.. orig_badge
-			.. "  "
-			.. st_badge
-		table.insert(
-			lines,
-			truncate_visible(hdr, w) == strip_ansi(hdr) and hdr or ("  " .. truncate_visible(strip_ansi(hdr), w - 2))
-		)
-
-		local loc_str = (dr.file and dr.file ~= "") and dr.file or "(REPL memory — press [S] to save)"
-		local meta = "File: " .. loc_str
-		if dr.status ~= "never" then
-			meta = meta
-				.. string.format(
-					"  |  %.2fms  %s  (%s)",
-					dr.time_ms or 0,
-					fmt_bytes(dr.alloc_bytes or 0),
-					dr.last_run or "-"
-				)
-		end
-		add_wrapped_lines(meta, DIM .. FG_GRAY, "  ", false)
-
-		if dr.doc and dr.doc ~= "" then
-			add_wrapped_lines(dr.doc, ITALIC .. FG_LIGHT_GRAY, "  ", false)
-		end
-
-		if dr.last_run_cmd and dr.last_run_cmd ~= "" then
-			table.insert(lines, "")
-			add_section_title(FG_AQUA, "▶ Last Call / Entered Command:")
-			add_wrapped_lines(dr.last_run_cmd, nil, "    ", true)
-		end
-
-		if dr.status == "error" or (dr.last_error and dr.last_error ~= "") then
-			table.insert(lines, "")
-			local line_tag = (dr.last_error_line and dr.last_error_line > 0)
-					and (" (line " .. dr.last_error_line .. ")")
-				or ""
-			add_section_title(FG_RED, "✗ Error" .. line_tag .. ":")
-			add_wrapped_lines(
-				dr.last_error ~= "" and dr.last_error or "(Error captured)",
-				FG_RED .. BOLD,
-				"    ",
-				false
-			)
-
-			if dr.last_error_cmd and dr.last_error_cmd ~= "" and dr.last_error_cmd ~= dr.last_run_cmd then
-				add_section_title(FG_ORANGE, "✗ Failing Statement:")
-				add_wrapped_lines(dr.last_error_cmd, nil, "    ", true)
-			end
-		end
-
-		table.insert(lines, "")
-		add_section_title(FG_WHITE, "Source Code:")
-		if dr.code and dr.code ~= "" then
-			add_code_block(dr.code, dr.last_error_line)
-		else
-			table.insert(lines, DIM .. FG_GRAY .. "    (No source code preview available)" .. RESET)
-		end
-
-		if dr.last_error_detail and dr.last_error_detail ~= "" then
-			table.insert(lines, "")
-			add_section_title(FG_ORANGE, "Stacktrace / Error Detail:")
-			add_wrapped_lines(dr.last_error_detail, FG_LIGHT_GRAY, "    ", false)
-		end
-	elseif dr.kind == "failed_cmd" then
-		local src_tag = (dr.source and dr.source ~= "") and ("[" .. dr.source .. "] ") or ""
-		local ts_tag = (dr.timestamp and dr.timestamp ~= "") and ("  " .. dr.timestamp) or ""
-		local hdr = FG_RED
-			.. BOLD
-			.. "  ✗ FAILED COMMAND #"
-			.. tostring(dr.id or "")
-			.. RESET
-			.. "  "
-			.. FG_YELLOW
-			.. src_tag
-			.. RESET
-			.. DIM
-			.. FG_GRAY
-			.. ts_tag
-			.. RESET
-		table.insert(lines, hdr)
-
-		table.insert(lines, "")
-		local line_tag = (dr.error_line and dr.error_line > 0) and (" (line " .. dr.error_line .. ")") or ""
-		add_section_title(FG_RED, "✗ Error" .. line_tag .. ":")
-		add_wrapped_lines(dr.error ~= "" and dr.error or "(Error)", FG_RED .. BOLD, "    ", false)
-
-		if dr.failed_stmt and dr.failed_stmt ~= "" then
-			table.insert(lines, "")
-			add_section_title(FG_ORANGE, "✗ Failing Statement:")
-			add_wrapped_lines(dr.failed_stmt, nil, "    ", true)
-		end
-
-		table.insert(lines, "")
-		add_section_title(FG_AQUA, "▶ Full Entered Command:")
-		if dr.cmd and dr.cmd ~= "" then
-			add_code_block(dr.cmd, dr.error_line)
-		else
-			table.insert(lines, DIM .. FG_GRAY .. "    (empty command)" .. RESET)
-		end
-
-		if dr.error_detail and dr.error_detail ~= "" then
-			table.insert(lines, "")
-			add_section_title(FG_ORANGE, "Stacktrace / Error Detail:")
-			add_wrapped_lines(dr.error_detail, FG_LIGHT_GRAY, "    ", false)
-		end
-	elseif dr.kind == "history" then
-		local st_badge
-		if dr.status == "error" then
-			st_badge = FG_RED .. BOLD .. "✗ ERROR" .. RESET
-		elseif dr.status == "ok" then
-			st_badge = FG_GREEN .. BOLD .. "✓ OK" .. RESET
-		else
-			st_badge = DIM .. FG_GRAY .. "○ UNKNOWN" .. RESET
-		end
-		table.insert(
-			lines,
-			"  " .. FG_YELLOW .. BOLD .. "History #" .. tostring(dr.idx or "") .. RESET .. "  " .. st_badge
-		)
-
-		local matched_fc = find_matching_failed_cmd(dr.cmd)
-		local err_line = matched_fc and tonumber(matched_fc.error_line) or 0
-
-		table.insert(lines, "")
-		add_section_title(FG_AQUA, "▶ Full Entered Command:")
-		add_code_block(dr.cmd or "", err_line)
-
-		if matched_fc then
-			table.insert(lines, "")
-			local line_tag = (err_line > 0) and (" (line " .. err_line .. ")") or ""
-			add_section_title(FG_RED, "✗ Error" .. line_tag .. ":")
-			add_wrapped_lines(matched_fc.error or "(Error)", FG_RED .. BOLD, "    ", false)
-			if matched_fc.failed_stmt and matched_fc.failed_stmt ~= "" then
-				table.insert(lines, "")
-				add_section_title(FG_ORANGE, "✗ Failing Statement:")
-				add_wrapped_lines(matched_fc.failed_stmt, nil, "    ", true)
-			end
-			if matched_fc.error_detail and matched_fc.error_detail ~= "" then
-				table.insert(lines, "")
-				add_section_title(FG_ORANGE, "Stacktrace / Error Detail:")
-				add_wrapped_lines(matched_fc.error_detail, FG_LIGHT_GRAY, "    ", false)
-			end
-		elseif dr.status == "error" then
-			table.insert(lines, "")
-			add_section_title(FG_RED, "✗ Command ended with an error (details no longer in recent error buffer).")
-		end
-	else
-		table.insert(lines, DIM .. FG_GRAY .. "  (No detail preview for this item)" .. RESET)
-	end
-
-	return lines
+	return preview.build(dr, max_w, compact, state)
 end
 
 -- ---------------------------------------------------------------------------

@@ -52,4 +52,9 @@ end
 
 #### Behavior Verification
 
-When configured correctly, launching `julia` in terminal starts the background watcher task. Output in `/tmp/jl_tui_state.json` will update automatically every ~2 seconds while REPL is active.
+When configured correctly, launching `julia` starts the background watcher and a
+private UNIX socket. Run `jEMach.terminal_info()` to see its session paths.
+Connect with `jl-assist` from the same project. While a TUI subscriber is connected,
+the watcher checks the workspace every 0.5 seconds and publishes changed snapshots
+to the socket and session's `state.json` file. Without subscribers it skips
+collection. See [IPC and sessions](ipc.md) for multiple REPLs and explicit selection.

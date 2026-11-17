@@ -34,6 +34,8 @@ export make_procedure, record, record_stop, run_procedure, list_procedures,
     @jemach, @inspect
 
 include("config.jl")
+include("json.jl")
+include("session.jl")
 include("workspace.jl")
 include("history.jl")
 include("procedures.jl")
@@ -45,10 +47,6 @@ function __init__()
     _load_zig_native!()
     hist_path = _history_path()
     HIST_START_POS[] = isfile(hist_path) ? filesize(hist_path) : 0
-
-    safe_name = _get_safe_name(_get_project_dir())
-    STATE_FILE[] = "/tmp/jl_tui_state_" * safe_name * ".json"
-    SOCKET_PATH[] = "/tmp/jemach_" * safe_name * ".sock"
 
     atexit(() -> stop(quiet = true))
 

@@ -2,19 +2,21 @@
 
 ![zdjęcie](jemachpic.png)
 
-A high-performance, Data-Oriented **Julia Workspace Assistant & REPL Monitor** with a multi-terminal interactive TUI (**Ghostty**, **Kitty**, **tmux**, **Zellij**, **Rex**) and native Zig IPC broker.
+A **Julia Workspace Assistant & REPL Monitor** with an interactive terminal UI for **Ghostty**, **Kitty**, **tmux**, **Zellij**, and **Rex**, plus an optional native Zig accelerator.
 
-Inspect variables, dataframes, matrices, composite structs, and package dependencies in real time alongside your Julia REPL — completely standalone, with zero Neovim or external package requirements.
+Inspect variables, dataframes, matrices, composite structs, and package dependencies alongside your Julia REPL. Turn selected REPL commands into reusable procedures. The Julia package uses only standard libraries; the TUI requires LuaJIT and works independently of Neovim.
 
 ---
 
 ## Architecture Overview
 
-`jEMach` is built around **Data-Oriented Design (DoD)** principles for minimum latency, zero GC pressure, and optimal cache locality:
+`jEMach` stores workspace snapshots in a **Struct-of-Arrays (SoA)** table and sends updates when the serialized state changes:
 
-- **Julia Engine (`src/jEMach.jl`)**: Asynchronous background introspection task organizing workspace symbols into a Struct-of-Arrays (SoA) columnar table (`WorkspaceTable`), plus a full-duplex UNIX domain socket server for direct REPL evaluation and `LineEdit` buffer injection without external multiplexer dependencies.
-- **Multi-Terminal TUI (`scripts/jl_tui.lua`)**: Standalone LuaJIT terminal UI connecting over UNIX domain sockets (`/tmp/jemach_<project>.sock`). Features DEC Mode 2026 Synchronized Output, Alternate Screen Buffer, Kitty/Ghostty CSI-u keyboard protocol support, zero-fork FFI `ioctl(TIOCGWINSZ)` resize detection, and 0.0% idle CPU usage.
-- **Native Zig Broker (`zig/`)**: Ultra-fast bidirectional fan-out IPC broker and SoA multi-array structures (`std.MultiArrayList`) for high-throughput zero-copy event streaming.
+- **Julia engine (`src/`)**: Background introspection into `WorkspaceTable`, procedure generation and lifecycle, and a full-duplex UNIX socket for REPL evaluation and `LineEdit` input editing. Procedure responsibilities live in `src/procedures/`; snapshot encoding, REPL commands and socket transport live in `src/ipc/`.
+- **Terminal UI (`scripts/jl_tui.lua`, `scripts/tui/`)**: LuaJIT UI with separate modules for session discovery, JSON, display rows, previews, key normalization, text formatting, syntax highlighting and theme. Supports synchronized output, alternate screen, CSI-u keyboards and FFI resize detection.
+- **Optional Zig components (`zig/`)**: Native JSON escaping and history/source scanning, with Julia fallbacks. A standalone experimental `jemach-broker` is also included; the default Julia-to-TUI path connects directly to Julia.
+
+Snapshot collection and serialization allocate memory. Julia checks for changes every 0.5 seconds while a TUI subscriber is connected; without subscribers it skips collection. CPU usage and latency depend on the workspace and terminal. See [performance measurements](docs/src/performance.md) for a reproducible benchmark and its limits.
 
 ---
 
@@ -23,7 +25,7 @@ Inspect variables, dataframes, matrices, composite structs, and package dependen
 ### In Julia
 
 ```julia
-julia .
+julia
 ]
 # pkg>
 add https://github.com/kitajusSus/jEMach
@@ -80,6 +82,22 @@ Pkg.add(url="https://github.com/kitajusSus/jEMach")
 | **`kitty`**               | `$KITTY_WINDOW_ID` / `xterm-kitty`        | `kitten @ launch --location=vsplit` (or companion window)                                                 | UNIX Socket RPC + `kitten @ send-text` fallback |
 | **`ghostty`**             | `$TERM_PROGRAM=ghostty` / `xterm-ghostty` | Companion `ghostty` window (`JEMACH_GHOSTTY_MODE=tab` for tab, or `Ctrl+Shift+O` + `jl-assist`) | UNIX Socket RPC (`LineEdit` + `Main` eval)      |
 | **`rex`** _(Ghostty mux)_ | `$REX_SESSION` / `$REX` / `$GHOSTTY_REX`  | `rex pane split` / `rex split-window` / `$JEMACH_REX_SPLIT_CMD`                                           | UNIX Socket RPC + `rex send-keys` fallback      |
+
+### Multiple Julia sessions
+
+Each REPL has a private session directory under `/tmp/jemach-<uid>/session-<random>/`, containing `repl.sock`, `state.json`, and project metadata. Starting or stopping another REPL in the same project does not replace its socket.
+
+`jl-assist` automatically selects the sole live session for the current project. If several sessions are running, it lists their sockets and requires an explicit selection:
+
+```julia
+jEMach.terminal_info()  # :socket_path identifies this REPL
+```
+
+```bash
+./scripts/jl-assist -i -s /tmp/jemach-1000/session-EXAMPLE/repl.sock
+```
+
+The state path is inferred from `repl.sock`; custom socket filenames require `-d STATE`. A TUI stays attached to its chosen session and does not switch to a different project when disconnected. Normal shutdown removes the session files; discovery ignores leftover directories without a live socket.
 
 ---
 
@@ -253,7 +271,7 @@ jEMach.find_procedures("sample")
 
 ## Native Zig Accelerator & Broker (`zig/`)
 
-`jEMach` includes a native Zig shared library (`libjemach_native`) with SIMD JSON string escaping and single-pass `repl_history.jl` block parsing (with automatic pure-Julia fallback if `zig` is not installed), as well as a standalone IPC broker (`jemach-broker`):
+`jEMach` includes a native Zig shared library (`libjemach_native`) for JSON string escaping and `repl_history.jl` block parsing, with automatic pure-Julia fallback if the native library is unavailable. The separate experimental IPC broker (`jemach-broker`) is not required to run the assistant. The minimum Zig compiler version is recorded in `zig/build.zig.zon`.
 
 ```bash
 # Built automatically when Zig is installed via Julia:
@@ -267,8 +285,20 @@ zig build -Doptimize=ReleaseFast     # Builds libjemach_native + jemach-broker
 
 ---
 
+## Development checks
+
+```bash
+julia --project=. -e 'using Pkg; Pkg.test()'
+luajit "$PWD/test/tui.lua"
+bash -n scripts/jl-assist
+julia --startup-file=no --project=. scripts/benchmark.jl
+```
+
+`Pkg.test()` covers procedure behavior, JSON validation, repeated start/stop, and independent Julia processes in one project. With LuaJIT installed it also checks discovery and TUI modules. CI installs LuaJIT on Linux and macOS. See [the source map](docs/src/development.md) before extending the implementation.
+
 ## System Requirements
 
 - **Julia** >= 1.10
+- **Operating system**: Linux or macOS (UNIX domain sockets; Windows is not currently supported)
 - **luajit** (`sudo pacman -S luajit` on Arch Linux, `sudo apt install luajit` on Ubuntu/Debian)
 - **Terminal / Multiplexer**: Any of **Ghostty**, **Kitty**, **tmux** (>= 3.0), **Zellij**, **Rex**, or any ANSI/VT100 terminal emulator

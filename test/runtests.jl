@@ -1,6 +1,9 @@
 using Test
 using jEMach
 
+# Unit and integration coverage for per-process sessions lives in sessions.jl,
+# included after the existing procedure tests below.
+
 const Sockets = jEMach.Sockets
 
 @testset "jEMach World-Age & Workspace Visibility" begin
@@ -585,3 +588,5 @@ end
         rm(jEMach.STATE_FILE[]; force = true)
     end
 end
+
+include("sessions.jl")

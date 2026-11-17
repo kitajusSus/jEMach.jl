@@ -43,5 +43,15 @@ jobs:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
       - uses: julia-actions/cache@v2
+      - name: Install LuaJIT (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y luajit
+      - name: Install LuaJIT (macOS)
+        if: runner.os == 'macOS'
+        run: brew list luajit || brew install luajit
+      - name: Check launcher syntax
+        run: bash -n scripts/jl-assist
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1

@@ -101,13 +101,21 @@ find_project_dir() {
 }
 
 PROJ_DIR="$(find_project_dir)"
-SAFE_NAME="$(printf '%s' "$PROJ_DIR" | sed 's/[^a-zA-Z0-9]/_/g')"
-
+# Discovery is shared with the TUI. Never choose a session from another project,
+# and never silently pick one when multiple REPLs are running.
 if [[ -z "$SOCKET" ]]; then
-  SOCKET="/tmp/jemach_${SAFE_NAME}.sock"
-fi
-if [[ -z "$STATE" ]]; then
-  STATE="/tmp/jl_tui_state_${SAFE_NAME}.json"
+  DISCOVERED="$(luajit "${SCRIPT_DIR}/discover_session.lua" "$PROJ_DIR")"
+  SOCKET="${DISCOVERED%%$'\n'*}"
+  if [[ -z "$STATE" ]]; then
+    STATE="${DISCOVERED#*$'\n'}"
+  fi
+elif [[ -z "$STATE" ]]; then
+  if [[ "$SOCKET" == */repl.sock ]]; then
+    STATE="${SOCKET%/repl.sock}/state.json"
+  else
+    echo "Error: provide -d STATE when using a custom socket filename." >&2
+    exit 1
+  fi
 fi
 
 # --------------------------------------------------------------------------
@@ -165,8 +173,13 @@ case "$ACTIVE_BACKEND" in
 
     TUI_PANE=""
     if [[ "$FORCE_NEW" -eq 0 ]]; then
-      TUI_PANE="$(tmux list-panes -F "#{pane_id} #{pane_current_command}" \
-        | awk '/luajit/{print $1; exit}')"
+      while IFS= read -r candidate; do
+        candidate_socket="$(tmux show-options -p -t "$candidate" -v @jemach_socket 2>/dev/null || true)"
+        if [[ "$candidate_socket" == "$SOCKET" ]]; then
+          TUI_PANE="$candidate"
+          break
+        fi
+      done < <(tmux list-panes -F "#{pane_id}")
     fi
 
     if [[ -n "$TUI_PANE" ]]; then
@@ -176,9 +189,10 @@ case "$ACTIVE_BACKEND" in
     fi
 
     PANE_DIR="$(tmux display-message -t "${JULIA_PANE}" -p "#{pane_current_path}" 2>/dev/null || echo "$PROJ_DIR")"
-    tmux split-window -h -l "${PANE_WIDTH}" -c "${PANE_DIR}" \
+    TUI_PANE="$(tmux split-window -P -F "#{pane_id}" -h -l "${PANE_WIDTH}" -c "${PANE_DIR}" \
       -e "JEMACH_SOCKET=${SOCKET}" -e "JEMACH_STATE=${STATE}" -e "JEMACH_PROJ=${PROJ_DIR}" -e "JEMACH_BACKEND=tmux" \
-      "luajit '${TUI_SCRIPT}' '${JULIA_PANE}' '${SOCKET}' '${STATE}' || { echo 'TUI exited with error — press any key'; read -n1; }"
+      luajit "$TUI_SCRIPT" "$JULIA_PANE" "$SOCKET" "$STATE")"
+    tmux set-option -p -t "$TUI_PANE" @jemach_socket "$SOCKET"
     echo "Done. tmux TUI pane started alongside Julia REPL (${JULIA_PANE})."
     ;;
 

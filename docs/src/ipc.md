@@ -1,45 +1,67 @@
-# IPC & Socket Architecture
+# IPC and sessions
 
-Overview of communication mechanics implemented between `jEMach.jl` and UI consumers (`jl-assist` TUI and Zig broker).
+The default TUI connects directly to the Julia process over a full-duplex UNIX
+domain socket. The optional Zig broker is a separate experimental program and
+is not started by `jEMach.start()`.
 
-## Dual Sync Mechanism
+## Session ownership
 
-`jEMach.jl` uses a hybrid communication model combining **UNIX Domain Socket Event Broadcasting** and **Filesystem State Backup**.
+Each process creates `/tmp/jemach-<uid>/session-<random>/`. The parent and session
+directories are private to the user (0700); the listening socket is 0600.
+`src/session.jl` owns creation, discovery metadata and cleanup. Session files are:
 
-```
-                       +-------------------------------+
-                       |    jEMach Julia Engine        |
-                       +---------------+---------------+
-                                       |
-                     +-----------------+-----------------+
-                     |                                   |
-           UNIX Socket Listener                  File State Output
-     /tmp/jemach_<project_hash>.sock         /tmp/jl_tui_state_<hash>.json
-                     |                                   |
-            +--------+--------+                 +--------+--------+
-            |                 |                 |                 |
-     jl-assist TUI       Zig Broker       Fallback Reader   Offline Inspector
-```
+| File | Purpose |
+| --- | --- |
+| `repl.sock` | Commands and state subscriptions |
+| `state.json` | Last published snapshot, replaced atomically |
+| `project` | Canonical project directory, advertised after the socket starts |
 
-## Bidirectional UNIX Domain Socket Protocol
+Paths are independent of project name length and remain short enough for UNIX
+sockets. Several Julia processes may use the same project without unlinking one
+another's socket. `jEMach.terminal_info()` reports the current socket, state file
+and session directory. A restart creates a fresh session directory.
 
-- **Socket Path**: `/tmp/jemach_<project_safe_name>.sock`
-- **Protocol**: Full-duplex single-line JSON objects terminated with `\n`.
-- **State Streaming (Julia -> TUI)**:
-  1. Consumer connects to socket and writes `SUB\n`.
-  2. `jEMach` registers client socket in active subscriber set `_socket_clients`.
-  3. Immediately sends the latest serialized workspace JSON (including detected `"backend"`).
-  4. Subsequent state refreshes write JSON payloads directly across open sockets.
-  5. On `jEMach.stop()`, broadcasts `{"event":"stop","action":"close"}` so TUI panes exit cleanly across Ghostty, Kitty, Zellij, tmux, and Rex.
-- **Interactive REPL RPC (TUI -> Julia)**:
-  Subscribers can send JSON command lines back over the same open socket connection (removing any hard requirement on `tmux send-keys`):
-  - `{"cmd":"eval","code":"..."}`: Evaluates code in `Main`, prints `julia> <code>` and formatted output in the REPL, refreshes `REPL.LineEdit`, and broadcasts updated state.
-  - `{"cmd":"eval_silent","code":"..."}`: Evaluates internal management commands silently and refreshes state.
-  - `{"cmd":"insert","text":"...","move_left":1}`: Injects text directly into the active `REPL.LineEdit` prompt buffer (`Base.active_repl.mistate`) and positions the cursor.
-  - `{"cmd":"clear"}`: Clears the REPL terminal screen and redraws the prompt.
+The launcher and TUI share `scripts/tui/sessions.lua`. Discovery only considers
+live sockets for the current user and canonical project path. A single match is
+selected automatically; multiple matches require `jl-assist -s SOCKET`. No match
+produces an error with startup instructions. Explicit selection remains pinned
+when a connection drops. Discovery ignores stale session directories after a
+crash; normal shutdown removes the process's own files.
 
-#### Automatic Fallback File
+## Wire protocol
 
-In addition to socket streaming, state updates are written to `/tmp/jl_tui_state_<project_safe_name>.json` to ensure recovery if socket connections reset or close.
+Messages are UTF-8, one JSON object per line, terminated with a newline.
 
-`DOCS CREATED BY VIBES`:
+1. A subscriber sends `SUB\n`.
+2. Julia immediately sends the cached snapshot, or collects the first snapshot.
+3. While subscribers are connected, Julia checks state every 0.5 seconds.
+   An unchanged serialized body is not broadcast again. Without subscribers,
+   the watcher skips snapshot collection.
+4. The same connection accepts command objects. A one-shot connection may
+   send a command without subscribing.
+5. Shutdown sends `{"event":"stop","action":"close"}` and closes subscribers.
+
+| Command | Fields | Effect |
+| --- | --- | --- |
+| `eval` | `code`, optional `history` | Evaluate in `Main`, show output and refresh state |
+| `eval_silent` | `code`, optional `filename`, `proc_name` | Evaluate management code and refresh state |
+| `insert` | `text`, optional `move_left` | Insert into the active REPL buffer |
+| `replace_input` | `text`, optional `move_left` | Replace input and switch to Julia mode |
+| `clear` | — | Clear and redraw the REPL |
+
+RPC objects are flat: strings, numbers, booleans and null. Malformed JSON is
+rejected as a whole, including bad escapes, malformed numbers and trailing input.
+Both codecs handle Unicode escapes and surrogate pairs. Code evaluation is
+available to processes running as the same user through the private socket.
+
+## File fallback
+
+Snapshot publication writes `state.json.tmp` and atomically renames it to
+`state.json`. When socket frames are unavailable, the TUI reads that session's
+file and compares its contents, avoiding platform-specific `stat` commands and
+timestamp granularity issues. It never discovers a different session as a
+side effect of a failed read or reconnect.
+
+`publish_state()` also supports an explicit snapshot while the watcher is stopped;
+it creates a private directory without advertising a listening session. `stop()`
+cleans that directory as well.

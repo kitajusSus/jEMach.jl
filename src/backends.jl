@@ -53,6 +53,7 @@ function terminal_info()::Dict{Symbol, Any}
         :rex => haskey(ENV, "REX_SESSION") || haskey(ENV, "REX") || haskey(ENV, "GHOSTTY_REX"),
         :socket_path => SOCKET_PATH[],
         :state_file => STATE_FILE[],
+        :session_dir => _session_dir[],
     )
 end
 
@@ -88,36 +89,13 @@ function _close_tui_pane()
         _tui_proc_ref[] = nothing
     end
 
-    if backend == :tmux || haskey(ENV, "TMUX")
+    if backend == :tmux
         if !isempty(_tui_pane_ref[])
             try
                 run(pipeline(`tmux kill-pane -t $(_tui_pane_ref[])`, devnull))
             catch
             end
             _tui_pane_ref[] = ""
-        end
-        if haskey(ENV, "TMUX")
-            try
-                out = read(`tmux list-panes -F "#{pane_id} #{pane_current_command} #{pane_title}"`, String)
-                cur_pane = try
-                    strip(read(`tmux display-message -p "#{pane_id}"`, String))
-                catch
-                    ""
-                end
-                for line in split(strip(out), '\n')
-                    parts = split(strip(line))
-                    !isempty(parts) || continue
-                    pid = parts[1]
-                    line_str = lowercase(line)
-                    if pid != cur_pane && (occursin("jl_tui", line_str) || occursin("jl-assist", line_str) || occursin("jemach", line_str))
-                        try
-                            run(pipeline(`tmux kill-pane -t $pid`, devnull))
-                        catch
-                        end
-                    end
-                end
-            catch
-            end
         end
     elseif backend == :zellij
         # Zellij panes launched with `--close-on-exit` terminate automatically when the socket stops
@@ -182,6 +160,7 @@ function _open_tui_pane(; backend::Symbol = detect_backend(), width::Int = 65)
             pane_id = strip(read(cmd, String))
             _tui_pane_ref[] = pane_id
             _tui_backend_ref[] = :tmux
+            run(`tmux set-option -p -t $pane_id @jemach_socket $sock`)
             println("🚀 tmux TUI split opened ($pane_id)!")
         catch e
             @warn "Failed to open tmux TUI pane" exception = e
@@ -288,6 +267,8 @@ function _open_tui_pane(; backend::Symbol = detect_backend(), width::Int = 65)
     return nothing
 end
 
+const _watcher_epoch = Ref{UInt64}(0)
+
 function start(; split::Bool = true, backend::Symbol = :auto, width::Int = 65, quiet::Bool = false)
     backend != :auto && (_backend_override[] = backend)
     _load_procedures!()
@@ -297,17 +278,26 @@ function start(; split::Bool = true, backend::Symbol = :auto, width::Int = 65, q
         end
         !quiet && !split && @info "jEMach Watcher already running"
     else
+        _ensure_session!()
         _running[] = true
-        _start_socket_server()
+        try
+            _start_socket_server()
+        catch
+            _running[] = false
+            _stop_socket_server()
+            _cleanup_session!()
+            rethrow()
+        end
+        _watcher_epoch[] += 1
+        epoch = _watcher_epoch[]
         _task_ref[] = @async begin
             !quiet && @info "jEMach Watcher started — writing state to $(STATE_FILE[]) and socket $(SOCKET_PATH[]) [backend: $(detect_backend())]"
-            while _running[]
+            while _running[] && _watcher_epoch[] == epoch
                 if _has_active_tui_clients()
                     Base.invokelatest(publish_state)
                 end
                 sleep(UPDATE_INTERVAL)
             end
-            _stop_socket_server()
             !quiet && @info "jEMach Watcher stopped"
         end
     end
@@ -320,10 +310,15 @@ function start(; split::Bool = true, backend::Symbol = :auto, width::Int = 65, q
 end
 
 function stop(; quiet::Bool = false)
-    _running[] = false
-    _last_serialized_body[] = ""
-    _stop_socket_server()
-    _close_tui_pane()
+    lock(_publish_lock) do
+        _running[] = false
+        _watcher_epoch[] += 1
+        _last_serialized_body[] = ""
+        _last_serialized_json[] = ""
+        _stop_socket_server()
+        _close_tui_pane()
+        _cleanup_session!()
+    end
     !quiet && @info "jEMach Watcher stopped and TUI panel closed."
     return nothing
 end
@@ -356,7 +351,7 @@ function _is_tui_open()::Bool
     for c in _socket_clients
         isopen(c) && return true
     end
-    if !isempty(_tui_pane_ref[]) && haskey(ENV, "TMUX")
+    if !isempty(_tui_pane_ref[]) && _tui_backend_ref[] == :tmux
         try
             run(pipeline(`tmux display-message -t $(_tui_pane_ref[]) -p "#{pane_id}"`, devnull))
             return true

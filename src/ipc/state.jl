@@ -1,0 +1,17 @@
+const _task_ref = Ref{Union{Task, Nothing}}(nothing)
+const _running = Ref{Bool}(false)
+const _socket_clients = Set{Sockets.PipeEndpoint}()
+const _server_ref = Ref{Union{Sockets.PipeServer, Nothing}}(nothing)
+const _last_serialized_json = Ref{String}("")
+const _last_serialized_body = Ref{String}("")
+const _tui_pane_ref = Ref{String}("")
+const _tui_backend_ref = Ref{Symbol}(:none)
+const _tui_proc_ref = Ref{Union{Base.Process, Nothing}}(nothing)
+const _json_dst_buf = Vector{UInt8}(undef, 4096)
+const _serialize_lock = ReentrantLock()
+const _publish_lock = ReentrantLock()
+const _hasmethod_cache = Dict{Symbol, Bool}()
+const _hasmethod_world_ref = Ref{UInt64}(UInt64(0))
+
+_has_active_tui_clients()::Bool = any(isopen, _socket_clients)
+
