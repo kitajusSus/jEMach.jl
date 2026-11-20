@@ -23,7 +23,8 @@
 #   - inline   : Runs `jl_tui.lua` directly in the current terminal (`jl-assist -i`)
 #
 # Recommended workflow:
-#   julia --project=. -e 'using jEMach; jEMach.start()'
+#   julia --project=.
+#   julia> using jEMach; jEMach.start()
 #   # Or manually in any split / terminal:
 #   ./scripts/jl-assist -i
 
@@ -127,7 +128,7 @@ detect_backend() {
     return
   fi
   if [[ "$BACKEND" != "auto" && -n "$BACKEND" ]]; then
-    echo "${BACKEND,,}"
+    printf '%s\n' "$BACKEND" | tr '[:upper:]' '[:lower:]'
     return
   fi
   if [[ -n "${REX_SESSION:-}" || -n "${REX:-}" || -n "${REX_PANE_ID:-}" || -n "${REX_SOCKET:-}" || -n "${GHOSTTY_REX:-}" ]]; then

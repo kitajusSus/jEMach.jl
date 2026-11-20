@@ -8,19 +8,11 @@ Inspect variables, dataframes, matrices, composite structs, and package dependen
 
 ---
 
-## Architecture Overview
-
-`jEMach` stores workspace snapshots in a **Struct-of-Arrays (SoA)** table and sends updates when the serialized state changes:
-
-- **Julia engine (`src/`)**: Background introspection into `WorkspaceTable`, procedure generation and lifecycle, and a full-duplex UNIX socket for REPL evaluation and `LineEdit` input editing. Procedure responsibilities live in `src/procedures/`; snapshot encoding, REPL commands and socket transport live in `src/ipc/`.
-- **Terminal UI (`scripts/jl_tui.lua`, `scripts/tui/`)**: LuaJIT UI with separate modules for session discovery, JSON, display rows, previews, key normalization, text formatting, syntax highlighting and theme. Supports synchronized output, alternate screen, CSI-u keyboards and FFI resize detection.
-- **Optional Zig components (`zig/`)**: Native JSON escaping and history/source scanning, with Julia fallbacks. A standalone experimental `jemach-broker` is also included; the default Julia-to-TUI path connects directly to Julia.
-
-Snapshot collection and serialization allocate memory. Julia checks for changes every 0.5 seconds while a TUI subscriber is connected; without subscribers it skips collection. CPU usage and latency depend on the workspace and terminal. See [performance measurements](docs/src/performance.md) for a reproducible benchmark and its limits.
-
----
-
 ## Installation
+
+You need Julia 1.10 or newer. Install **LuaJIT** separately to use the terminal UI;
+the Julia package itself uses only standard libraries. On Ubuntu/Debian, for example,
+run `sudo apt install luajit`; on macOS with Homebrew, run `brew install luajit`.
 
 ### In Julia
 
@@ -45,13 +37,13 @@ Pkg.add(url="https://github.com/kitajusSus/jEMach")
    ```bash
    julia -t auto --project=.
    ```
-2. Load and start `jEMach`:
+2. Load `jEMach` and open the TUI:
    ```julia
-   using jEMach
-   jEMach.start()                 # Auto-detects active multiplexer/terminal and opens TUI
-   # Or explicitly specify a backend (:auto, :ghostty, :kitty, :tmux, :zellij, :rex):
-   jEMach.start(backend=:ghostty)
+   using jEMach                   # Starts the background watcher
+   jEMach.start()                 # Opens the TUI using the detected terminal
    ```
+   You can also press `Alt+j` to toggle the TUI. To choose a backend explicitly,
+   use `jEMach.start(backend=:ghostty)` (also `:kitty`, `:tmux`, `:zellij`, or `:rex`).
 3. When finished:
    ```julia
    jEMach.stop()                  # Stops the watcher and closes the TUI pane/window automatically
@@ -60,6 +52,16 @@ Pkg.add(url="https://github.com/kitajusSus/jEMach")
 ---
 
 ### Option 2: Manual Split or Inline Launch via CLI (`jl-assist`)
+
+Keep the Julia REPL running with `using jEMach`. If you installed the package
+with `Pkg.add`, print the launcher's location in that REPL:
+
+```julia
+println(joinpath(pkgdir(jEMach), "scripts", "jl-assist"))
+```
+
+Run that path from another terminal or split in the same project directory.
+The examples below use `./scripts/jl-assist` when working from a clone of this repository.
 
 - **Inside Ghostty / Kitty / Any Native Split**:
   1. Open a split in your terminal (e.g., `Ctrl+Shift+O` in **Ghostty** for `new_split:right`) and run:
@@ -149,7 +151,7 @@ Turn your experimental REPL commands into parameterized, reproducible procedures
 #### `jemach>` REPL Mode & Shortcuts
 
 - Type **`}`** on an empty prompt (or press **`Alt+m`**) to enter the **`jemach>`** REPL mode (with full **Tab completion** for subcommands, procedure names, and workspace variables; `Backspace` or `Ctrl+C` exits).
-- **`Alt+j`**: Insert/browse a procedure call straight into the current `julia>` prompt.
+- **`Alt+j`**: Open or close the TUI panel.
 - **`Alt+r`**: Start or stop procedure recording (prompt dynamically switches to `⏺ [rec: name] julia> ` while recording).
 - **`↑` / `↓` history sync**: Commands executed from the TUI sidecar (`Enter` in History/Procedures) are appended to Julia's live in-memory `REPLHistoryProvider`, so pressing `↑` recalls them right away.
 - **Lazy on-demand procedures**: Existing `procedures/*.jl` files are indexed (not executed) on `using jEMach` so startup stays instant; run or load a procedure from the TUI (`[↵]` / `[R]`) or via `jEMach.run_procedure` / `jEMach.reload_procedure` to evaluate it on demand (opt into eager startup loading with `ENV["JEMACH_AUTOLOAD"] = "1"`).
@@ -266,6 +268,18 @@ jEMach.find_procedures("sample")
   -d STATE     Custom state JSON file path
   -f           Force a new TUI pane/window even if one is already open
 ```
+
+---
+
+## Architecture Overview
+
+`jEMach` stores workspace snapshots in a **Struct-of-Arrays (SoA)** table and sends updates when the serialized state changes:
+
+- **Julia engine (`src/`)**: Background introspection into `WorkspaceTable`, procedure generation and lifecycle, and a full-duplex UNIX socket for REPL evaluation and `LineEdit` input editing. Procedure responsibilities live in `src/procedures/`; snapshot encoding, REPL commands and socket transport live in `src/ipc/`.
+- **Terminal UI (`scripts/jl_tui.lua`, `scripts/tui/`)**: LuaJIT UI with separate modules for each view, session discovery, JSON, previews, key normalization, text formatting, syntax highlighting and theme. Supports synchronized output, alternate screen, CSI-u keyboards and FFI resize detection.
+- **Optional Zig components (`zig/`)**: Native JSON escaping and history/source scanning, with Julia fallbacks. A standalone experimental `jemach-broker` is also included; the default Julia-to-TUI path connects directly to Julia.
+
+Snapshot collection and serialization allocate memory. Julia checks for changes every 0.5 seconds while a TUI subscriber is connected; without subscribers it skips collection. CPU usage and latency depend on the workspace and terminal. See [performance measurements](docs/src/performance.md) for a reproducible benchmark and its limits.
 
 ---
 

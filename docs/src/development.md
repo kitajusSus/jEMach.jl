@@ -25,13 +25,17 @@ these files do not introduce extra Julia modules or change exported names.
 | `src/backends.jl` | Terminal launch/close and watcher lifecycle |
 | `src/repl_mode.jl` | Commands, macros, completion and keybindings |
 
-The Lua entry point orchestrates terminal IO, navigation and rendering.
-Modules under `scripts/tui/` return explicit functions or tables; they do not
-depend on the entry point's locals. `rows.lua` takes the snapshot and UI state
-as a context table and returns display rows. It updates the supplied collapse
-and initialization tables. `preview.lua` takes a row, width and snapshot, and
-returns formatted lines without terminal IO. `sessions.lua` is shared by the
-launcher helper and TUI, so session selection has one implementation.
+The Lua entry point handles terminal IO, navigation, shared state and overlays.
+The five modules in `scripts/tui/views/` own the rows, headers and rendering for
+Workspace, History, Procedures, Packages and Guide. `rows.lua` maps tab numbers
+to those modules and passes the snapshot and UI state to the selected view.
+Workspace updates the supplied collapse and initialization tables; the
+procedures split returns its preview scroll position and mouse hitbox. The view
+modules do not depend on the entry point's locals.
+
+`preview.lua` takes a row, width and snapshot and returns formatted lines without
+terminal IO. `sessions.lua` is shared by the launcher helper and TUI, so session
+selection has one implementation.
 
 Run `julia --project=. -e 'using Pkg; Pkg.test()'` for the complete Julia suite.
 Use `Pkg.test()` rather than including `test/runtests.jl` directly: package tests
@@ -42,8 +46,10 @@ alone, and `bash -n scripts/jl-assist` for shell syntax.
 The multi-process regression starts two Julia processes against one project,
 routes commands to both, and verifies that closing one preserves the other.
 Restart checks give old watcher tasks time to wake, detecting stale shutdowns.
-The Lua suite covers Unicode/invalid JSON, keyboard normalization, display rows
-and error previews, and rejects accidental reads of undefined globals.
+The Lua suite covers Unicode/invalid JSON, keyboard normalization, display rows,
+view rendering and error previews, and rejects accidental reads of undefined globals.
+The pseudoterminal smoke test also switches tabs, filters the guide and opens
+the procedure preview against a live Julia process.
 
 Run `zig build test` from `zig/` separately when changing native code, using a
 compiler compatible with the version in `build.zig.zon`.

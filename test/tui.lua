@@ -4,7 +4,8 @@ package.path = root .. "/scripts/?.lua;" .. package.path
 local json = require("tui.json")
 local text = require("tui.text")
 local keys = require("tui.keys")
-local rows = require("tui.rows")
+local row_views = require("tui.rows")
+local rows, views = row_views.build, row_views.views
 local preview = require("tui.preview")
 local sessions = require("tui.sessions")
 local platform = require("tui.platform")
@@ -135,4 +136,60 @@ check(rows(ctx)[1].kind == "guide_hdr")
 ctx.search_query = "impossible-search-term"
 check(rows(ctx)[1].kind == "empty_search")
 check(sessions.canonical(".") ~= ".")
+
+-- Exercise each view's rendering in isolation, with unexpected globals rejected.
+local headers = { "NAME", "COMMAND", "FUNCTION", "PACKAGE", "DESCRIPTION" }
+for i, view in ipairs(views) do
+	local header = view.header(100, {}, false)
+	check(text.strip_ansi(header):find(headers[i], 1, true), "missing header for tab " .. i)
+end
+local failed_header, failed_hitbox = views[3].header(100, { {} }, true)
+check(text.strip_ansi(failed_header):find("FAILED COMMAND", 1, true) and failed_hitbox.x2 == 100)
+
+local function rendered(view, row, selected, options)
+	local out = {}
+	view.render_row(out, row, selected, 100, options or {})
+	return text.strip_ansi(table.concat(out))
+end
+ctx.search_query = ""
+ctx.active_tab = 1
+built = rows(ctx)
+check(rendered(views[1], built[1], true, { col_cursor = 1 }):find("Main", 1, true))
+check(rendered(views[1], built[2], true, { col_cursor = 2 }):find("42", 1, true))
+ctx.active_tab = 2
+ctx.history_selected[2] = true
+built = rows(ctx)
+check(rendered(views[2], built[#built], true, { history_selected = ctx.history_selected }):find("[✓]", 1, true))
+ctx.active_tab = 4
+check(rendered(views[4], rows(ctx)[1], true):find("Random", 1, true))
+ctx.active_tab = 5
+check(rendered(views[5], rows(ctx)[1], false):find("Julia", 1, true))
+
+ctx.active_tab = 3
+ctx.proc_errors_view = false
+built = rows(ctx)
+local split_output, hitboxes = {}, {}
+local scroll, key, split_row = views[3].render_split({
+	out_buf = split_output, display_rows = built, row_hitboxes = hitboxes,
+	term_rows = 24, term_cols = 100, header_rows = 4, content_rows = 18,
+	total = #built, cursor = 1, preview_scroll = 999, preview_key = "p:f",
+	compute_win_start = function() return 1 end, state = ctx.state,
+})
+check(key == "p:f" and scroll >= 0 and scroll < 999)
+check(split_row > 4 and hitboxes[5] == 1)
+check(text.strip_ansi(table.concat(split_output)):find("oops", 1, true))
+ctx.proc_errors_view = true
+built = rows(ctx)
+split_output, hitboxes = {}, {}
+scroll, key, split_row = views[3].render_split({
+	out_buf = split_output, display_rows = built, row_hitboxes = hitboxes,
+	term_rows = 24, term_cols = 60, header_rows = 4, content_rows = 18,
+	total = #built, cursor = 1, preview_scroll = 12, preview_key = "p:f",
+	compute_win_start = function() return 1 end, state = ctx.state,
+})
+check(key == "f:1" and scroll == 0 and hitboxes[5] == 1)
+check(text.strip_ansi(table.concat(split_output)):find("bad()", 1, true))
+local empty_output = {}
+check(views[3].render_empty(empty_output, 5, 100) == 10)
+check(text.strip_ansi(table.concat(empty_output)):find("Quick Start", 1, true))
 io.write("TUI: " .. count .. " assertions passed\n")

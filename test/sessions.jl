@@ -39,6 +39,8 @@ end
                 code = """
                 using jEMach
                 tui_smoke_value = 123
+                tui_smoke_proc(x) = x + 123
+                jEMach._capture_repl_definitions!("tui_smoke_proc(x) = x + 123")
                 write($(repr(ready_paths[i])), jEMach.SOCKET_PATH[])
                 while !isfile($(repr(stop_paths[i])))
                     sleep(0.02)
@@ -79,6 +81,21 @@ end
                 @test !ispath(paths[1])
                 @test ispath(paths[2])
                 @test first(split(read(`$luajit $discover $project`, String), '\n')) == paths[2]
+                # BSD find lacks GNU's -mindepth and -maxdepth options.
+                real_find = Sys.which("find")
+                if !isnothing(real_find)
+                    mock_find = joinpath(dir, "find")
+                    write(mock_find, raw"""#!/bin/sh
+                    for arg do
+                        case "$arg" in -mindepth|-maxdepth) exit 1 ;; esac
+                    done
+                    exec "$JEMACH_TEST_FIND" "$@"
+                    """)
+                    chmod(mock_find, 0o700)
+                    withenv("PATH" => dir * ":" * ENV["PATH"], "JEMACH_TEST_FIND" => real_find) do
+                        @test first(split(read(`$luajit $discover $project`, String), '\n')) == paths[2]
+                    end
+                end
                 python = Sys.which("python3")
                 if !isnothing(python)
                     smoke = joinpath(@__DIR__, "tui_smoke.py")

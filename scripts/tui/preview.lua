@@ -52,27 +52,6 @@ local function fmt_bytes(b)
 	return string.format("%dB", b)
 end
 
-local function ws_col_widths(cols)
-	local name_w = (cols >= 90) and 28 or math.max(14, math.floor(cols * 0.36))
-	local type_w = (cols >= 90) and 22 or math.max(11, math.floor(cols * 0.25))
-	local val_max = math.max(6, cols - name_w - type_w - 4)
-	return name_w, type_w, val_max
-end
-
-local function origin_glyph_and_color(origin, status)
-	if status == "error" then
-		return "✗", FG_RED .. BOLD, false
-	elseif origin == "modified" then
-		return "◈", FG_YELLOW .. BOLD, false
-	elseif origin == "live" then
-		return "◆", FG_CYAN .. BOLD, false
-	elseif origin == "unloaded" then
-		return "○", DIM .. FG_GRAY, false
-	else
-		return "●", FG_GREEN, false
-	end
-end
-
 local function build_item_preview_lines(dr, max_w, compact, state)
 	local lines = {}
 	if not dr then
@@ -327,6 +306,4 @@ end
 return {
 	build = build_item_preview_lines,
 	fmt_bytes = fmt_bytes,
-	ws_col_widths = ws_col_widths,
-	origin_glyph_and_color = origin_glyph_and_color,
 }

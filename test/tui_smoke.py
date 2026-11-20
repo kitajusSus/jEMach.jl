@@ -19,7 +19,7 @@ def main():
     command = [shutil.which("luajit"), str(root / "scripts/jl_tui.lua"),
                "inline", sys.argv[1], sys.argv[2]]
     if "--launcher" in sys.argv:
-        command = ["bash", str(root / "scripts/jl-assist"), "-i", "-s", sys.argv[1]]
+        command = ["bash", str(root / "scripts/jl-assist"), "-b", "INLINE", "-s", sys.argv[1]]
     env = dict(os.environ, TERM="xterm-256color", JEMACH_BACKEND="standalone")
     process = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave,
                                cwd="/tmp", env=env)
@@ -48,6 +48,20 @@ def main():
                               (b"4", b"Packages"), (b"?", b"Julia REPL Editing")]:
             os.write(master, key)
             await_text(expected)
+        os.write(master, b"/no-such-guide-entry\r")
+        await_text(b"No guide entries matching")
+        os.write(master, b"x")
+        await_text(b"Julia REPL Editing")
+        os.write(master, b"3")
+        await_text(b"tui_smoke_proc")
+        os.write(master, b"J")
+        await_text(b"tui_smoke_proc")
+        os.write(master, b"v")
+        await_text(b"tui_smoke_proc")
+        os.write(master, b"v")
+        await_text(b"tui_smoke_proc")
+        os.write(master, b"F")
+        await_text(b"No failed commands recorded")
         os.write(master, b"q")
         # Drain the PTY while waiting so a full output buffer cannot block exit.
         deadline = time.monotonic() + 5

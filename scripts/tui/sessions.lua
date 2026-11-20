@@ -67,7 +67,9 @@ end
 function M.discover(project)
 	project = M.canonical(project or M.project_dir())
 	local root = "/tmp/jemach-" .. tonumber(ffi.C.getuid())
-	local pipe = io.popen("find " .. M.quote(root) .. " -mindepth 1 -maxdepth 1 -type d -name 'session-*' 2>/dev/null")
+	-- Prune every child so discovery stays one level deep with both BSD and GNU find.
+	local quoted_root = M.quote(root)
+	local pipe = io.popen("find " .. quoted_root .. " ! -path " .. quoted_root .. " -prune -type d -name 'session-*' 2>/dev/null")
 	local matches = {}
 	if not pipe then
 		return matches
