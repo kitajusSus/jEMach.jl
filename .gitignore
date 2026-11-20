@@ -14,7 +14,7 @@ Manifest.toml
 LocalPreferences.toml
 .setup_done
 docs/build/
-
+docs/resolved_issues/*
 # Test files
 *.test.jl
 
