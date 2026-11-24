@@ -25,6 +25,13 @@ mutable struct ProcedureInfo
     generation::Int
     last_args_str::String
     func_start_line::Int
+    prev_time_ms::Float64
+    prev_alloc_bytes::Int
+    prev_generation::Int
+    bench_samples::Int
+    min_time_ms::Float64
+    max_time_ms::Float64
+    last_result_repr::String
 end
 
 function ProcedureInfo(
@@ -47,13 +54,22 @@ function ProcedureInfo(
         generation::Int = 1,
         last_args_str::AbstractString = "",
         func_start_line::Int = 1,
+        prev_time_ms::Real = 0.0,
+        prev_alloc_bytes::Integer = 0,
+        prev_generation::Int = 0,
+        bench_samples::Int = 0,
+        min_time_ms::Real = 0.0,
+        max_time_ms::Real = 0.0,
+        last_result_repr::AbstractString = "",
     )
     return ProcedureInfo(
         name, String(signature), String(file), String(doc), String(code),
         Float64(last_run_time_ms), Int(last_run_alloc_bytes), last_run_status, String(last_run_at),
         "", "", "", 0, "",
         origin, String(disk_code), String(live_code), String(edit_code), String(imports_block),
-        disk_hash, live_hash, generation, String(last_args_str), func_start_line
+        disk_hash, live_hash, generation, String(last_args_str), func_start_line,
+        Float64(prev_time_ms), Int(prev_alloc_bytes), prev_generation, bench_samples,
+        Float64(min_time_ms), Float64(max_time_ms), String(last_result_repr)
     )
 end
 

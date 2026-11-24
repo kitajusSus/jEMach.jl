@@ -10,12 +10,13 @@ struct WorkspaceTable
     depths::Vector{Int32}
     parent_indices::Vector{Int32}
     has_children::Vector{Bool}
+    sizes::Vector{Int64}
 end
 
 function WorkspaceTable()
     return WorkspaceTable(
         String[], String[], String[], String[], String[], String[],
-        Int32[], Int32[], Bool[]
+        Int32[], Int32[], Bool[], Int64[]
     )
 end
 
@@ -29,6 +30,7 @@ function Base.empty!(t::WorkspaceTable)
     empty!(t.depths)
     empty!(t.parent_indices)
     empty!(t.has_children)
+    empty!(t.sizes)
     return t
 end
 
@@ -42,7 +44,8 @@ function _add_entry!(
         mod_str::String,
         depth::Int,
         parent_idx::Int,
-        has_children::Bool
+        has_children::Bool,
+        size_bytes::Integer = Int64(-1)
     )::Int
     push!(t.names, name)
     push!(t.kinds, kind)
@@ -53,6 +56,7 @@ function _add_entry!(
     push!(t.depths, Int32(depth))
     push!(t.parent_indices, Int32(parent_idx))
     push!(t.has_children, has_children)
+    push!(t.sizes, Int64(size_bytes))
     return length(t.names)
 end
 
@@ -69,6 +73,7 @@ function _append_table!(dst::WorkspaceTable, src::WorkspaceTable)
         push!(dst.parent_indices, pidx >= Int32(0) ? pidx + offset : Int32(-1))
     end
     append!(dst.has_children, src.has_children)
+    append!(dst.sizes, src.sizes)
     return dst
 end
 
@@ -112,8 +117,8 @@ function Base.show(io::IO, ::MIME"text/plain", t::WorkspaceTable)
         val_str = t.values[i]
         mod_str = t.modules[i]
 
-        sz_str = "-"
-        if mod_str == "Main" && kind == "variable"
+        sz_str = t.sizes[i] >= 0 ? Base.format_bytes(t.sizes[i]) : "-"
+        if sz_str == "-" && mod_str == "Main" && kind == "variable"
             sym = Symbol(name)
             if Base.invokelatest(isdefined, Main, sym)
                 try
@@ -168,7 +173,8 @@ function workspace(query::AbstractString = "")
             )
             _add_entry!(
                 filtered, t.names[i], t.kinds[i], t.types[i], t.values[i],
-                t.exprs[i], t.modules[i], Int(t.depths[i]), Int(t.parent_indices[i]), t.has_children[i]
+                t.exprs[i], t.modules[i], Int(t.depths[i]), Int(t.parent_indices[i]),
+                t.has_children[i], t.sizes[i]
             )
         end
     end
@@ -253,25 +259,89 @@ function _skip_name(s::String)::Bool
     return false
 end
 
+const _var_size_cache = Dict{UInt64, Tuple{Int, Int64}}()
+const _var_size_lock = ReentrantLock()
+
+function _fast_var_size(val)::Int64
+    T = typeof(val)
+    (T === Module || val isa Function || T === DataType || T === UnionAll) && return Int64(-1)
+    if isbitstype(T) || val isa String || val isa SubString{String} || val isa Symbol
+        return Int64(sizeof(val))
+    elseif (val isa Array || val isa BitArray) && isbitstype(eltype(val))
+        return Int64(sizeof(val))
+    end
+    oid = objectid(val)
+    stamp = if val isa AbstractDict || val isa AbstractArray || val isa Tuple
+        try
+            Int(length(val))
+        catch
+            0
+        end
+    elseif hasmethod(size, Tuple{T, Int})
+        try
+            Int(size(val, 1))
+        catch
+            0
+        end
+    else
+        Int(Base.get_world_counter() & 0x7fffffff)
+    end
+    return lock(_var_size_lock) do
+        cached = get(_var_size_cache, oid, nothing)
+        if !isnothing(cached) && cached[1] == stamp
+            return cached[2]
+        end
+        sz = try
+            Int64(Base.summarysize(val))
+        catch
+            Int64(-1)
+        end
+        length(_var_size_cache) >= 512 && empty!(_var_size_cache)
+        _var_size_cache[oid] = (stamp, sz)
+        return sz
+    end
+end
+
+function _value_has_children(val)::Bool
+    T = typeof(val)
+    (T === Module || val isa Function || T === DataType || T === UnionAll) && return false
+    if val isa AbstractDict
+        return !isempty(val)
+    elseif val isa AbstractArray
+        return !isempty(val)
+    elseif val isa Tuple || val isa NamedTuple
+        return !isempty(val)
+    elseif !isprimitivetype(T)
+        return fieldcount(T) > 0
+    end
+    return false
+end
+
 function _value_preview(val)::String
     (val isa Number || val isa Bool || val isa Symbol) && return string(val)
     if val isa AbstractString
         return length(val) > 60 ? repr(first(val, 57)) * "…" : repr(val)
     elseif val isa AbstractArray && length(val) > 64
         s = try
-            summary(val)
+            head_els = String[]
+            for (k, el) in enumerate(val)
+                k > 3 && break
+                push!(head_els, (el isa Number || el isa Bool || el isa Symbol) ? string(el) : repr(el))
+            end
+            sample_s = isempty(head_els) ? "" : " [" * join(head_els, ", ") * ", …]"
+            summary(val) * sample_s
         catch
             string(typeof(val))
         end
-        return length(s) > 60 ? first(s, 60) * "…" : s
+        return length(s) > 60 ? first(s, 59) * "…" : s
     elseif val isa AbstractDict && length(val) > 16
         s = "$(typeof(val)) ($(length(val)) entries)"
-        return length(s) > 60 ? first(s, 60) * "…" : s
+        return length(s) > 60 ? first(s, 59) * "…" : s
     end
     return try
         s = sprint((io, x) -> Base.invokelatest(show, io, x), val; context = IOContext(devnull, :limit => true, :compact => true))
         s = replace(s, '\n' => ' ')
-        length(s) > 60 ? first(s, 60) * "…" : s
+        length(s) > 60 ? first(s, 59) * "…" : s
     catch
         "<?>"
     end
@@ -286,8 +356,15 @@ function _collect_children_dod!(
         parent_idx::Int
     )
     depth > 5 && return
-    add_child!(name::String, type_str::String, val_preview::String, expr::String) =
-        _add_entry!(t, name, "variable", type_str, val_preview, expr, mod_name, depth, parent_idx, false)
+    function add_child!(name::String, type_str::String, child_val, val_preview::String, expr::String, allow_recurse::Bool = true)
+        kids = allow_recurse && depth < 5 && _value_has_children(child_val)
+        sz = _fast_var_size(child_val)
+        cidx = _add_entry!(t, name, "variable", type_str, val_preview, expr, mod_name, depth, parent_idx, kids, sz)
+        if kids && _is_path_expanded(mod_name * "/" * expr)
+            _collect_children_dod!(t, child_val, expr, mod_name, depth + 1, cidx)
+        end
+        return cidx
+    end
 
     T = typeof(val)
     return try
@@ -299,37 +376,38 @@ function _collect_children_dod!(
                 for cname in col_names[1:min(length(col_names), 20)]
                     c_str = string(cname)
                     c_col = val[!, Symbol(cname)]
-                    add_child!(":" * c_str, "$(typeof(c_col)) ($r_count rows)", _value_preview(c_col), "$parent_expr[!, :$c_str]")
+                    add_child!(":" * c_str, "$(typeof(c_col)) ($r_count rows)", c_col, _value_preview(c_col), "$parent_expr[!, :$c_str]")
                 end
             catch
             end
         elseif val isa AbstractDict
             for (count, (k, v)) in enumerate(val)
                 count > 20 && break
-                add_child!(string(k), string(typeof(v)), _value_preview(v), "$parent_expr[$(repr(k))]")
+                add_child!(string(k), string(typeof(v)), v, _value_preview(v), "$parent_expr[$(repr(k))]")
             end
         elseif val isa AbstractArray && ndims(val) == 1
             for i in 1:min(length(val), 20)
-                add_child!("[$i]", string(typeof(val[i])), _value_preview(val[i]), "$parent_expr[$i]")
+                add_child!("[$i]", string(typeof(val[i])), val[i], _value_preview(val[i]), "$parent_expr[$i]")
             end
         elseif val isa AbstractArray && ndims(val) == 2
             rows, cols = size(val)
             el_tp = string(eltype(val))
             for i in 1:min(rows, 5), j in 1:min(cols, 5)
-                add_child!("[$i, $j]", el_tp, _value_preview(val[i, j]), "$parent_expr[$i, $j]")
+                add_child!("[$i, $j]", el_tp, val[i, j], _value_preview(val[i, j]), "$parent_expr[$i, $j]", false)
             end
         elseif val isa AbstractArray && ndims(val) > 2
-            add_child!("[dimensions]", "Tuple", string(size(val)), "size($parent_expr)")
+            sz_t = size(val)
+            _add_entry!(t, "[dimensions]", "variable", "Tuple", string(sz_t), "size($parent_expr)", mod_name, depth, parent_idx, false, Int64(sizeof(sz_t)))
         elseif val isa NamedTuple
             for name in keys(val)
                 v = val[name]
                 n_str = string(name)
-                add_child!(n_str, string(typeof(v)), _value_preview(v), "$parent_expr.$n_str")
+                add_child!(n_str, string(typeof(v)), v, _value_preview(v), "$parent_expr.$n_str")
             end
         elseif val isa Tuple
             for (i, v) in enumerate(val)
                 i > 20 && break
-                add_child!("[$i]", string(typeof(v)), _value_preview(v), "$parent_expr[$i]")
+                add_child!("[$i]", string(typeof(v)), v, _value_preview(v), "$parent_expr[$i]")
             end
         elseif !isprimitivetype(T) && T !== Module && T !== Function && T !== DataType && T !== UnionAll
             for f in fieldnames(T)
@@ -339,7 +417,7 @@ function _collect_children_dod!(
                 catch
                     continue
                 end
-                add_child!(f_str, string(typeof(f_val)), _value_preview(f_val), "$parent_expr.$f_str")
+                add_child!(f_str, string(typeof(f_val)), f_val, _value_preview(f_val), "$parent_expr.$f_str")
             end
         end
     catch
@@ -410,16 +488,13 @@ function _collect_module_items_dod!(t::WorkspaceTable, mod::Module, mod_name::St
         end
 
         item_expr = (mod == Main) ? name : (mod_name * "." * name)
-        has_kids = (kind == "variable") && (
-            val isa AbstractDict ||
-                (val isa AbstractArray && !isempty(val)) ||
-                val isa Tuple ||
-                val isa NamedTuple ||
-                (!isprimitivetype(typeof(val)) && !(typeof(val) in (Module, Function, DataType, UnionAll)))
-        )
+        has_kids = (kind == "variable") && _value_has_children(val)
+        sz_bytes = (kind == "variable" && all) ? _fast_var_size(val) : Int64(-1)
 
-        entry_idx = _add_entry!(t, name, kind, type_str, value_str, item_expr, mod_name, 0, -1, has_kids)
-        has_kids && _collect_children_dod!(t, val, item_expr, mod_name, 1, entry_idx)
+        entry_idx = _add_entry!(t, name, kind, type_str, value_str, item_expr, mod_name, 0, -1, has_kids, sz_bytes)
+        if has_kids && _is_path_expanded(mod_name * "/" * item_expr)
+            _collect_children_dod!(t, val, item_expr, mod_name, 1, entry_idx)
+        end
     end
     return nothing
 end
@@ -666,4 +741,289 @@ function save_clean_session()
     println(" File: $filepath")
     println(" " * "✓"^60)
     return nothing
+end
+
+function _get_revise_status()::String
+    for mod in _snapshot_loaded_modules()
+        if nameof(mod) === :Revise
+            return try
+                has_err = isdefined(mod, :queue_errors) && !isempty(Base.invokelatest(getfield, mod, :queue_errors))
+                has_err && return "error"
+                has_pend = isdefined(mod, :revision_queue) && !isempty(Base.invokelatest(getfield, mod, :revision_queue))
+                has_pend ? "pending" : "ok"
+            catch
+                "ok"
+            end
+        end
+    end
+    return ""
+end
+
+function _resolve_module_by_name(mod_str::AbstractString)::Module
+    mod_str == "Main" && return Main
+    sym = Symbol(mod_str)
+    if Base.invokelatest(isdefined, Main, sym)
+        m = try
+            Base.invokelatest(getfield, Main, sym)
+        catch
+            nothing
+        end
+        m isa Module && return m
+    end
+    for m in _snapshot_loaded_modules()
+        string(m) == mod_str && return m
+    end
+    return Main
+end
+
+function _cell_preview(x, max_len::Int = 36)::String
+    (x isa Number || x isa Bool || x isa Symbol) && return _truncate_chars(string(x), max_len)
+    isnothing(x) && return "nothing"
+    x === missing && return "missing"
+    if x isa AbstractString
+        r = repr(x)
+        return _truncate_chars(r, max_len)
+    end
+    return try
+        s = sprint((io, v) -> Base.invokelatest(show, io, v), x; context = IOContext(devnull, :limit => true, :compact => true))
+        _truncate_chars(replace(s, '\n' => ' '), max_len)
+    catch
+        "<?>"
+    end
+end
+
+function _compute_inspector_json(
+        mod_str::AbstractString,
+        expr_str::AbstractString,
+        row_start::Int = 1,
+        col_start::Int = 1,
+        max_rows::Int = 30,
+        max_cols::Int = 8
+    )::String
+    mod = _resolve_module_by_name(mod_str)
+    val = try
+        Base.invokelatest(Core.eval, mod, Meta.parse(expr_str))
+    catch e
+        buf = IOBuffer()
+        write(buf, "{\"ok\":false,\"expr\":")
+        _write_json_str(buf, String(expr_str))
+        write(buf, ",\"mod\":")
+        _write_json_str(buf, String(mod_str))
+        write(buf, ",\"error\":")
+        _write_json_str(buf, _truncate_chars(sprint(showerror, e), 240))
+        write(buf, "}")
+        return String(take!(buf))
+    end
+
+    T = typeof(val)
+    type_str = string(T)
+    sz_bytes = _fast_var_size(val)
+    kind = "scalar"
+    dims_str = ""
+    total_rows = 0
+    total_cols = 0
+    r1 = max(1, row_start)
+    c1 = max(1, col_start)
+    headers = String[]
+    grid_rows = Vector{String}[]
+    body_text = ""
+
+    is_df = occursin("DataFrame", type_str) || (hasmethod(names, Tuple{T}) && hasmethod(size, Tuple{T, Int}) && !(val isa AbstractArray))
+    if is_df
+        try
+            cnames = collect(names(val))
+            total_rows = Int(size(val, 1))
+            total_cols = length(cnames)
+            dims_str = "$(total_rows)×$(total_cols)"
+            kind = "table"
+            r1 = total_rows > 0 ? clamp(r1, 1, total_rows) : 1
+            c1 = total_cols > 0 ? clamp(c1, 1, total_cols) : 1
+            r2 = min(total_rows, r1 + max(1, max_rows) - 1)
+            c2 = min(total_cols, c1 + max(1, max_cols) - 1)
+            push!(headers, "ROW")
+            cols_slice = Any[]
+            for c in c1:c2
+                cn = cnames[c]
+                col_vec = val[!, Symbol(cn)]
+                push!(cols_slice, col_vec)
+                push!(headers, "$(cn) :: $(eltype(col_vec))")
+            end
+            for r in r1:r2
+                row_cells = String[string(r)]
+                for col_vec in cols_slice
+                    cell_v = try
+                        col_vec[r]
+                    catch
+                        "<?>"
+                    end
+                    push!(row_cells, _cell_preview(cell_v, 28))
+                end
+                push!(grid_rows, row_cells)
+            end
+        catch
+            kind = "scalar"
+        end
+    elseif val isa AbstractArray && ndims(val) == 2
+        total_rows, total_cols = size(val)
+        dims_str = "$(total_rows)×$(total_cols)"
+        kind = "matrix"
+        r1 = total_rows > 0 ? clamp(r1, 1, total_rows) : 1
+        c1 = total_cols > 0 ? clamp(c1, 1, total_cols) : 1
+        r2 = min(total_rows, r1 + max(1, max_rows) - 1)
+        c2 = min(total_cols, c1 + max(1, max_cols) - 1)
+        push!(headers, "ROW \\ COL")
+        for c in c1:c2
+            push!(headers, "[:, $c]")
+        end
+        for r in r1:r2
+            row_cells = String["[$r, :]"]
+            for c in c1:c2
+                cell_v = try
+                    val[r, c]
+                catch
+                    "<?>"
+                end
+                push!(row_cells, _cell_preview(cell_v, 24))
+            end
+            push!(grid_rows, row_cells)
+        end
+    elseif (val isa AbstractArray && ndims(val) == 1) || val isa Tuple || val isa AbstractSet
+        items_vec = val isa AbstractSet ? collect(val) : val
+        total_rows = length(items_vec)
+        total_cols = 1
+        dims_str = "$(total_rows) items"
+        kind = "vector"
+        r1 = total_rows > 0 ? clamp(r1, 1, total_rows) : 1
+        c1 = 1
+        r2 = min(total_rows, r1 + max(1, max_rows) - 1)
+        append!(headers, ("INDEX", "TYPE", "VALUE"))
+        for r in r1:r2
+            el = try
+                items_vec[r]
+            catch
+                "<?>"
+            end
+            push!(grid_rows, String["[$r]", string(typeof(el)), _cell_preview(el, 56)])
+        end
+    elseif val isa AbstractArray && ndims(val) > 2
+        total_rows = length(val)
+        total_cols = 1
+        dims_str = join(size(val), "×")
+        kind = "vector"
+        r1 = total_rows > 0 ? clamp(r1, 1, total_rows) : 1
+        c1 = 1
+        r2 = min(total_rows, r1 + max(1, max_rows) - 1)
+        append!(headers, ("INDEX", "TYPE", "VALUE"))
+        cis = CartesianIndices(val)
+        for r in r1:r2
+            ci = cis[r]
+            el = try
+                val[ci]
+            catch
+                "<?>"
+            end
+            idx_s = "[" * join(Tuple(ci), ", ") * "]"
+            push!(grid_rows, String[idx_s, string(typeof(el)), _cell_preview(el, 52)])
+        end
+    elseif val isa AbstractDict
+        total_rows = length(val)
+        total_cols = 1
+        dims_str = "$(total_rows) entries"
+        kind = "dict"
+        r1 = total_rows > 0 ? clamp(r1, 1, total_rows) : 1
+        c1 = 1
+        append!(headers, ("KEY", "TYPE", "VALUE"))
+        for (idx, (k, v)) in enumerate(val)
+            idx < r1 && continue
+            idx >= r1 + max(1, max_rows) && break
+            push!(grid_rows, String[_cell_preview(k, 28), string(typeof(v)), _cell_preview(v, 48)])
+        end
+    elseif val isa NamedTuple || (!isprimitivetype(T) && T !== Module && !(val isa Function) && T !== DataType && T !== UnionAll && fieldcount(T) > 0)
+        fnames = val isa NamedTuple ? collect(keys(val)) : collect(fieldnames(T))
+        total_rows = length(fnames)
+        total_cols = 1
+        dims_str = "$(total_rows) fields"
+        kind = "struct"
+        r1 = total_rows > 0 ? clamp(r1, 1, total_rows) : 1
+        c1 = 1
+        r2 = min(total_rows, r1 + max(1, max_rows) - 1)
+        append!(headers, ("FIELD", "TYPE", "VALUE"))
+        for r in r1:r2
+            f = fnames[r]
+            fv = try
+                val isa NamedTuple ? val[f] : getfield(val, f)
+            catch
+                "<undef>"
+            end
+            push!(grid_rows, String[string(f), string(typeof(fv)), _cell_preview(fv, 52)])
+        end
+    else
+        kind = (val isa Function || T === DataType || T === UnionAll) ? "callable" : "scalar"
+        io_b = IOBuffer()
+        if val isa Function
+            try
+                ms = collect(Base.invokelatest(methods, val))
+                println(io_b, "Methods ($(length(ms))):")
+                for (mi, m) in enumerate(ms)
+                    mi > 25 && (println(io_b, "  ... ($(length(ms) - 25) more)"); break)
+                    println(io_b, "  [$mi] ", m)
+                end
+            catch
+            end
+        else
+            try
+                Base.invokelatest(show, IOContext(io_b, :limit => true), MIME("text/plain"), val)
+            catch
+                print(io_b, _cell_preview(val, 200))
+            end
+        end
+        base_m = match(r"^[a-zA-Z_][a-zA-Z0-9_!]*", expr_str)
+        if !isnothing(base_m)
+            try
+                doc = Base.invokelatest(Base.Docs.doc, Base.Docs.Binding(mod, Symbol(base_m.match)))
+                ds = _strip_ansi_codes(sprint(io -> Base.invokelatest(show, IOContext(io, :color => false), MIME("text/plain"), doc)))
+                if !occursin("No documentation found", ds)
+                    println(io_b, "\nDocumentation:\n", strip(ds))
+                end
+            catch
+            end
+        end
+        body_text = _truncate_chars(String(take!(io_b)), 3500)
+    end
+
+    return lock(_serialize_lock) do
+        buf = IOBuffer()
+        dst_buf = _json_dst_buf
+        write(buf, "{\"ok\":true,\"expr\":")
+        _write_json_str(buf, String(expr_str), dst_buf)
+        write(buf, ",\"mod\":")
+        _write_json_str(buf, String(mod_str), dst_buf)
+        write(buf, ",\"kind\":")
+        _write_json_str(buf, kind, dst_buf)
+        write(buf, ",\"type\":")
+        _write_json_str(buf, type_str, dst_buf)
+        write(buf, ",\"dims\":")
+        _write_json_str(buf, dims_str, dst_buf)
+        write(buf, ",\"size_bytes\":")
+        print(buf, sz_bytes)
+        write(buf, ",\"row\":")
+        print(buf, r1)
+        write(buf, ",\"col\":")
+        print(buf, c1)
+        write(buf, ",\"total_rows\":")
+        print(buf, total_rows)
+        write(buf, ",\"total_cols\":")
+        print(buf, total_cols)
+        write(buf, ",\"headers\":")
+        _write_json_str_col(buf, headers, dst_buf)
+        write(buf, ",\"rows\":[")
+        for (ri, rvec) in enumerate(grid_rows)
+            ri > 1 && write(buf, ',')
+            _write_json_str_col(buf, rvec, dst_buf)
+        end
+        write(buf, "],\"text\":")
+        _write_json_str(buf, body_text, dst_buf)
+        write(buf, "}")
+        String(take!(buf))
+    end
 end

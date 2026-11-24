@@ -24,7 +24,13 @@ function _ensure_session!()
 end
 
 function _advertise_session!()
-    # Write last so a discovering client cannot see a partially initialized session.
+    # Write metadata and project last so discovering clients see a fully initialized session.
+    meta_path = joinpath(_session_dir[], "meta")
+    open(meta_path * ".tmp", "w"; lock = false) do io
+        write(io, "pid=", string(getpid()), "\nstarted=", Dates.format(Dates.now(), "HH:MM:SS"), "\n")
+    end
+    mv(meta_path * ".tmp", meta_path; force = true)
+
     path = joinpath(_session_dir[], "project")
     open(path * ".tmp", "w"; lock = false) do io
         write(io, realpath(_get_project_dir()))
@@ -36,11 +42,24 @@ end
 function _cleanup_session!()
     dir = _session_dir[]
     isempty(dir) && return nothing
-    # Remove only files we own, never recursively remove an arbitrary directory.
-    for name in ("project", "project.tmp", "state.json", "state.json.tmp", "repl.sock")
+    # Remove only files/subdirs we own, never recursively remove an arbitrary root directory.
+    plots_dir = joinpath(dir, "plots")
+    if isdir(plots_dir) && !islink(plots_dir)
+        for f in readdir(plots_dir)
+            endswith(f, ".png") && rm(joinpath(plots_dir, f); force = true)
+        end
+        try
+            rm(plots_dir)
+        catch
+        end
+    end
+    for name in ("project", "project.tmp", "meta", "meta.tmp", "state.json", "state.json.tmp", "repl.sock")
         rm(joinpath(dir, name); force = true)
     end
-    rm(dir)
+    try
+        rm(dir)
+    catch
+    end
     _session_dir[] = ""
     return nothing
 end

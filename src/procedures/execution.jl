@@ -135,6 +135,25 @@ function _format_raw_args_str(args, kwargs; max_len::Int = 200)::String
     end
 end
 
+function _reproducible_result_repr(val; max_len::Int = 140)::String
+    return try
+        rep = Base.invokelatest(repr, val)
+        (isempty(rep) || length(rep) > max_len || occursin('\n', rep)) && return ""
+        ex = Meta.parse(rep; raise = false)
+        _is_literal_expr(ex) ? rep : ""
+    catch
+        ""
+    end
+end
+
+function _format_delta_str(p::ProcedureInfo)::String
+    (p.prev_time_ms <= 0.0 || p.last_run_time_ms <= 0.0 || p.last_run_status != :ok) && return ""
+    pct = round(((p.last_run_time_ms - p.prev_time_ms) / p.prev_time_ms) * 100.0; digits = 1)
+    sign_s = pct > 0 ? "+" : ""
+    vs_lbl = p.prev_generation > 0 && p.prev_generation != p.generation ? " vs v$(p.prev_generation)" : " vs prev"
+    return "$(sign_s)$(pct)%$(vs_lbl)"
+end
+
 function run_procedure(name::Union{Symbol, AbstractString}, args...; kwargs...)
     sym = Symbol(name)
     _load_procedures!()
@@ -254,7 +273,15 @@ function run_procedure(name::Union{Symbol, AbstractString}, args...; kwargs...)
     end
 
     p = _procedures[sym]
+    if !is_err && p.last_run_status == :ok && p.last_run_time_ms > 0.0 && p.prev_generation == 0
+        p.prev_time_ms = p.last_run_time_ms
+        p.prev_alloc_bytes = p.last_run_alloc_bytes
+        p.prev_generation = p.generation
+    end
     p.last_run_time_ms = time_ms
+    p.min_time_ms = time_ms
+    p.max_time_ms = time_ms
+    p.bench_samples = 1
     p.last_run_alloc_bytes = alloc_bytes
     p.last_run_status = status_sym
     p.last_run_at = now_str
@@ -262,6 +289,10 @@ function run_procedure(name::Union{Symbol, AbstractString}, args...; kwargs...)
     raw_args = _format_raw_args_str(args, kwargs)
     if !isempty(args) || !isempty(kwargs) || !is_err
         p.last_args_str = raw_args
+    end
+    if !is_err
+        p.last_result_repr = _reproducible_result_repr(val)
+        _maybe_capture_plot!(val, call_str)
     end
     _remember_cmd_outcome!(call_str, status_sym)
 
@@ -351,7 +382,13 @@ function list_procedures(query::AbstractString = "")
             else
                 " " * green * "[●]" * reset
             end
-            time_str = p.last_run_status != :never ? " $(yellow)($(p.last_run_time_ms)ms, $(Base.format_bytes(p.last_run_alloc_bytes)))$(reset)" : ""
+            time_str = if p.last_run_status != :never
+                d_str = _format_delta_str(p)
+                d_part = isempty(d_str) ? "" : " [$(d_str)]"
+                " $(yellow)($(p.last_run_time_ms)ms, $(Base.format_bytes(p.last_run_alloc_bytes)))$(d_part)$(reset)"
+            else
+                ""
+            end
             println("│ $status_icon " * cyan * bold * string(p.name) * reset * origin_tag * " → " * p.signature * time_str)
             if p.last_run_status == :error && !isempty(p.last_error)
                 loc = p.last_error_line > 0 ? " [L$(p.last_error_line)]" : ""
@@ -373,5 +410,122 @@ function list_procedures(query::AbstractString = "")
         println(bold * red * "└" * ("─"^52) * reset)
     end
     return nothing
+end
+
+"""
+    benchmark_procedure(name, args...; samples = 7, max_seconds = 2.5, kwargs...)
+
+Warm up and benchmark procedure `name` across multiple samples without external
+dependencies, recording median/min/max runtime, allocations, and generation deltas.
+"""
+function benchmark_procedure(
+        name::Union{Symbol, AbstractString},
+        args...;
+        samples::Int = 7,
+        max_seconds::Real = 2.5,
+        kwargs...
+    )
+    sym = Symbol(name)
+    samples = clamp(samples, 2, 200)
+    # Warmup (also handles lazy disk loading, error capture, and baseline snapshot)
+    first_val = run_procedure(sym, args...; kwargs...)
+    p = _procedures[sym]
+
+    func = Base.invokelatest(getfield, Main, sym)
+    timings = Float64[]
+    allocs = Int[]
+    t_budget_end = time() + Float64(max_seconds)
+
+    for s_idx in 1:samples
+        GC.gc(false)
+        t_res = @timed Base.invokelatest(func, args...; kwargs...)
+        push!(timings, round(t_res.time * 1000.0; digits = 3))
+        push!(allocs, Int(t_res.bytes))
+        s_idx >= 2 && time() >= t_budget_end && break
+    end
+
+    sort!(timings)
+    sort!(allocs)
+    mid = cld(length(timings), 2)
+    med_ms = round(timings[mid]; digits = 2)
+    min_ms = round(first(timings); digits = 2)
+    max_ms = round(last(timings); digits = 2)
+    med_alloc = allocs[mid]
+
+    p.last_run_time_ms = med_ms
+    p.min_time_ms = min_ms
+    p.max_time_ms = max_ms
+    p.last_run_alloc_bytes = med_alloc
+    p.bench_samples = length(timings)
+    p.last_run_at = Dates.format(Dates.now(), "HH:MM:SS")
+    publish_state()
+
+    delta_s = _format_delta_str(p)
+    delta_badge = isempty(delta_s) ? "" : "  [$(delta_s)]"
+    println(
+        "\e[36m\e[1m⏱ Benchmark '$sym' ($(length(timings)) samples):\e[0m " *
+            "median \e[33m\e[1m$(med_ms)ms\e[0m (min $(min_ms)ms, max $(max_ms)ms) · " *
+            "$(Base.format_bytes(med_alloc))$(delta_badge)"
+    )
+    return first_val
+end
+
+"""
+    generate_procedure_test(name; file = "") -> Union{String, Nothing}
+
+Generate a reproducible `@testset` file for procedure `name` under `test/procedures/`
+using its latest arguments and literal return value (if available).
+"""
+function generate_procedure_test(name::Union{Symbol, AbstractString}; file::AbstractString = "")
+    sym = Symbol(strip(string(name)))
+    _load_procedures!()
+    p = get(_procedures, sym, nothing)
+    if isnothing(p)
+        p = _ensure_live_proc_for_symbol(sym)
+    end
+    if isnothing(p)
+        println("\e[31m✗ Procedure ':$sym' not found.\e[0m")
+        return nothing
+    end
+
+    proj_dir = _get_project_dir()
+    if isempty(p.file)
+        save_procedure(sym)
+        p = _procedures[sym]
+    end
+
+    target_path = if !isempty(strip(file))
+        isabspath(file) ? String(file) : joinpath(proj_dir, String(file))
+    else
+        joinpath(proj_dir, "test", "procedures", "test_$(sym).jl")
+    end
+    mkpath(dirname(target_path))
+
+    rel_proc_from_test = relpath(joinpath(proj_dir, p.file), dirname(target_path))
+    call_expr = isempty(strip(p.last_args_str)) ? "$(sym)()" : "$(sym)($(p.last_args_str))"
+    assertion_line = if !isempty(p.last_result_repr)
+        "    @test $(call_expr) == $(p.last_result_repr)"
+    else
+        "    res = $(call_expr)\n    @test res !== nothing || res === nothing"
+    end
+
+    ts = Dates.format(Dates.now(), "yyyy-mm-dd HH:MM:SS")
+    test_code = """
+    # Generated by jEMach on $ts
+    using Test
+
+    if !isdefined(@__MODULE__, $(QuoteNode(sym)))
+        include($(repr(rel_proc_from_test)))
+    end
+
+    @testset $(repr(string(sym))) begin
+    $assertion_line
+    end
+    """
+
+    write(target_path, test_code)
+    rel_out = relpath(target_path, proj_dir)
+    println("\e[32m\e[1m✓\e[0m Generated @testset for \e[36m$(sym)\e[0m in \e[32m$(rel_out)\e[0m")
+    return rel_out
 end
 

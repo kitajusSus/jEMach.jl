@@ -2,7 +2,8 @@
 
 const _JEMACH_COMMANDS = [
     "help", "ui", "toggle", "open", "close", "clear", "ws", "vars", "ls", "find", "show",
-    "run", "edit", "make", "rec", "stop", "inspect", "errors", "save", "reload", "status", "shutdown", "rss_chemia",
+    "run", "bench", "testgen", "edit", "make", "rec", "stop", "inspect", "errors", "save",
+    "reload", "status", "shutdown",
 ]
 
 function _print_jemach_help(io::IO = stdout)

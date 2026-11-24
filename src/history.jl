@@ -319,9 +319,9 @@ function _append_history_file(code::AbstractString)
     !isdir(dirname(hist_path)) && return
     _invalidate_hist_cache!()
     return try
-        ts = Dates.format(Dates.now(), "yyyy-mm-dd HH:MM:SS")
+        ts = Dates.format(Dates.now(Dates.UTC), "yyyy-mm-dd HH:MM:SS")
         open(hist_path, "a") do f
-            write(f, "# time: $(ts) CET\n# mode: julia\n")
+            write(f, "# time: $(ts) UTC\n# mode: julia\n")
             for line in split(code, '\n')
                 write(f, "\t", line, "\n")
             end
