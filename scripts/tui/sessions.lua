@@ -81,7 +81,22 @@ function M.discover(project)
 			f:close()
 			local socket = dir .. "/repl.sock"
 			if owner_project == project and M.alive(socket) then
-				matches[#matches + 1] = { socket = socket, state = dir .. "/state.json" }
+				local pid, started = "", ""
+				local mf = io.open(dir .. "/meta", "r")
+				if mf then
+					local mtxt = mf:read("*a") or ""
+					mf:close()
+					pid = mtxt:match("pid=(%d+)") or ""
+					started = mtxt:match("started=([^\r\n]+)") or ""
+				end
+				local name = dir:match("([^/]+)$") or dir
+				matches[#matches + 1] = {
+					socket = socket,
+					state = dir .. "/state.json",
+					pid = pid,
+					started = started,
+					name = name,
+				}
 			end
 		end
 	end

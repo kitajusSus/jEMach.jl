@@ -417,6 +417,9 @@ end
         @test scan_z.func_line == scan_j.func_line
         @test scan_z.edit_code == scan_j.edit_code
         @test scan_z.imports_block == "using Statistics"
+        if jEMach._zig_proc_scan_ptr[] != C_NULL
+            @test scan_z.content_hash == scan_j.content_hash
+        end
 
         # 2. Disk creation initializes :disk origin, clean edit_code & last_args tracking
         redirect_stdout(devnull) do
@@ -586,6 +589,162 @@ end
         jEMach._load_procedures!()
         jEMach.stop()
         rm(jEMach.STATE_FILE[]; force = true)
+    end
+end
+
+@testset "Lazy Tree, Slice Inspector, Plots, Benchmarks & Testgen" begin
+    mktempdir() do tmp_dir
+        gen_test_file = joinpath(tmp_dir, "test_bench_demo.jl")
+        proc_dir = joinpath(jEMach._get_project_dir(), "procedures")
+        proc_dir_existed = isdir(proc_dir)
+        bench_proc_file = joinpath(proc_dir, "test_bench_demo_proc.jl")
+        exported_plot_rel = ""
+        try
+            jEMach.start(split = false, quiet = true)
+
+            # 1. Session meta file contains pid & started timestamp
+            sess_meta = joinpath(dirname(jEMach.SOCKET_PATH[]), "meta")
+            @test isfile(sess_meta)
+            meta_txt = read(sess_meta, String)
+            @test occursin("pid=$(getpid())", meta_txt)
+            @test occursin("started=", meta_txt)
+
+            # 2. Sizes column + lazy child tree expansion
+            Core.eval(Main, :(lazy_test_vec = collect(1:25)))
+            Core.eval(Main, :(lazy_test_mat = reshape(collect(1.0:16.0), 4, 4)))
+            jEMach._set_expanded_paths!("")
+            t_collapsed = Base.invokelatest(jEMach._collect_state_dod!, jEMach.WorkspaceTable())
+            vec_idx = findfirst(==("lazy_test_vec"), t_collapsed.names)
+            @test vec_idx !== nothing
+            @test t_collapsed.sizes[vec_idx] == sizeof(Int) * 25
+            @test t_collapsed.has_children[vec_idx] == true
+            @test !any(e -> startswith(e, "lazy_test_vec["), t_collapsed.exprs)
+
+            jEMach._set_expanded_paths!("Main/lazy_test_vec")
+            t_expanded = Base.invokelatest(jEMach._collect_state_dod!, jEMach.WorkspaceTable())
+            @test any(e -> e == "lazy_test_vec[1]", t_expanded.exprs)
+            jEMach._reset_client_view_state!()
+
+            # 3. 2D Slice Inspector JSON (no numeric diagnostic stats / sparklines)
+            insp_mat = Base.invokelatest(jEMach._compute_inspector_json, "Main", "lazy_test_mat", 2, 2, 2, 2)
+            @test occursin("\"ok\":true", insp_mat)
+            @test occursin("\"kind\":\"matrix\"", insp_mat)
+            @test occursin("\"dims\":\"4×4\"", insp_mat)
+            @test occursin("[:, 2]", insp_mat)
+            @test occursin("[2, :]", insp_mat)
+
+            # 4. PNG Plot auto-capture, IHDR dimension parsing & export
+            Core.eval(
+                Main,
+                quote
+                    struct DummyPNGPlot
+                        label::String
+                    end
+                    function Base.show(io::IO, ::MIME"image/png", ::DummyPNGPlot)
+                        # Minimal valid 16x12 PNG header + IEND
+                        hdr = UInt8[
+                            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+                            0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+                            0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x0c,
+                            0x08, 0x02, 0x00, 0x00, 0x00,
+                        ]
+                        write(io, hdr)
+                    end
+                end,
+            )
+            p_obj = Base.invokelatest(Core.eval, Main, :(DummyPNGPlot("sin(x)")))
+            entry = jEMach.capture_plot(p_obj; title = "plot(x, sin.(x))")
+            @test entry !== nothing
+            @test entry.width == 16
+            @test entry.height == 12
+            @test isfile(entry.filepath)
+            exported_plot_rel = redirect_stdout(devnull) do
+                jEMach._export_plot(entry.id, "unit_test_plot.png")
+            end
+            @test !isempty(exported_plot_rel)
+            @test isfile(joinpath(jEMach._get_project_dir(), exported_plot_rel))
+
+            # 5. Multi-sample benchmark, v1 -> v2 delta tracking & @testset generation
+            redirect_stdout(devnull) do
+                jEMach.make_procedure(
+                    :test_bench_demo_proc;
+                    commands = ["k = 6", "res = k * 7"],
+                    save = true,
+                )
+            end
+            bval = redirect_stdout(devnull) do
+                jEMach.benchmark_procedure(:test_bench_demo_proc, 6; samples = 4)
+            end
+            @test bval == 42
+            pb = jEMach._procedures[:test_bench_demo_proc]
+            @test pb.bench_samples == 4
+            @test pb.last_result_repr == "42"
+
+            # Modify in memory -> v2 preserves baseline from v1
+            jEMach._repl_eval("test_bench_demo_proc(k = 6) = k * 7 + 1"; silent = true)
+            @test pb.origin == :modified
+            @test pb.prev_generation == 1
+            bval2 = redirect_stdout(devnull) do
+                jEMach.run_procedure(:test_bench_demo_proc, 6)
+            end
+            @test bval2 == 43
+            @test pb.last_result_repr == "43"
+
+            # Generate @testset file and verify the generated test runs cleanly
+            redirect_stdout(devnull) do
+                jEMach.save_procedure(:test_bench_demo_proc)
+                jEMach.generate_procedure_test(:test_bench_demo_proc; file = gen_test_file)
+            end
+            @test isfile(gen_test_file)
+            gen_src = read(gen_test_file, String)
+            @test occursin("@testset \"test_bench_demo_proc\"", gen_src)
+            @test occursin("== 43", gen_src)
+            include(gen_test_file)
+
+            # 6. Live BUSY event frame over UNIX socket
+            sock = Sockets.connect(jEMach.SOCKET_PATH[])
+            frames = Channel{String}(16)
+            @async begin
+                try
+                    while isopen(sock) && !eof(sock)
+                        ln = readline(sock)
+                        !isempty(ln) && put!(frames, ln)
+                    end
+                catch
+                end
+            end
+            write(sock, "SUB\n")
+            flush(sock)
+            @test timedwait(() -> isready(frames), 2.0) == :ok
+            _ = take!(frames) # initial snapshot
+            jEMach._set_repl_busy!(true, "sleep(1)")
+            jEMach._set_repl_busy!(false, "sleep(1)"; ok = true)
+            busy_msgs = String[]
+            deadline = time() + 2.0
+            while time() < deadline && length(busy_msgs) < 2
+                while isready(frames)
+                    f = take!(frames)
+                    occursin("\"event\":\"busy\"", f) && push!(busy_msgs, f)
+                end
+                sleep(0.02)
+            end
+            close(sock)
+            @test any(m -> occursin("\"busy\":true", m), busy_msgs)
+            @test any(m -> occursin("\"busy\":false", m), busy_msgs)
+        finally
+            if !isempty(exported_plot_rel)
+                full_exp = joinpath(jEMach._get_project_dir(), exported_plot_rel)
+                rm(full_exp; force = true)
+                plots_out_dir = dirname(full_exp)
+                isdir(plots_out_dir) && isempty(readdir(plots_out_dir)) && rm(plots_out_dir; force = true)
+            end
+            rm(bench_proc_file; force = true)
+            delete!(jEMach._procedures, :test_bench_demo_proc)
+            if !proc_dir_existed && isdir(proc_dir) && isempty(readdir(proc_dir))
+                rm(proc_dir; force = true)
+            end
+            jEMach.stop(quiet = true)
+        end
     end
 end
 

@@ -141,6 +141,12 @@ function M.build(ctx, q)
 				last_args = p.last_args or "",
 				time_ms = p.time_ms or 0.0,
 				alloc_bytes = p.alloc_bytes or 0,
+				prev_time_ms = tonumber(p.prev_time_ms) or 0.0,
+				prev_alloc_bytes = tonumber(p.prev_alloc_bytes) or 0,
+				prev_gen = tonumber(p.prev_gen) or 0,
+				bench_samples = tonumber(p.bench_samples) or 0,
+				min_time_ms = tonumber(p.min_time_ms) or 0.0,
+				max_time_ms = tonumber(p.max_time_ms) or 0.0,
 				status = p.status or "never",
 				last_run = p.last_run or "-",
 				last_run_cmd = pcmd,
@@ -195,6 +201,11 @@ function M.render_split(ctx)
 
 			local avail = math.max(10, term_cols - 3)
 			local metrics
+			local delta_tag = ""
+			if dr.status == "ok" and (dr.prev_time_ms or 0) > 0 and (dr.time_ms or 0) > 0 then
+				local pct = ((dr.time_ms - dr.prev_time_ms) / dr.prev_time_ms) * 100.0
+				delta_tag = string.format(" %s%.0f%%", pct > 0 and "+" or "", pct)
+			end
 			if dr.status == "error" then
 				local err_short = (dr.last_error or "Error"):gsub("%s+", " ")
 				local ltag = (dr.last_error_line and dr.last_error_line > 0)
@@ -206,24 +217,25 @@ function M.render_split(ctx)
 			elseif dr.origin == "modified" then
 				if dr.status ~= "never" then
 					metrics = string.format(
-						"⚡v%d  %.1fms %s",
+						"⚡v%d  %.1fms %s%s",
 						dr.generation or 1,
 						dr.time_ms,
-						fmt_bytes(dr.alloc_bytes)
+						fmt_bytes(dr.alloc_bytes),
+						delta_tag
 					)
 				else
 					metrics = string.format("⚡v%d  in memory", dr.generation or 1)
 				end
 			elseif dr.origin == "live" then
 				if dr.status ~= "never" then
-					metrics = string.format("◆ live  %.1fms %s", dr.time_ms, fmt_bytes(dr.alloc_bytes))
+					metrics = string.format("◆ live  %.1fms %s%s", dr.time_ms, fmt_bytes(dr.alloc_bytes), delta_tag)
 				else
 					metrics = "◆ live (memory)"
 				end
 			elseif dr.origin == "unloaded" then
 				metrics = "○ on disk"
 			elseif dr.status ~= "never" then
-				metrics = string.format("%.1fms %s %s", dr.time_ms, fmt_bytes(dr.alloc_bytes), dr.last_run)
+				metrics = string.format("%.1fms %s%s %s", dr.time_ms, fmt_bytes(dr.alloc_bytes), delta_tag, dr.last_run)
 			else
 				metrics = "never run"
 			end

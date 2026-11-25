@@ -315,6 +315,11 @@ function stop(; quiet::Bool = false)
         _watcher_epoch[] += 1
         _last_serialized_body[] = ""
         _last_serialized_json[] = ""
+        _reset_client_view_state!()
+        lock(_plots_lock) do
+            empty!(_plots)
+            _last_plot_oid[] = UInt64(0)
+        end
         _stop_socket_server()
         _close_tui_pane()
         _cleanup_session!()

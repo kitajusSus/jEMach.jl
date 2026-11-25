@@ -17,6 +17,8 @@ function _print_jemach_help(io::IO = stdout)
         ("edit <name>", "Load clean function into `julia>` REPL editor"),
         ("errors", "Show recent failed commands and errored procedures"),
         ("run <name>(args...)", "Run a procedure with profiling (args space- or comma-sep)"),
+        ("bench <name>(args...)", "Multi-sample benchmark with min/median/max & generation delta"),
+        ("testgen <name>", "Generate a @testset regression file under test/procedures/"),
         ("<name>(args...)", "Shortcut: run an existing procedure directly"),
         ("make <name> [N]", "Create a procedure from the last N commands (default 5)"),
         ("rec [name] | stop", "Start / stop recording a procedure (also Alt+r)"),
@@ -83,8 +85,8 @@ function _split_call_args(args)
     return params, positional
 end
 
-function _run_expr(target)
-    rp = GlobalRef(jEMach, :run_procedure)
+function _call_proc_helper_expr(helper_sym::Symbol, target)
+    rp = GlobalRef(jEMach, helper_sym)
     if target isa Symbol
         return Expr(:call, rp, QuoteNode(target))
     elseif target isa Expr && target.head == :call && target.args[1] isa Symbol
@@ -98,7 +100,10 @@ function _run_expr(target)
     throw(ArgumentError("expected a procedure name or call, got: $(target)"))
 end
 
-function _run_from_string(rest::AbstractString)
+_run_expr(target) = _call_proc_helper_expr(:run_procedure, target)
+_bench_expr(target) = _call_proc_helper_expr(:benchmark_procedure, target)
+
+function _invoke_proc_from_string(helper_sym::Symbol, verb::String, rest::AbstractString)
     s = replace(strip(rest), r"^([A-Za-z_][A-Za-z0-9_!]*)\s+\(" => s"\1(")
     target = try
         Meta.parse(s)
@@ -107,13 +112,16 @@ function _run_from_string(rest::AbstractString)
     end
     if !(target isa Symbol || (target isa Expr && target.head == :call && target.args[1] isa Symbol))
         m = match(r"^([A-Za-z_][A-Za-z0-9_!]*)\s+(.*)$"s, s)
-        isnothing(m) && throw(ArgumentError("usage: run <name> [args...]  or  run name(args...)"))
+        isnothing(m) && throw(ArgumentError("usage: $verb <name> [args...]  or  $verb name(args...)"))
         argstr = strip(m.captures[2])
         occursin(',', argstr) || (argstr = join(split(argstr), ", "))
         target = Meta.parse(m.captures[1] * "(" * argstr * ")")
     end
-    return Base.invokelatest(Core.eval, Main, _run_expr(target))
+    return Base.invokelatest(Core.eval, Main, _call_proc_helper_expr(helper_sym, target))
 end
+
+_run_from_string(rest::AbstractString) = _invoke_proc_from_string(:run_procedure, "run", rest)
+_bench_from_string(rest::AbstractString) = _invoke_proc_from_string(:benchmark_procedure, "bench", rest)
 
 """
     _exec_command(line::AbstractString)
@@ -159,6 +167,14 @@ function _exec_command(line::AbstractString)
     elseif cmd == "run" && isnothing(m_call)
         isempty(rest) && throw(ArgumentError("usage: run <name> [args...]  or  run name(args...)"))
         return _run_from_string(rest)
+    elseif cmd in ("bench", "benchmark") && isnothing(m_call)
+        isempty(rest) && throw(ArgumentError("usage: bench <name> [args...]  or  bench name(args...)"))
+        return _bench_from_string(rest)
+    elseif cmd == "testgen" && isnothing(m_call)
+        isempty(rest) && throw(ArgumentError("usage: testgen <procedure> [output_file]"))
+        parts = split(rest)
+        out_f = length(parts) >= 2 ? parts[2] : ""
+        return generate_procedure_test(Symbol(parts[1]); file = out_f)
     elseif cmd == "make" && isnothing(m_call)
         parts = split(rest)
         isempty(parts) && throw(ArgumentError("usage: make <name> [N]"))
@@ -237,17 +253,18 @@ macro jemach(args...)
     isempty(args) && return :($(GlobalRef(jEMach, :toggle))())
     cmd = lowercase(string(args[1]))
     rest = args[2:end]
-    if cmd == "run" && !isempty(rest)
+    if cmd in ("run", "bench", "benchmark") && !isempty(rest)
+        helper_sym = cmd == "run" ? :run_procedure : :benchmark_procedure
         target = rest[1]
         if target isa Expr && target.head == :call && target.args[1] isa Symbol
             params, positional = _split_call_args(target.args[2:end])
-            call = Expr(:call, GlobalRef(jEMach, :run_procedure))
+            call = Expr(:call, GlobalRef(jEMach, helper_sym))
             isempty(params) || push!(call.args, Expr(:parameters, map(_esc_arg, params)...))
             push!(call.args, QuoteNode(target.args[1]))
             append!(call.args, map(_esc_arg, positional))
             return call
         end
-        return Expr(:call, GlobalRef(jEMach, :run_procedure), QuoteNode(Symbol(string(target))), map(_esc_arg, rest[2:end])...)
+        return Expr(:call, GlobalRef(jEMach, helper_sym), QuoteNode(Symbol(string(target))), map(_esc_arg, rest[2:end])...)
     elseif cmd in ("inspect", "i") && !isempty(rest)
         expr_str = join(map(string, rest), " ")
         return :($(GlobalRef(jEMach, :inspect_var))($__module__, $expr_str))
@@ -294,7 +311,7 @@ function _jemach_completions(partial::AbstractString)
         vcat(_JEMACH_COMMANDS, proc_names)
     else
         c = lowercase(words_before[1])
-        if c in ("run", "show", "ls", "find", "reload", "save") && length(words_before) == 1
+        if c in ("run", "bench", "benchmark", "testgen", "show", "ls", "find", "reload", "save") && length(words_before) == 1
             proc_names
         elseif c in ("edit", "e") && length(words_before) == 1
             vcat(proc_names, _main_symbol_names())
@@ -364,13 +381,22 @@ function _install_repl_error_hook!(repl, main::LineEdit.Prompt)
             end
         end
 
-        res = orig_on_done(s, buf, ok)
+        has_line = ok && !isempty(strip(line))
+        has_line && _set_repl_busy!(true, line)
+        res = try
+            orig_on_done(s, buf, ok)
+        catch e
+            has_line && _set_repl_busy!(false, line; ok = false)
+            rethrow()
+        end
 
-        if ok && !isempty(strip(line))
+        if has_line
             try
                 was_err = has_waserr ? Bool(repl.waserror) : false
+                _set_repl_busy!(false, line; ok = !was_err)
                 new_err = isdefined(Base.MainInclude, :err) ? getfield(Base.MainInclude, :err) : nothing
-                is_proc_runner = startswith(strip(line), "jEMach.run_procedure(")
+                is_proc_runner = startswith(strip(line), "jEMach.run_procedure(") ||
+                    startswith(strip(line), "jEMach.benchmark_procedure(")
                 if was_err
                     err_stack = (new_err !== prev_err && !isnothing(new_err)) ? new_err : nothing
                     is_stack = !isnothing(err_stack) && err_stack isa Base.ExceptionStack
@@ -380,6 +406,14 @@ function _install_repl_error_hook!(repl, main::LineEdit.Prompt)
                 elseif !is_proc_runner
                     Base.invokelatest(_capture_repl_definitions!, line)
                     Base.invokelatest(_record_command_outcome!, line, true; source = "repl")
+                    if Base.invokelatest(isdefined, Main, :ans)
+                        ans_val = try
+                            Base.invokelatest(getfield, Main, :ans)
+                        catch
+                            nothing
+                        end
+                        Base.invokelatest(_maybe_capture_plot!, ans_val, line)
+                    end
                 end
                 _has_active_tui_clients() && @async (sleep(0.02); Base.invokelatest(publish_state))
             catch

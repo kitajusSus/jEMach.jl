@@ -70,14 +70,18 @@ function _repl_eval(code::AbstractString; silent::Bool = false, record_history::
     end
 
     record_history && _append_repl_history(clean_code)
-    is_proc_runner = startswith(clean_code, "jEMach.run_procedure(")
+    is_proc_runner = startswith(clean_code, "jEMach.run_procedure(") ||
+        startswith(clean_code, "jEMach.benchmark_procedure(")
     is_internal = startswith(clean_code, "jEMach.inspect_var(") ||
         startswith(clean_code, "jEMach.save_clean_session(") ||
         startswith(clean_code, "jEMach.reload_procedure(") ||
         startswith(clean_code, "jEMach.save_procedure(") ||
         startswith(clean_code, "jEMach.edit_procedure(") ||
+        startswith(clean_code, "jEMach.generate_procedure_test(") ||
         startswith(clean_code, "jEMach._")
 
+    !is_internal && _set_repl_busy!(true, clean_code)
+    eval_ok = true
     try
         parsed_ast = Meta.parseall(clean_code; filename = String(filename))
         val = Base.invokelatest(Core.eval, Main, parsed_ast)
@@ -89,6 +93,7 @@ function _repl_eval(code::AbstractString; silent::Bool = false, record_history::
         _capture_repl_definitions!(clean_code)
         if !is_proc_runner && !is_internal
             _record_command_outcome!(clean_code, true; source = "tui")
+            _maybe_capture_plot!(val, clean_code)
         end
 
         is_self_printing = startswith(clean_code, "println(") ||
@@ -100,12 +105,15 @@ function _repl_eval(code::AbstractString; silent::Bool = false, record_history::
             println(stdout)
         end
     catch e
+        eval_ok = false
         bt = catch_backtrace()
         Base.invokelatest(Base.showerror, stdout, e, bt)
         println(stdout)
         if !(is_proc_runner && !(e isa Base.Meta.ParseError))
             _record_command_outcome!(clean_code, false, e, bt; source = "tui")
         end
+    finally
+        !is_internal && _set_repl_busy!(false, clean_code; ok = eval_ok)
     end
 
     println(stdout)
@@ -195,6 +203,24 @@ function _handle_socket_message(line::AbstractString)
         @async _repl_replace_input(text, move_left; switch_to_main = true)
     elseif cmd == "clear"
         @async _repl_clear()
+    elseif cmd == "set_expanded"
+        paths = string(get(msg, "paths", ""))
+        _set_expanded_paths!(paths)
+        @async Base.invokelatest(publish_state)
+    elseif cmd == "inspect_slice"
+        mod_s = string(get(msg, "mod", "Main"))
+        expr_s = string(get(msg, "expr", ""))
+        r1 = max(1, Int(get(msg, "row", 1)))
+        c1 = max(1, Int(get(msg, "col", 1)))
+        max_r = clamp(Int(get(msg, "max_rows", 30)), 1, 200)
+        max_c = clamp(Int(get(msg, "max_cols", 8)), 1, 30)
+        @async begin
+            _inspector_json[] = Base.invokelatest(_compute_inspector_json, mod_s, expr_s, r1, c1, max_r, max_c)
+            Base.invokelatest(publish_state)
+        end
+    elseif cmd == "clear_inspector"
+        _inspector_json[] = "null"
+        @async Base.invokelatest(publish_state)
     end
 end
 

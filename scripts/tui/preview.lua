@@ -44,12 +44,103 @@ end
 
 local function fmt_bytes(b)
 	b = tonumber(b) or 0
-	if b >= 1048576 then
+	if b >= 1073741824 then
+		return string.format("%.1fGB", b / 1073741824)
+	elseif b >= 1048576 then
 		return string.format("%.1fMB", b / 1048576)
 	elseif b >= 1024 then
 		return string.format("%.1fKB", b / 1024)
 	end
 	return string.format("%dB", b)
+end
+
+local function fmt_delta_badge(dr)
+	local prev_ms = tonumber(dr.prev_time_ms) or 0
+	local cur_ms = tonumber(dr.time_ms) or 0
+	if dr.status ~= "ok" or prev_ms <= 0 or cur_ms <= 0 then
+		return ""
+	end
+	local pct = ((cur_ms - prev_ms) / prev_ms) * 100.0
+	local pgen = tonumber(dr.prev_gen) or 0
+	local cgen = tonumber(dr.generation) or 1
+	local vs = (pgen > 0 and pgen ~= cgen) and (" vs v" .. pgen) or " vs prev"
+	local sign = (pct > 0) and "+" or ""
+	local clr = (pct <= -2.0) and FG_GREEN or ((pct >= 5.0) and FG_ORANGE or FG_LIGHT_GRAY)
+	return clr .. string.format("(%s%.1f%%%s)", sign, pct, vs) .. RESET
+end
+
+local function render_inspector_grid(lines, insp, max_w)
+	local headers = insp.headers or {}
+	local rows = insp.rows or {}
+	local ncols = #headers
+	if ncols == 0 then
+		return
+	end
+
+	local col_w = {}
+	local max_cell_cap = (ncols <= 3) and math.max(16, math.floor(max_w * 0.50)) or 24
+	for c = 1, ncols do
+		col_w[c] = math.min(max_cell_cap, math.max(4, visible_len(tostring(headers[c] or ""))))
+	end
+	for _, r in ipairs(rows) do
+		for c = 1, ncols do
+			local vlen = visible_len(tostring(r[c] or ""))
+			if vlen > col_w[c] then
+				col_w[c] = math.min(max_cell_cap, vlen)
+			end
+		end
+	end
+
+	-- Shrink widest columns proportionally if total exceeds available width
+	local sep_w = 3
+	local total_w = 2
+	for c = 1, ncols do
+		total_w = total_w + col_w[c] + ((c < ncols) and sep_w or 0)
+	end
+	while total_w > max_w do
+		local widest_c, widest_v = 1, col_w[1]
+		for c = 2, ncols do
+			if col_w[c] > widest_v then
+				widest_c, widest_v = c, col_w[c]
+			end
+		end
+		if widest_v <= 6 then
+			break
+		end
+		col_w[widest_c] = widest_v - 1
+		total_w = total_w - 1
+	end
+
+	local hdr_parts = { "  " }
+	local div_parts = { "  " }
+	for c = 1, ncols do
+		local htxt = truncate_visible(tostring(headers[c] or ""), col_w[c])
+		local pad_n = math.max(0, col_w[c] - visible_len(htxt))
+		local hclr = (c == 1) and (BOLD .. FG_YELLOW) or (BOLD .. FG_AQUA)
+		table.insert(hdr_parts, hclr .. htxt .. string.rep(" ", pad_n) .. RESET)
+		table.insert(div_parts, FG_DARK_GRAY .. string.rep("─", col_w[c]) .. RESET)
+		if c < ncols then
+			table.insert(hdr_parts, FG_DARK_GRAY .. " │ " .. RESET)
+			table.insert(div_parts, FG_DARK_GRAY .. "─┼─" .. RESET)
+		end
+	end
+	table.insert(lines, table.concat(hdr_parts))
+	table.insert(lines, table.concat(div_parts))
+
+	for _, r in ipairs(rows) do
+		local r_parts = { "  " }
+		for c = 1, ncols do
+			local cell = truncate_visible(tostring(r[c] or ""), col_w[c])
+			local pad_n = math.max(0, col_w[c] - visible_len(cell))
+			local cclr = (c == 1) and (DIM .. FG_YELLOW)
+				or ((ncols == 3 and c == 2) and FG_CYAN or FG_WHITE)
+			table.insert(r_parts, cclr .. cell .. string.rep(" ", pad_n) .. RESET)
+			if c < ncols then
+				table.insert(r_parts, FG_DARK_GRAY .. " │ " .. RESET)
+			end
+		end
+		table.insert(lines, table.concat(r_parts))
+	end
 end
 
 local function build_item_preview_lines(dr, max_w, compact, state)
@@ -162,15 +253,29 @@ local function build_item_preview_lines(dr, max_w, compact, state)
 		local loc_str = (dr.file and dr.file ~= "") and dr.file or "(REPL memory — press [S] to save)"
 		local meta = "File: " .. loc_str
 		if dr.status ~= "never" then
+			local b_samples = tonumber(dr.bench_samples) or 0
+			local sample_tag = (b_samples > 1)
+					and string.format(
+						" [median of %d: %.2f..%.2fms]",
+						b_samples,
+						tonumber(dr.min_time_ms) or dr.time_ms or 0,
+						tonumber(dr.max_time_ms) or dr.time_ms or 0
+					)
+				or ""
 			meta = meta
 				.. string.format(
-					"  |  %.2fms  %s  (%s)",
+					"  |  %.2fms%s  %s  (%s)",
 					dr.time_ms or 0,
+					sample_tag,
 					fmt_bytes(dr.alloc_bytes or 0),
 					dr.last_run or "-"
 				)
 		end
 		add_wrapped_lines(meta, DIM .. FG_GRAY, "  ", false)
+		local delta_line = fmt_delta_badge(dr)
+		if delta_line ~= "" then
+			table.insert(lines, "  " .. BOLD .. FG_AQUA .. "Benchmark Delta: " .. RESET .. delta_line)
+		end
 
 		if dr.doc and dr.doc ~= "" then
 			add_wrapped_lines(dr.doc, ITALIC .. FG_LIGHT_GRAY, "  ", false)
@@ -296,6 +401,81 @@ local function build_item_preview_lines(dr, max_w, compact, state)
 			table.insert(lines, "")
 			add_section_title(FG_RED, "✗ Command ended with an error (details no longer in recent error buffer).")
 		end
+	elseif dr.kind == "item" then
+		local full_name = ((dr.module_name and dr.module_name ~= "Main") and (dr.module_name .. ".") or "")
+			.. (dr.expr or dr.name or "item")
+		local sz_b = tonumber(dr.size_bytes) or -1
+		local insp = (state and type(state.inspector) == "table" and state.inspector.expr == dr.expr) and state.inspector
+			or nil
+		if insp and tonumber(insp.size_bytes) and tonumber(insp.size_bytes) >= 0 then
+			sz_b = tonumber(insp.size_bytes)
+		end
+		local sz_lbl = (sz_b >= 0) and ("  ·  " .. FG_GREEN .. fmt_bytes(sz_b) .. RESET) or ""
+		local tp_lbl = (insp and insp.type and insp.type ~= "") and insp.type or (dr.item_type or "")
+		local dims_lbl = (insp and insp.dims and insp.dims ~= "") and ("  (" .. insp.dims .. ")") or ""
+
+		table.insert(
+			lines,
+			"  "
+				.. BOLD
+				.. FG_CYAN
+				.. truncate_visible(full_name, math.max(12, w - 6))
+				.. RESET
+		)
+		table.insert(
+			lines,
+			"  "
+				.. FG_YELLOW
+				.. truncate_visible(tp_lbl, math.max(12, w - 24))
+				.. RESET
+				.. DIM
+				.. FG_LIGHT_GRAY
+				.. dims_lbl
+				.. RESET
+				.. sz_lbl
+		)
+		table.insert(lines, "")
+
+		if insp and insp.ok == false then
+			add_section_title(FG_RED, "✗ Could not inspect expression:")
+			add_wrapped_lines(insp.error or "Evaluation failed", FG_RED, "    ", false)
+		elseif insp and insp.headers and #insp.headers > 0 then
+			local r1 = tonumber(insp.row) or 1
+			local nrows = #(insp.rows or {})
+			local r2 = math.max(r1, r1 + nrows - 1)
+			local tot_r = tonumber(insp.total_rows) or nrows
+			local c1 = tonumber(insp.col) or 1
+			local tot_c = tonumber(insp.total_cols) or 1
+			local nav_info
+			if insp.kind == "table" or insp.kind == "matrix" then
+				local shown_c = math.max(1, #insp.headers - 1)
+				local c2 = math.min(tot_c, c1 + shown_c - 1)
+				nav_info = string.format(
+					"Rows %d–%d of %d  ·  Cols %d–%d of %d   [J/K rows · H/L cols]",
+					math.min(r1, tot_r),
+					math.min(r2, tot_r),
+					tot_r,
+					math.min(c1, tot_c),
+					c2,
+					tot_c
+				)
+			else
+				nav_info = string.format(
+					"Showing %d–%d of %d   [J/K page rows]",
+					math.min(r1, tot_r),
+					math.min(r2, tot_r),
+					tot_r
+				)
+			end
+			add_section_title(FG_AQUA, nav_info)
+			table.insert(lines, "")
+			render_inspector_grid(lines, insp, w)
+		elseif insp and insp.text and insp.text ~= "" then
+			add_wrapped_lines(insp.text, FG_LIGHT_GRAY, "  ", false)
+		else
+			add_section_title(FG_AQUA, "Value Preview:")
+			add_wrapped_lines(dr.value or "(loading slice…)", FG_WHITE, "    ", false)
+		end
 	else
 		table.insert(lines, DIM .. FG_GRAY .. "  (No detail preview for this item)" .. RESET)
 	end
@@ -306,4 +486,5 @@ end
 return {
 	build = build_item_preview_lines,
 	fmt_bytes = fmt_bytes,
+	fmt_delta_badge = fmt_delta_badge,
 }

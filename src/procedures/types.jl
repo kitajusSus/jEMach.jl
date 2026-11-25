@@ -112,9 +112,19 @@ function Base.show(io::IO, ::MIME"text/plain", p::ProcedureInfo)
 
     status_badge = p.last_run_status == :ok ? (green * "✓ OK" * reset) :
         p.last_run_status == :error ? (red * "✗ ERROR" * reset) : (dim * "○ NEVER RUN" * reset)
-    metrics_str = p.last_run_status != :never ?
-        "$(p.last_run_time_ms) ms, $(Base.format_bytes(p.last_run_alloc_bytes)) (at $(p.last_run_at))" :
+    metrics_str = if p.last_run_status != :never
+        s_info = p.bench_samples > 1 ? " [median of $(p.bench_samples): $(p.min_time_ms)–$(p.max_time_ms) ms]" : ""
+        d_info = if p.prev_time_ms > 0.0 && p.last_run_time_ms > 0.0 && p.last_run_status == :ok
+            pct = round(((p.last_run_time_ms - p.prev_time_ms) / p.prev_time_ms) * 100.0; digits = 1)
+            vs_l = p.prev_generation > 0 && p.prev_generation != p.generation ? " vs v$(p.prev_generation)" : " vs prev"
+            " ($(pct > 0 ? "+" : "")$(pct)%$(vs_l))"
+        else
+            ""
+        end
+        "$(p.last_run_time_ms) ms, $(Base.format_bytes(p.last_run_alloc_bytes))$(s_info)$(d_info) (at $(p.last_run_at))"
+    else
         "-"
+    end
     file_disp = isempty(p.file) ? "(memory only)" : p.file
 
     println(io, bold * cyan * "╭─ Procedure: " * string(p.name) * " " * ("─"^max(1, 50 - length(string(p.name)))) * "╮" * reset)

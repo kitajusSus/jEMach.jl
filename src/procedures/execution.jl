@@ -245,7 +245,7 @@ function run_procedure(name::Union{Symbol, AbstractString}, args...; kwargs...)
     val = t_res.value
     is_err = !isnothing(err_ref[])
     status_sym = is_err ? :error : :ok
-    time_ms = round(t_res.time * 1000, digits = 2)
+    time_ms = round(t_res.time * 1000, digits = 4)
     alloc_bytes = t_res.bytes
     now_str = Dates.format(Dates.now(), "HH:MM:SS")
 
@@ -273,7 +273,7 @@ function run_procedure(name::Union{Symbol, AbstractString}, args...; kwargs...)
     end
 
     p = _procedures[sym]
-    if !is_err && p.last_run_status == :ok && p.last_run_time_ms > 0.0 && p.prev_generation == 0
+    if !is_err && p.last_run_status == :ok && p.prev_generation == 0
         p.prev_time_ms = p.last_run_time_ms
         p.prev_alloc_bytes = p.last_run_alloc_bytes
         p.prev_generation = p.generation
@@ -439,7 +439,7 @@ function benchmark_procedure(
     for s_idx in 1:samples
         GC.gc(false)
         t_res = @timed Base.invokelatest(func, args...; kwargs...)
-        push!(timings, round(t_res.time * 1000.0; digits = 3))
+        push!(timings, round(t_res.time * 1000.0; digits = 4))
         push!(allocs, Int(t_res.bytes))
         s_idx >= 2 && time() >= t_budget_end && break
     end
@@ -447,9 +447,9 @@ function benchmark_procedure(
     sort!(timings)
     sort!(allocs)
     mid = cld(length(timings), 2)
-    med_ms = round(timings[mid]; digits = 2)
-    min_ms = round(first(timings); digits = 2)
-    max_ms = round(last(timings); digits = 2)
+    med_ms = round(timings[mid]; digits = 4)
+    min_ms = round(first(timings); digits = 4)
+    max_ms = round(last(timings); digits = 4)
     med_alloc = allocs[mid]
 
     p.last_run_time_ms = med_ms

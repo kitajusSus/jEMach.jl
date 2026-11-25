@@ -4,6 +4,7 @@ local views = {
 	require("tui.views.history"),
 	require("tui.views.procedures"),
 	require("tui.views.packages"),
+	require("tui.views.plots"),
 	require("tui.views.guide"),
 }
 

@@ -105,10 +105,20 @@ PROJ_DIR="$(find_project_dir)"
 # Discovery is shared with the TUI. Never choose a session from another project,
 # and never silently pick one when multiple REPLs are running.
 if [[ -z "$SOCKET" ]]; then
-  DISCOVERED="$(luajit "${SCRIPT_DIR}/discover_session.lua" "$PROJ_DIR")"
-  SOCKET="${DISCOVERED%%$'\n'*}"
-  if [[ -z "$STATE" ]]; then
-    STATE="${DISCOVERED#*$'\n'}"
+  if DISCOVERED="$(luajit "${SCRIPT_DIR}/discover_session.lua" "$PROJ_DIR" 2>/dev/null)"; then
+    SOCKET="${DISCOVERED%%$'\n'*}"
+    if [[ -z "$STATE" ]]; then
+      STATE="${DISCOVERED#*$'\n'}"
+    fi
+  else
+    MATCH_COUNT="$(luajit -e 'package.path=arg[1].."/?.lua;"..package.path; print(#require("tui.sessions").discover(arg[2]))' "$SCRIPT_DIR" "$PROJ_DIR" 2>/dev/null || echo 0)"
+    if [[ "$MATCH_COUNT" -gt 1 && -t 0 && -t 1 ]]; then
+      SOCKET="@pick"
+      STATE=""
+    else
+      luajit "${SCRIPT_DIR}/discover_session.lua" "$PROJ_DIR"
+      exit 1
+    fi
   fi
 elif [[ -z "$STATE" ]]; then
   if [[ "$SOCKET" == */repl.sock ]]; then
@@ -215,7 +225,7 @@ case "$ACTIVE_BACKEND" in
         --env "JEMACH_SOCKET=${SOCKET}" --env "JEMACH_STATE=${STATE}" --env "JEMACH_PROJ=${PROJ_DIR}" --env "JEMACH_BACKEND=kitty" \
         luajit "$TUI_SCRIPT" "$TARGET_WIN" "$SOCKET" "$STATE")"
       echo "Done. Kitty TUI vsplit started (window ${WIN_ID})."
-    elif [[ "$FORCE_NEW" -eq 0 && ( -S "$SOCKET" || -f "$STATE" ) ]]; then
+    elif [[ "$FORCE_NEW" -eq 0 && ( "$SOCKET" == "@pick" || -S "$SOCKET" || -f "$STATE" ) ]]; then
       # If the user opened a Kitty split manually and ran jl-assist, run inline
       export JEMACH_SOCKET="$SOCKET"
       export JEMACH_STATE="$STATE"
@@ -232,7 +242,7 @@ case "$ACTIVE_BACKEND" in
 
   ghostty)
     # If the user split in Ghostty (e.g. Alt+\ or Ctrl+Shift+O) and ran jl-assist in the new split while Julia is running, run inline!
-    if [[ "$FORCE_NEW" -eq 0 && ( -S "$SOCKET" || -f "$STATE" ) ]]; then
+    if [[ "$FORCE_NEW" -eq 0 && ( "$SOCKET" == "@pick" || -S "$SOCKET" || -f "$STATE" ) ]]; then
       export JEMACH_SOCKET="$SOCKET"
       export JEMACH_STATE="$STATE"
       export JEMACH_PROJ="$PROJ_DIR"

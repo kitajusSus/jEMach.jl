@@ -16,9 +16,10 @@ these files do not introduce extra Julia modules or change exported names.
 | `src/procedures/discovery.jl` | Source scanning, disk indexing and loading |
 | `src/procedures/analysis.jl` | AST scopes, free variables and imports |
 | `src/procedures/generation.jl` | Generate procedures from selected commands |
-| `src/procedures/execution.jl` | Record, run, search and list procedures |
+| `src/procedures/execution.jl` | Record, run, benchmark, generate `@testset`, search and list procedures |
 | `src/procedures/lifecycle.jl` | Capture live functions, edit, reload, save and delete |
-| `src/ipc/state.jl` | Shared socket state and publication locks |
+| `src/plots.jl` | Session PNG plot capture, IHDR dimensions and export |
+| `src/ipc/state.jl` | Shared socket state, lazy expansion paths and publication locks |
 | `src/ipc/serialization.jl` | Snapshot JSON columns and metadata |
 | `src/ipc/repl.jl` | REPL evaluation and input editing |
 | `src/ipc/server.jl` | Subscribers, socket lifecycle and publication |

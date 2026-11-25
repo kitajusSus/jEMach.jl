@@ -44,10 +44,25 @@ def main():
 
     try:
         await_text(b"tui_smoke_value")
+        os.write(master, b"o")
+        await_text(b"Sort Workspace: size")
+        os.write(master, b"jv")
+        await_text(b"Detail:")
+        os.write(master, b"\x1b")
+        await_text(b"tui_smoke_value")
+        os.write(master, b"B")
+        await_text(b"Select Julia REPL Session")
+        os.write(master, b"\x1b")
+        await_text(b"tui_smoke_value")
         for key, expected in [(b"2", b"History"), (b"3", b"Procedures"),
-                              (b"4", b"Packages"), (b"?", b"Julia REPL Editing")]:
+                              (b"4", b"Packages"), (b"5", b"Plot Gallery"),
+                              (b"?", b"Julia REPL Editing")]:
             os.write(master, key)
             await_text(expected)
+        os.write(master, "/żółć-no-match".encode("utf-8"))
+        await_text("żółć-no-match".encode("utf-8"))
+        os.write(master, b"\x15\r")  # Ctrl+U clears search query in search_mode!
+        await_text(b"Julia REPL Editing")
         os.write(master, b"/no-such-guide-entry\r")
         await_text(b"No guide entries matching")
         os.write(master, b"x")

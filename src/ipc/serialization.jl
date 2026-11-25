@@ -16,6 +16,15 @@ function _write_json_int_col(buf::IOBuffer, vals::Vector{Int32})
     return write(buf, ']')
 end
 
+function _write_json_int64_col(buf::IOBuffer, vals::Vector{Int64})
+    write(buf, '[')
+    @inbounds for i in eachindex(vals)
+        i > 1 && write(buf, ',')
+        print(buf, vals[i])
+    end
+    return write(buf, ']')
+end
+
 function _serialize_dod_body(t::WorkspaceTable, packages_data::Vector)::String
     return lock(_serialize_lock) do
         buf = IOBuffer()
@@ -23,6 +32,8 @@ function _serialize_dod_body(t::WorkspaceTable, packages_data::Vector)::String
 
         write(buf, "\"backend\":")
         _write_json_str(buf, string(detect_backend()), dst_buf)
+        write(buf, ",\"revise\":")
+        _write_json_str(buf, _get_revise_status(), dst_buf)
         write(buf, ",\"columns\":{\"names\":")
         _write_json_str_col(buf, t.names, dst_buf)
         write(buf, ",\"kinds\":")
@@ -39,6 +50,8 @@ function _serialize_dod_body(t::WorkspaceTable, packages_data::Vector)::String
         _write_json_int_col(buf, t.depths)
         write(buf, ",\"parent_indices\":")
         _write_json_int_col(buf, t.parent_indices)
+        write(buf, ",\"sizes\":")
+        _write_json_int64_col(buf, t.sizes)
 
         write(buf, ",\"has_children\":[")
         @inbounds for i in eachindex(t.has_children)
@@ -126,6 +139,18 @@ function _serialize_dod_body(t::WorkspaceTable, packages_data::Vector)::String
             print(buf, p.func_start_line)
             write(buf, ",\"last_args\":")
             _write_json_str(buf, p.last_args_str, dst_buf)
+            write(buf, ",\"prev_time_ms\":")
+            print(buf, p.prev_time_ms)
+            write(buf, ",\"prev_alloc_bytes\":")
+            print(buf, p.prev_alloc_bytes)
+            write(buf, ",\"prev_gen\":")
+            print(buf, p.prev_generation)
+            write(buf, ",\"bench_samples\":")
+            print(buf, p.bench_samples)
+            write(buf, ",\"min_time_ms\":")
+            print(buf, p.min_time_ms)
+            write(buf, ",\"max_time_ms\":")
+            print(buf, p.max_time_ms)
             write(buf, '}')
         end
 
@@ -169,7 +194,31 @@ function _serialize_dod_body(t::WorkspaceTable, packages_data::Vector)::String
             st_str = st_sym == :ok ? "ok" : st_sym == :error ? "error" : ""
             _write_json_str(buf, st_str, dst_buf)
         end
-        write(buf, "]}")
+        write(buf, "],\"plots\":[")
+        lock(_plots_lock) do
+            for (i, pl) in enumerate(_plots)
+                i > 1 && write(buf, ',')
+                write(buf, "{\"id\":")
+                print(buf, pl.id)
+                write(buf, ",\"title\":")
+                _write_json_str(buf, pl.title, dst_buf)
+                write(buf, ",\"timestamp\":")
+                _write_json_str(buf, pl.timestamp, dst_buf)
+                write(buf, ",\"path\":")
+                _write_json_str(buf, pl.filepath, dst_buf)
+                write(buf, ",\"width\":")
+                print(buf, pl.width)
+                write(buf, ",\"height\":")
+                print(buf, pl.height)
+                write(buf, ",\"bytes\":")
+                print(buf, pl.bytes)
+                write(buf, '}')
+            end
+        end
+        write(buf, "],\"inspector\":")
+        insp = _inspector_json[]
+        write(buf, isempty(insp) ? "null" : insp)
+        write(buf, "}")
         return String(take!(buf))
     end
 end

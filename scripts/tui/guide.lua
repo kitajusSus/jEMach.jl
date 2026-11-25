@@ -44,6 +44,8 @@ local GUIDE_SECTIONS = {
 			},
 			{ key = "errors", desc = "List errored procedures & failed commands from this session" },
 			{ key = "<name>(args...) | run ...", desc = "Run a procedure with profiling (keeps live in-memory edits)" },
+			{ key = "bench <name>(args...)", desc = "Multi-sample benchmark with median/min/max & generation delta" },
+			{ key = "testgen <name>", desc = "Generate @testset regression file in test/procedures/" },
 			{ key = "make <name> [N]", desc = "Extract last N commands into procedures/<name>.jl (hoists using)" },
 			{ key = "rec [name] | stop", desc = "Start / stop live procedure recording ([rec: name] julia>)" },
 			{ key = "inspect <expr> | @inspect", desc = "Deep-inspect variable/function, methods, origin & docstring" },
@@ -57,10 +59,11 @@ local GUIDE_SECTIONS = {
 	{
 		title = "jEMach TUI Global Keys & Mouse Navigation",
 		items = {
-			{ key = "1 / 2 / 3 / 4", desc = "Jump to Workspace / History / Procedures / Packages (or click tab)" },
-			{ key = "? (or 5)", desc = "Open or toggle this Guide tab (Esc returns to prior tab)" },
+			{ key = "1 / 2 / 3 / 4 / 5", desc = "Jump to Workspace / History / Procedures / Packages / Plots" },
+			{ key = "? (or 6)", desc = "Open or toggle this Guide tab (Esc returns to prior tab)" },
+			{ key = "Ctrl+S / B", desc = "Open interactive Julia Session Switcher (attach to another REPL)" },
 			{ key = "Tab / ] / [", desc = "Cycle forward / backward through TUI tabs" },
-			{ key = "/", desc = "Live search & filter current tab (Esc or x clears filter)" },
+			{ key = "/", desc = "Live UTF-8 search & filter current tab (Ctrl+U, Esc or x clears)" },
 			{ key = "j / k or Up / Down", desc = "Move cursor down / up (g/G top/bottom, PgUp/PgDn page)" },
 			{ key = "Mouse / m", desc = "Click rows & pills, dbl-click edits, wheel scrolls; [m] toggles mouse" },
 			{ key = "c / q / Ctrl+C", desc = "Clear REPL screen / Quit TUI panel" },
@@ -69,13 +72,14 @@ local GUIDE_SECTIONS = {
 	{
 		title = "jEMach TUI Tab Actions & Live Functions",
 		items = {
-			{ key = "[1] Workspace", desc = "l/h/Enter fold/eval; i inspect; e edit fn or paste var; d/D hide" },
+			{ key = "[1] Workspace", desc = "v 2D table/slice viewer; o sort (size/name/type); l/h fold; i inspect" },
 			{ key = "[2] History", desc = "Previous session folded! h/l/H fold; Space select; p make proc" },
 			{ key = "[2] v / e / Enter", desc = "Full cmd+error viewer / paste to REPL / re-run cmd" },
 			{
 				key = "[3] Procedures (● ⚡ ◆)",
 				desc = "● Disk  ⚡ Modified in memory  ◆ Live REPL fn  ○ Unloaded  ✗ Error",
 			},
+			{ key = "[3] b / T", desc = "Run multi-sample benchmark (shows % vs v1) / Generate @testset file" },
 			{ key = "[3] e / E / c", desc = "Edit clean fn in julia> REPL / open $EDITOR -> Main / paste call" },
 			{
 				key = "[3] R / S / Enter",
@@ -83,6 +87,7 @@ local GUIDE_SECTIONS = {
 			},
 			{ key = "[3] F / v / J / K", desc = "Toggle Failed Commands sub-view / Full detail / Scroll preview" },
 			{ key = "[4] Packages", desc = "a add package / d remove package / u update packages" },
+			{ key = "[5] Plots", desc = "Inline Kitty/Ghostty PNG plot gallery; s export PNG; o open; d/D clear" },
 		},
 	},
 }

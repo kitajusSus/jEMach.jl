@@ -48,6 +48,11 @@ Messages are UTF-8, one JSON object per line, terminated with a newline.
 | `insert` | `text`, optional `move_left` | Insert into the active REPL buffer |
 | `replace_input` | `text`, optional `move_left` | Replace input and switch to Julia mode |
 | `clear` | — | Clear and redraw the REPL |
+| `set_expanded` | `paths` (newline-separated) | Enable lazy workspace child collection for expanded nodes only |
+| `inspect_slice` | `mod`, `expr`, `row`, `col`, `max_rows`, `max_cols` | Populate `state.inspector` with a 2D/1D/struct slice |
+| `clear_inspector` | — | Clear `state.inspector` when the detail viewer closes |
+
+During interactive evaluation, Julia also emits `{"event":"busy","busy":true|false,...}` frames so connected TUIs display live elapsed runtime without polling.
 
 RPC objects are flat: strings, numbers, booleans and null. Malformed JSON is
 rejected as a whole, including bad escapes, malformed numbers and trailing input.

@@ -26,11 +26,11 @@ import REPL
 import REPL.LineEdit
 import Sockets
 
-export make_procedure, record, record_stop, run_procedure, list_procedures,
-    find_procedures, search_procedures, autoload_procedures!, get_recent_commands,
-    edit_procedure, reload_procedure, save_procedure,
-    detect_backend, terminal_info, workspace, inspect_var, save_clean_session,
-    @jemach, @inspect
+export make_procedure, record, record_stop, run_procedure, benchmark_procedure,
+    generate_procedure_test, list_procedures, find_procedures, search_procedures,
+    autoload_procedures!, get_recent_commands, edit_procedure, reload_procedure,
+    save_procedure, capture_plot, detect_backend, terminal_info, workspace,
+    inspect_var, save_clean_session, @jemach, @inspect
 
 include("config.jl")
 include("json.jl")
@@ -38,6 +38,7 @@ include("session.jl")
 include("workspace.jl")
 include("history.jl")
 include("procedures.jl")
+include("plots.jl")
 include("ipc.jl")
 include("backends.jl")
 include("repl_mode.jl")

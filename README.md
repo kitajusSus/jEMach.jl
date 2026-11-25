@@ -122,13 +122,16 @@ See [docs/src/startup.md](docs/src/startup.md) for advanced configuration.
 
 ## TUI Tabs & Navigation
 
-The TUI provides 4 dedicated panels accessible via `1`, `2`, `3`, `4` or `Tab`:
+The TUI provides 5 dedicated panels accessible via `1`–`5` or `Tab`, plus `[?] Guide`:
 
-- **`[1] Workspace`**: Real-time Data-Oriented tree view of variables, matrices, dataframes, structs, and modules.
+- **`[1] Workspace`**: Real-time Data-Oriented tree view of variables, matrices, dataframes, structs, and modules with memory **`SIZE`**, sorting (`o`: default / size / name / type), lazy subtree loading, and an interactive **2D Table / Matrix / Slice Viewer** (`v`).
 - **`[2] History`**: REPL session command log separating **Previous Sessions** (folded by default with `h`/`l`/`H`) from the **Current Session**, with pass/fail markers (`✓`/`✗`), multi-select (`Space`), full preview (`v`), and procedure creation (`p`).
-- **`[3] Procedures`**: Saved procedures and recent failed REPL commands (`✗ ERR` / failed command log), with scrollable wrapped code + error/traceback preview (`J`/`K`, `v`), argument-prompting or one-key execution (`Enter`), and REPL editing (`e`).
+- **`[3] Procedures`**: Saved procedures and recent failed REPL commands (`✗ ERR`), with scrollable wrapped code + error/traceback preview (`J`/`K`, `v`), multi-sample benchmarking (`b`) with `v1 → v2` generation deltas, `@testset` file generation (`T`), and REPL/`$EDITOR` editing (`e`/`E`).
 - **`[4] Packages`**: Interactive project package manager (`a` add, `d` remove, `u` update).
-- **`[?] Guide`**: Built-in English quick-reference tab (toggled with `?`) covering global Julia REPL shortcuts/modes, `jemach>` commands, macros/API functions, and TUI shortcuts.
+- **`[5] Plots`**: Automatic PNG session plot gallery (`CairoMakie`, `Plots.jl`, or `jEMach.capture_plot(fig)`) rendered inline via the **Kitty Graphics Protocol** in Ghostty & Kitty (with tmux passthrough), plus one-key PNG export (`s`) and external viewer launch (`o`).
+- **`[?] Guide`**: Built-in English quick-reference tab (toggled with `?` or `6`) covering global Julia REPL shortcuts/modes, `jemach>` commands, macros/API functions, and TUI shortcuts.
+
+The header bar also displays live **`⟳ BUSY`** elapsed evaluation timers (with OSC-99/BEL completion notifications for commands running `>= 10s`), **`Revise.jl`** status (`Rev✓` / `Rev⚡` / `Rev✗`), and an interactive **Session Switcher** (`B` or `Ctrl+S`) when multiple Julia REPLs run in the same project.
 
 ---
 
@@ -201,10 +204,10 @@ jEMach.find_procedures("sample")
 
 | Key                      | Context            | Action                                                                        |
 | :----------------------- | :----------------- | :---------------------------------------------------------------------------- |
-| `/`                      | Global             | **Search & Live Filter** (procedures, errors, workspace, history, guide)      |
-| `Esc` / `x`              | Global             | Clear search filter (`Esc` on empty Guide closes the Guide tab)               |
-| `?`                      | Global             | Open / toggle **`[?] Guide`** reference tab (REPL & TUI commands)             |
-| `1` / `2` / `3` / `4`    | Global             | Jump directly to Workspace / History / Procedures / Packages                  |
+| `/`                      | Global             | **UTF-8 Search & Live Filter** (`Ctrl+U`, `Esc` or `x` clears filter)         |
+| `?` (or `6`)             | Global             | Open / toggle **`[?] Guide`** reference tab (REPL & TUI commands)             |
+| `1` / `2` / `3` / `4` / `5` | Global          | Jump directly to Workspace / History / Procedures / Packages / Plots          |
+| `B` / `Ctrl+S`           | Global             | Open interactive **Julia Session Switcher** across live project REPLs         |
 | `Tab` / `]` / `[`        | Global             | Cycle to next / previous tab                                                  |
 | `j` / `k` (or `↓` / `↑`) | Global             | Move cursor down / up (`g`/`G` top/bottom, `PgUp`/`PgDn` page)                |
 | `Space`                  | History            | Toggle Previous Sessions fold (on header) or command selection `[✓]`          |
@@ -219,7 +222,12 @@ jEMach.find_procedures("sample")
 | `e`                      | Procedures         | Paste `<proc_name>()` or failed command into REPL to edit                     |
 | `d`                      | Procedures         | Delete procedure file from disk **or** dismiss selected failed command        |
 | `D`                      | Procedures         | Clear all captured failed commands                                            |
+| `b`                      | Procedures         | Run multi-sample **Benchmark** (records median/min/max & `%` vs prev gen)     |
+| `T`                      | Procedures         | Generate reproducible `@testset` file under `test/procedures/`                |
 | `r`                      | Procedures         | Reload procedure definitions from disk                                        |
+| `v`                      | Workspace          | Open **2D Table / Matrix / Slice Viewer** (`J`/`K` rows, `H`/`L` cols)        |
+| `o`                      | Workspace          | Cycle workspace sort order (`default` / `size` / `name` / `type`)             |
+| `s` / `o` / `d` / `D`    | Plots              | Export PNG to `./plots/`, open in viewer, remove plot, or clear gallery       |
 | `l` / `↵` (Enter)        | Workspace          | Expand node **or** evaluate `println(var)` in REPL                            |
 | `h` (or `←`)             | Workspace          | Collapse node / jump to parent                                                |
 | `i`                      | Workspace          | Inspect variable details, methods, and creation history                       |

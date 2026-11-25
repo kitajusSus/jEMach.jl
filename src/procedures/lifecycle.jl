@@ -189,7 +189,7 @@ function _capture_repl_definitions!(code_str::AbstractString)::Bool
                 if p.disk_hash != UInt64(0) && scan.content_hash == p.disk_hash
                     p.origin = :disk
                 else
-                    if p.last_run_status == :ok && p.last_run_time_ms > 0.0
+                    if p.last_run_status == :ok
                         p.prev_time_ms = p.last_run_time_ms
                         p.prev_alloc_bytes = p.last_run_alloc_bytes
                         p.prev_generation = p.generation
@@ -198,7 +198,7 @@ function _capture_repl_definitions!(code_str::AbstractString)::Bool
                     p.generation += 1
                 end
             else
-                if p.last_run_status == :ok && p.last_run_time_ms > 0.0
+                if p.last_run_status == :ok
                     p.prev_time_ms = p.last_run_time_ms
                     p.prev_alloc_bytes = p.last_run_alloc_bytes
                     p.prev_generation = p.generation
