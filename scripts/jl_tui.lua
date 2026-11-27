@@ -1534,7 +1534,7 @@ local function open_in_external_editor(dr)
 	end
 	wf:close()
 
-	io.write((mouse_enabled and MOUSE_OFF or "") .. SHOW_CUR .. ALT_SCREEN_OFF)
+	io.write((mouse_enabled and MOUSE_OFF or "") .. ALT_SCREEN_OFF .. SHOW_CUR)
 	io.flush()
 	raw_mode_off()
 
@@ -2634,7 +2634,7 @@ local function main()
 	local function cleanup()
 		raw_mode_off()
 		local clr_seq = views[5].clear_graphics_seq(detect_backend())
-		io.write(clr_seq .. MOUSE_OFF .. SHOW_CUR .. ALT_SCREEN_OFF)
+		io.write(clr_seq .. MOUSE_OFF .. ALT_SCREEN_OFF .. SHOW_CUR)
 		io.flush()
 	end
 

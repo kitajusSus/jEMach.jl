@@ -354,6 +354,47 @@ function _toggle_recording_key(s)
     return :ok
 end
 
+function _toggle_tui_key(s)
+    _clear_repl_input_area(s)
+    try
+        toggle()
+    catch e
+        @error "jEMach TUI toggle failed" exception = e
+    end
+    println(stdout)
+    LineEdit.refresh_line(s)
+    return :ok
+end
+
+function _patch_semantic_prompt_markers!(repl)
+    # Julia 1.14+ emits OSC 133;A without `redraw=0`, causing terminals like Ghostty/Kitty
+    # to erase the active prompt (`julia> ` / `jemach> `) on window resize (e.g. tiling a TUI
+    # window), even though LineEdit does not redraw prompts on SIGWINCH.
+    isdefined(REPL, :SemanticPromptMarkers) || return false
+    hasproperty(repl, :semantic_prompt_markers) || return false
+    m = try
+        getproperty(repl, :semantic_prompt_markers)
+    catch
+        return false
+    end
+    m isa REPL.SemanticPromptMarkers || return false
+    m.prompt_start == "\e]133;A\a" || return false
+    return try
+        repl.semantic_prompt_markers = REPL.SemanticPromptMarkers(
+            "\e]133;A;redraw=0\a",
+            m.prompt_end,
+            m.command_start,
+            m.command_finish,
+            m.command_finish_ok,
+            m.command_finish_error,
+            m.command_line,
+        )
+        true
+    catch
+        false
+    end
+end
+
 const _hooked_repl_prompts = WeakKeyDict{Any, Bool}()
 
 function _install_repl_error_hook!(repl, main::LineEdit.Prompt)
@@ -425,6 +466,7 @@ function _install_repl_error_hook!(repl, main::LineEdit.Prompt)
 end
 
 function _install_jemach_mode!(repl)
+    _patch_semantic_prompt_markers!(repl)
     (hasproperty(repl, :interface) && isdefined(repl, :interface)) || return nothing
     iface = repl.interface
     any(m -> m isa LineEdit.Prompt && m.complete isa JEMachCompletionProvider, iface.modes) && return nothing
@@ -435,7 +477,7 @@ function _install_jemach_mode!(repl)
 
     jm = LineEdit.Prompt(
         "jemach> ";
-        prompt_prefix = "\e[36m\e[1m",
+        prompt_prefix = (hasproperty(repl, :hascolor) && !repl.hascolor) ? "" : "\e[36m",
         prompt_suffix = main.prompt_suffix,
         complete = JEMachCompletionProvider(),
         sticky = true,
@@ -449,7 +491,13 @@ function _install_jemach_mode!(repl)
     _, prefix_keymap = LineEdit.setup_prefix_keymap(hp, jm)
     keymaps = Dict{Any, Any}[]
     !isdefined(REPL, :History) && push!(keymaps, last(LineEdit.setup_search_keymap(hp)))
-    push!(keymaps, Dict{Any, Any}("\er" => (s, o...) -> _toggle_recording_key(s)))
+    push!(
+        keymaps,
+        Dict{Any, Any}(
+            "\ej" => (s, o...) -> _toggle_tui_key(s),
+            "\er" => (s, o...) -> _toggle_recording_key(s),
+        ),
+    )
     push!(keymaps, REPL.mode_keymap(main), prefix_keymap, LineEdit.history_keymap, LineEdit.default_keymap, LineEdit.escape_defaults)
     jm.keymap_dict = LineEdit.keymap(keymaps)
 
@@ -472,7 +520,7 @@ function _install_jemach_mode!(repl)
                 return nothing
             end
         end,
-        "\ej" => (s, o...) -> (@async toggle(); return :ok),
+        "\ej" => (s, o...) -> _toggle_tui_key(s),
         "\em" => (s, o...) -> _enter_jemach_mode(s),
         "\er" => (s, o...) -> _toggle_recording_key(s),
     )
@@ -481,10 +529,11 @@ function _install_jemach_mode!(repl)
 end
 
 function _setup_repl_hooks(repl)
+    _patch_semantic_prompt_markers!(repl)
     return @async begin
         for _ in 1:25
             if isdefined(Base, :active_repl_backend) && !isnothing(Base.active_repl_backend) &&
-                    hasproperty(repl, :interface) && !isnothing(repl.interface)
+                    hasproperty(repl, :interface) && isdefined(repl, :interface) && !isnothing(repl.interface)
                 break
             end
             sleep(0.05)

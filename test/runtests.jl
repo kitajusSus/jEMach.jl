@@ -731,6 +731,42 @@ end
             close(sock)
             @test any(m -> occursin("\"busy\":true", m), busy_msgs)
             @test any(m -> occursin("\"busy\":false", m), busy_msgs)
+
+            # 7. OSC 133 redraw=0 semantic prompt marker patch & symlinked jl-assist launcher
+            if isdefined(jEMach.REPL, :SemanticPromptMarkers)
+                t_repl = jEMach.REPL.LineEditREPL(
+                    jEMach.REPL.Terminals.TTYTerminal("xterm-ghostty", stdin, stdout, stderr),
+                    true,
+                )
+                t_repl.semantic_prompt_markers = jEMach.REPL.OSC_133_MARKERS
+                @test jEMach._patch_semantic_prompt_markers!(t_repl) === true
+                @test t_repl.semantic_prompt_markers.prompt_start == "\e]133;A;redraw=0\a"
+                @test t_repl.semantic_prompt_markers.prompt_end == "\e]133;B\a"
+                @test jEMach._patch_semantic_prompt_markers!(t_repl) === false
+                # VS Code OSC 633 markers must not be modified
+                if isdefined(jEMach.REPL, :OSC_633_MARKERS)
+                    t_repl.semantic_prompt_markers = jEMach.REPL.OSC_633_MARKERS
+                    @test jEMach._patch_semantic_prompt_markers!(t_repl) === false
+                    @test t_repl.semantic_prompt_markers.prompt_start == "\e]633;A\a"
+                end
+            end
+
+            # Detached launcher spawn must redirect stdio and not pollute stdout
+            proc = jEMach._spawn_detached(`sh -c "echo detached-noise; echo detached-err >&2"`)
+            wait(proc)
+            @test proc.exitcode == 0
+
+            # Symlinked jl-assist must resolve SCRIPT_DIR to scripts/ (passes TUI_SCRIPT check)
+            link_path = joinpath(tmp_dir, "jemach-symlink")
+            symlink(joinpath(@__DIR__, "..", "scripts", "jl-assist"), link_path)
+            if !isnothing(Sys.which("luajit"))
+                err_io = IOBuffer()
+                p_link = run(pipeline(`bash $link_path -s /tmp/custom.sock`; stdout = devnull, stderr = err_io); wait = false)
+                wait(p_link)
+                err_txt = String(take!(err_io))
+                @test !occursin("TUI script not found", err_txt)
+                @test occursin("provide -d STATE", err_txt)
+            end
         finally
             if !isempty(exported_plot_rel)
                 full_exp = joinpath(jEMach._get_project_dir(), exported_plot_rel)

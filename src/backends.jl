@@ -78,6 +78,8 @@ function _tui_env_cmd(tui_script::String, target_arg::String, proj_dir::String, 
     return `env JEMACH_SOCKET=$sock JEMACH_STATE=$st_file JEMACH_PROJ=$proj_dir JEMACH_BACKEND=$b_str luajit $tui_script $target_arg $sock $st_file`
 end
 
+_spawn_detached(cmd) = run(pipeline(cmd; stdin = devnull, stdout = devnull, stderr = devnull); wait = false)
+
 function _close_tui_pane()
     backend = _tui_backend_ref[] != :none ? _tui_backend_ref[] : detect_backend()
 
@@ -140,7 +142,7 @@ function _open_tui_pane(; backend::Symbol = detect_backend(), width::Int = 65)
 
     if haskey(ENV, "JEMACH_SPLIT_CMD") && !isempty(strip(ENV["JEMACH_SPLIT_CMD"]))
         cmd_str = _expand_split_template(ENV["JEMACH_SPLIT_CMD"], width, proj_dir, sock, st_file, tui_script)
-        _tui_proc_ref[] = run(Cmd(`sh -c $cmd_str`; dir = proj_dir); wait = false)
+        _tui_proc_ref[] = _spawn_detached(Cmd(`sh -c $cmd_str`; dir = proj_dir))
         _tui_backend_ref[] = backend
         println("🚀 Custom jEMach TUI split launched ($backend)!")
         return nothing
@@ -170,7 +172,7 @@ function _open_tui_pane(; backend::Symbol = detect_backend(), width::Int = 65)
             direction_args = get(ENV, "JEMACH_ZELLIJ_FLOATING", "0") == "1" ? ["--floating"] : ["--direction", "right"]
             env_cmd = _tui_env_cmd(tui_script, "zellij", proj_dir, sock, st_file, :zellij)
             cmd = `zellij run $(direction_args) --name jEMach --cwd $proj_dir --close-on-exit -- $env_cmd`
-            run(cmd; wait = false)
+            _spawn_detached(cmd)
             _tui_backend_ref[] = :zellij
             println("🚀 Zellij TUI pane opened!")
         catch e
@@ -195,7 +197,7 @@ function _open_tui_pane(; backend::Symbol = detect_backend(), width::Int = 65)
             if !rc_ok
                 env_cmd = _tui_env_cmd(tui_script, kitty_win_id, proj_dir, sock, st_file, :kitty)
                 cmd = `kitty --title=jEMach --directory=$proj_dir -o initial_window_width=$(width)c -o remember_window_size=no $env_cmd`
-                _tui_proc_ref[] = run(cmd; wait = false)
+                _tui_proc_ref[] = _spawn_detached(cmd)
                 _tui_backend_ref[] = :kitty
                 println("🚀 Kitty companion TUI window opened! (Tip: set `allow_remote_control yes` in kitty.conf for in-tab vsplit)")
             end
@@ -207,21 +209,21 @@ function _open_tui_pane(; backend::Symbol = detect_backend(), width::Int = 65)
             env_cmd = _tui_env_cmd(tui_script, "ghostty", proj_dir, sock, st_file, :ghostty)
             if haskey(ENV, "JEMACH_GHOSTTY_CMD") && !isempty(strip(ENV["JEMACH_GHOSTTY_CMD"]))
                 cmd_str = _expand_split_template(ENV["JEMACH_GHOSTTY_CMD"], width, proj_dir, sock, st_file, tui_script)
-                _tui_proc_ref[] = run(Cmd(`sh -c $cmd_str`; dir = proj_dir); wait = false)
+                _tui_proc_ref[] = _spawn_detached(Cmd(`sh -c $cmd_str`; dir = proj_dir))
                 println("🚀 Ghostty jEMach TUI custom command launched!")
             elseif Sys.isapple()
                 cmd = `open -na Ghostty.app --args --title=jEMach --working-directory=$proj_dir --window-width=$width --wait-after-command=false -e $env_cmd`
-                _tui_proc_ref[] = run(cmd; wait = false)
+                _tui_proc_ref[] = _spawn_detached(cmd)
                 println("🚀 Ghostty jEMach TUI window opened!")
             else
                 mode = lowercase(get(ENV, "JEMACH_GHOSTTY_MODE", "window"))
                 if mode == "tab"
                     cmd = `ghostty +new-tab -e $env_cmd`
-                    _tui_proc_ref[] = run(cmd; wait = false)
+                    _tui_proc_ref[] = _spawn_detached(cmd)
                     println("🚀 Ghostty jEMach TUI tab opened!")
                 else
                     cmd = `ghostty --gtk-single-instance=false --title=jEMach --working-directory=$proj_dir --window-width=$width --wait-after-command=false -e $env_cmd`
-                    _tui_proc_ref[] = run(cmd; wait = false)
+                    _tui_proc_ref[] = _spawn_detached(cmd)
                     println("🚀 Ghostty jEMach TUI window opened!")
                 end
             end
