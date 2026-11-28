@@ -1,7 +1,7 @@
 authors = ["kitajusSus <kitajusus@users.noreply.github.com>"]
 name = "jEMach"
 uuid = "67289db4-f2a6-40b9-80a9-9c8949710e38"
-version = "0.1.2"
+version = "0.2.0"
 
 [compat]
 Sockets = "1"

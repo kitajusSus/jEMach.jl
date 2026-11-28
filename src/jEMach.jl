@@ -10,6 +10,7 @@
 """
     jEMach
 
+Julia Workspace Assistant & REPL Monitor with multi-terminal TUI
 (`Ghostty`, `Kitty`, `tmux`, `Zellij`, `Rex`) and dedicated `jemach>` REPL mode.
 
 ### Quick REPL Shortcuts
