@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   test:
-    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }}
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.version == 'pre' }}
     strategy:
@@ -34,14 +34,11 @@ jobs:
         os:
           - ubuntu-latest
           - macos-latest
-        arch:
-          - x64
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.version }}
-          arch: ${{ matrix.arch }}
       - uses: julia-actions/cache@v2
       - name: Install LuaJIT (Linux)
         if: runner.os == 'Linux'
@@ -50,7 +47,7 @@ jobs:
           sudo apt-get install -y luajit
       - name: Install LuaJIT (macOS)
         if: runner.os == 'macOS'
-        run: brew list luajit || brew install luajit
+        run: brew list --formula luajit >/dev/null 2>&1 || brew install luajit
       - name: Check launcher syntax
         run: bash -n scripts/jl-assist
       - uses: julia-actions/julia-buildpkg@v1

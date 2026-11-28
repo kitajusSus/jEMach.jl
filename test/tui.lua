@@ -61,6 +61,16 @@ for _, fd in ipairs({ 0, 52, 53, 62, 63, 64, 1023 }) do
 end
 check(not platform.fd_set_isset(fds, 54))
 check(not pcall(platform.fd_set_set, fds, 1024))
+local tv_1500 = platform.make_timeval(1500)
+check(tonumber(tv_1500.tv_sec) == 1 and tonumber(tv_1500.tv_usec) == 500000)
+local tv_1000 = platform.make_timeval(1000)
+check(tonumber(tv_1000.tv_sec) == 1 and tonumber(tv_1000.tv_usec) == 0)
+local tv_250 = platform.make_timeval(250)
+check(tonumber(tv_250.tv_sec) == 0 and tonumber(tv_250.tv_usec) == 250000)
+local tv_neg = platform.make_timeval(-50)
+check(tonumber(tv_neg.tv_sec) == 0 and tonumber(tv_neg.tv_usec) == 0)
+local tv_large = platform.make_timeval(65432)
+check(tonumber(tv_large.tv_sec) == 65 and tonumber(tv_large.tv_usec) == 432000)
 
 -- Fail on accidental references to old lexical state after module extraction.
 setmetatable(_G, {

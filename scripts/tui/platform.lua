@@ -2,11 +2,16 @@ local ffi = require("ffi")
 -- ---------------------------------------------------------------------------
 -- FFI: non-blocking stdin read via select(2) + read(2) + sockets
 -- ---------------------------------------------------------------------------
+ffi.cdef(ffi.os == "OSX" and [[
+  typedef int           suseconds_t;
+]] or [[
+  typedef long          suseconds_t;
+]])
+
 ffi.cdef([[
   typedef long          ssize_t;
   typedef unsigned long size_t;
   typedef long          time_t;
-  typedef long          suseconds_t;
 
   typedef struct {
     time_t      tv_sec;
@@ -89,10 +94,22 @@ local function raw_mode_off()
 	os.execute("stty sane 2>/dev/null")
 end
 
+local function make_timeval(timeout_ms)
+	local ms = tonumber(timeout_ms) or 0
+	if ms < 0 then
+		ms = 0
+	end
+	local total_usec = math.floor(ms * 1000 + 0.5)
+	local sec = math.floor(total_usec / 1000000)
+	local usec = total_usec - sec * 1000000
+	return ffi.new("timeval_t", { tv_sec = sec, tv_usec = usec })
+end
+
 return {
 	fd_set_new = fd_set_new,
 	fd_set_set = fd_set_set,
 	fd_set_isset = fd_set_isset,
+	make_timeval = make_timeval,
 	get_terminal_size = get_terminal_size,
 	raw_mode_on = raw_mode_on,
 	raw_mode_off = raw_mode_off,

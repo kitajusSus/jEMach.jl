@@ -23,6 +23,7 @@ local STDIN = 0
 local fd_set_new = platform.fd_set_new
 local fd_set_set = platform.fd_set_set
 local fd_set_isset = platform.fd_set_isset
+local make_timeval = platform.make_timeval
 local get_terminal_size = platform.get_terminal_size
 local raw_mode_on = platform.raw_mode_on
 local raw_mode_off = platform.raw_mode_off
@@ -184,7 +185,7 @@ local function handle_socket_read()
 		end
 		local rfds = fd_set_new()
 		fd_set_set(rfds, socket_fd)
-		local rtv = ffi.new("timeval_t", { tv_sec = 0, tv_usec = 2000 })
+		local rtv = make_timeval(2)
 		if ffi.C.select(socket_fd + 1, rfds, nil, nil, rtv) <= 0 then
 			break
 		end
@@ -245,7 +246,7 @@ local function read_key(timeout_ms)
 		end
 	end
 
-	local tv = ffi.new("timeval_t", { tv_sec = 0, tv_usec = (timeout_ms or 100) * 1000 })
+	local tv = make_timeval(timeout_ms or 100)
 	local ready = ffi.C.select(max_fd + 1, fds, nil, nil, tv)
 	if ready <= 0 then
 		return nil
